@@ -82,7 +82,7 @@ jobs:
 
       - name: Update Cargo.toml
         run: |
-          sed -i 's/^version = .*/version = "${{ steps.new_version.outputs.version }}"/' Cargo.toml
+          sed -i 's/^version[[:space:]]*=.*/version      = "${{ steps.new_version.outputs.version }}"/' Cargo.toml
 
       - name: Verify update
         run: |
