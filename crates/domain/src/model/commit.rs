@@ -124,7 +124,7 @@ pub fn file_entry_diff_stats(
     let modified = current.iter().filter(|e| {
         parent_by_path
             .get(e.relative_path.as_str())
-            .map_or(false, |p| p.file_size != e.file_size || p.permissions != e.permissions)
+            .is_some_and(|p| p.file_size != e.file_size || p.permissions != e.permissions)
     }).count();
 
     (added, deleted, modified)

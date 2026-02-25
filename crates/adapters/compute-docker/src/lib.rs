@@ -304,7 +304,7 @@ impl Compute for DockerCompute {
                     output
                         .try_collect::<Vec<_>>()
                         .await
-                        .map_err(|e| classify(&id.0, e.into()))?;
+                        .map_err(|e| classify(&id.0, e))?;
                 }
                 bollard::exec::StartExecResults::Detached => {}
             }
@@ -456,9 +456,8 @@ impl DockerCompute {
                 .condition("not-running")
                 .build();
         let mut stream = self.docker.wait_container(&id.0, Some(wait_opts));
-        while let Some(item) = stream.next().await {
+        if let Some(item) = stream.next().await {
             item.map_err(|e| classify(&id.0, e))?;
-            break;
         }
         Ok(())
     }

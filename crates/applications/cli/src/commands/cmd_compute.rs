@@ -81,8 +81,7 @@ async fn dispatch(
         ComputeAction::Start { .. } => {
             let repo_path = path.clone().unwrap_or_else(get_repo_dir);
             let (instance_id, status) = start_restart_or_recreate(compute, &instance_id, &repo_path, false)
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
             print_status(&status);
             if let Some(ref dir) = container_data_dir(compute, &instance_id, path).await {
                 let rel = relativize_to_repo(&repo_path, dir);
@@ -101,8 +100,7 @@ async fn dispatch(
         ComputeAction::Restart { .. } => {
             let repo_path = path.clone().unwrap_or_else(get_repo_dir);
             let (instance_id, status) = start_restart_or_recreate(compute, &instance_id, &repo_path, true)
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
             print_status(&status);
             if let Some(ref dir) = container_data_dir(compute, &instance_id, path).await {
                 let rel = relativize_to_repo(&repo_path, dir);
@@ -248,11 +246,11 @@ async fn start_restart_or_recreate(
     compute.remove_instance(instance_id).await?;
 
     let mut definition = provider.definition();
-    if let Some(ref env) = config.environment {
-        if !env.database_version.is_empty() {
-            let base = definition.image.split(':').next().unwrap_or(&definition.image);
-            definition.image = format!("{}:{}", base, env.database_version);
-        }
+    if let Some(ref env) = config.environment
+        && !env.database_version.is_empty()
+    {
+        let base = definition.image.split(':').next().unwrap_or(&definition.image);
+        definition.image = format!("{}:{}", base, env.database_version);
     }
     definition.host_data_dir = Some(std::path::PathBuf::from(&active));
     let new_id = compute.provision(&definition).await?;

@@ -138,7 +138,7 @@ impl StoragePort for ApfsStorage {
         };
 
         let output = Command::new("cp")
-            .args(["-cRp", &id.0, &dest.to_string_lossy().as_ref()])
+            .args(["-cRp", &id.0, dest.to_string_lossy().as_ref()])
             .output()
             .await
             .map_err(StorageError::Io)?;
@@ -305,8 +305,7 @@ fn parse_diskutil_info(id: &VolumeId, output: &str) -> Result<VolumeStatus> {
 
 /// Extract the leading integer from a field like `"494384795648 Bytes (460.4 GB)"`.
 fn parse_bytes_field(s: &str) -> u64 {
-    s.trim()
-        .split_whitespace()
+    s.split_whitespace()
         .next()
         .and_then(|n| n.replace(',', "").parse().ok())
         .unwrap_or(0)

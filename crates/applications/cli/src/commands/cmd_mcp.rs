@@ -4,6 +4,7 @@
 //! - `gfs mcp` or `gfs mcp stdio` - runs embedded MCP handler with stdio transport
 //! - `gfs mcp web [--port N]` - runs embedded MCP handler with HTTP (foreground)
 //! - `gfs mcp start/stop/restart/status` - HTTP daemon management
+//!
 //! PID file: .gfs/mcp.pid, log file: .gfs/mcp.log.
 
 use std::fs;
@@ -228,12 +229,10 @@ async fn status(pid_file: &std::path::Path, default_port: u16) -> Result<()> {
 
     if let Some(pid) = running {
         println!("Daemon: running (PID {}, http://127.0.0.1:{}/mcp, no auth)", pid, default_port);
+    } else if pid_file.exists() {
+        println!("Daemon: stopped (use 'gfs mcp stop' to remove stale PID file)");
     } else {
-        if pid_file.exists() {
-            println!("Daemon: stopped (use 'gfs mcp stop' to remove stale PID file)");
-        } else {
-            println!("Daemon: stopped");
-        }
+        println!("Daemon: stopped");
     }
 
     println!();

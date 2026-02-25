@@ -187,11 +187,9 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         let commit_hash = self.repository.commit(&path, new_commit).await?;
 
         // 6. Unpause the container if we paused it.
-        if was_paused {
-            if let Some(runtime) = &runtime_config {
-                let instance_id = InstanceId(runtime.container_name.clone());
-                self.compute.unpause(&instance_id).await?;
-            }
+        if was_paused && let Some(runtime) = &runtime_config {
+            let instance_id = InstanceId(runtime.container_name.clone());
+            self.compute.unpause(&instance_id).await?;
         }
 
         tracing::info!("Commit created: {}", commit_hash);

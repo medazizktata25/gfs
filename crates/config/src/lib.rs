@@ -21,7 +21,7 @@ use serde::Deserialize;
 /// [metrics]
 /// interval_secs = 5
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub node:          NodeConfig,
@@ -60,16 +60,6 @@ pub struct MetricsConfig {
     /// How often metrics are collected and flushed, in seconds.
     /// Defaults to `5`.
     pub interval_secs: u64,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            node:          NodeConfig::default(),
-            control_plane: ControlPlaneConfig::default(),
-            metrics:       MetricsConfig::default(),
-        }
-    }
 }
 
 impl Default for NodeConfig {

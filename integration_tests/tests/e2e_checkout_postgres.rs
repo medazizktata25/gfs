@@ -65,15 +65,15 @@ impl MainContainerCleanup {
 
 impl Drop for MainContainerCleanup {
     fn drop(&mut self) {
-        if let Ok(mut id) = self.0.lock() {
-            if let Some(container_id) = id.take() {
-                let _ = Command::new("docker")
-                    .args(["stop", &container_id])
-                    .output();
-                let _ = Command::new("docker")
-                    .args(["rm", "-f", &container_id])
-                    .output();
-            }
+        if let Ok(mut id) = self.0.lock()
+            && let Some(container_id) = id.take()
+        {
+            let _ = Command::new("docker")
+                .args(["stop", &container_id])
+                .output();
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &container_id])
+                .output();
         }
     }
 }
@@ -277,6 +277,7 @@ fn gfs_compute_status(path: &Path) -> (bool, String, String) {
     (out.status.success(), stdout, stderr)
 }
 
+#[allow(dead_code)]
 fn gfs_compute_stop(path: &Path) -> (bool, String, String) {
     let out = Command::new("cargo")
         .args([
@@ -352,6 +353,7 @@ fn run_pgbench_init(container_id: &str) -> (Duration, String) {
     (elapsed, report)
 }
 
+#[allow(dead_code)]
 fn run_psql_list_tables(container_id: &str) -> String {
     let out = Command::new("docker")
         .args([
@@ -408,6 +410,7 @@ fn run_one_off_postgres_list_tables_as_host_user(host_data_path: &Path) -> Strin
 
 /// Run a one-off Postgres container as the postgres user (999:999, same as official image).
 /// Use when the data dir is owned by a container (e.g. main/0 after the compute wrote to it).
+#[allow(dead_code)]
 fn run_one_off_postgres_list_tables_as_postgres(host_data_path: &Path) -> String {
     run_one_off_postgres_list_tables_inner(host_data_path, Some("999:999"))
 }

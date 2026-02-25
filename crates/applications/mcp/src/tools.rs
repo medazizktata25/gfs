@@ -139,6 +139,12 @@ pub struct GfsMcpHandler {
     tool_router: ToolRouter<Self>,
 }
 
+impl Default for GfsMcpHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[tool_router]
 impl GfsMcpHandler {
     pub fn new() -> Self {
@@ -350,11 +356,11 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
             .run(repo_path, message.to_string(), author, author_email, None, None)
             .await
             .map_err(|e| to_error_data(e.to_string()))?;
-        return json_ok(json!({
+        json_ok(json!({
             "branch": branch,
             "commit_id": commit_hash,
             "message": message,
-        }));
+        }))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -664,11 +670,11 @@ async fn start_or_restart(
         compute.stop(instance_id).await.map_err(|e| to_error_data(e.to_string()))?;
         compute.remove_instance(instance_id).await.map_err(|e| to_error_data(e.to_string()))?;
         let mut definition = provider.definition();
-        if let Some(ref env) = config.environment {
-            if !env.database_version.is_empty() {
-                let base = definition.image.split(':').next().unwrap_or(&definition.image);
-                definition.image = format!("{}:{}", base, env.database_version);
-            }
+        if let Some(ref env) = config.environment
+            && !env.database_version.is_empty()
+        {
+            let base = definition.image.split(':').next().unwrap_or(&definition.image);
+            definition.image = format!("{}:{}", base, env.database_version);
         }
         definition.host_data_dir = Some(std::path::PathBuf::from(&active));
         let new_id = compute

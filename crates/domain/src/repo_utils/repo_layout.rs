@@ -70,7 +70,7 @@ pub fn init_repo_layout(working_dir: &Path, mount_point: Option<String>) -> Resu
         validate_repo_layout(&gfs_dir)?;
         tracing::info!("Using existing .gfs directory at {}", gfs_dir.display());
         if let Some(mount_point) = mount_point {
-            update_project_mount_point(&working_dir, mount_point)?;
+            update_project_mount_point(working_dir, mount_point)?;
         }
         return Ok(());
     }
@@ -123,7 +123,7 @@ pub fn init_repo_layout(working_dir: &Path, mount_point: Option<String>) -> Resu
 
     // Create config.toml
     let config = GfsConfig {
-        mount_point: mount_point,
+        mount_point,
         version: env!("CARGO_PKG_VERSION").to_string(),
         description: "Guepard Filesystem".to_string(),
         user: None,
@@ -202,9 +202,9 @@ pub fn get_current_branch(path: &Path) -> Result<String, RepoError> {
 
 pub fn update_project_mount_point(repo_path: &Path, mount_point: String) -> Result<(), RepoError> {
     tracing::trace!("Updating project mount point to {}", mount_point);
-    let mut config = GfsConfig::load(&repo_path)?;
+    let mut config = GfsConfig::load(repo_path)?;
     config.mount_point = Some(mount_point);
-    config.save(&repo_path)?;
+    config.save(repo_path)?;
     Ok(())
 }
 
@@ -213,9 +213,9 @@ pub fn update_runtime_config(
     runtime_config: RuntimeConfig,
 ) -> Result<(), RepoError> {
     tracing::trace!("Updating runtime config to {}", runtime_config);
-    let mut config = GfsConfig::load(&repo_path)?;
+    let mut config = GfsConfig::load(repo_path)?;
     config.runtime = Some(runtime_config);
-    config.save(&repo_path)?;
+    config.save(repo_path)?;
     Ok(())
 }
 
@@ -235,12 +235,12 @@ pub fn update_environment_config(
 }
 
 pub fn get_runtime_config(repo_path: &Path) -> Result<Option<RuntimeConfig>, RepoError> {
-    let config = GfsConfig::load(&repo_path)?;
+    let config = GfsConfig::load(repo_path)?;
     Ok(config.runtime)
 }
 
 pub fn get_mount_point(repo_path: &Path) -> Result<Option<String>, RepoError> {
-    let config = GfsConfig::load(&repo_path)?;
+    let config = GfsConfig::load(repo_path)?;
     Ok(config.mount_point)
 }
 
@@ -707,6 +707,7 @@ pub fn short_commit_id_for_workspace(commit_id: &str) -> String {
 /// Returns the path of the workspace data directory for the current HEAD.
 /// - On a branch: `workspaces/<branch>/0/data` (one persistent workspace per branch).
 /// - Detached HEAD: `workspaces/detached/<short_commit_id>/data`.
+///
 /// Does not create it.
 pub fn get_workspace_data_dir_path(repo_path: &Path) -> Result<std::path::PathBuf, RepoError> {
     let branch = get_current_branch(repo_path)?;
@@ -916,7 +917,7 @@ name = "test-repo"
         init_repo_layout(&repo_dir, None).unwrap();
 
         let result = get_current_branch(&repo_dir).unwrap();
-        assert!(result == String::from(MAIN_BRANCH));
+        assert!(result == MAIN_BRANCH);
     }
 
     #[test]
@@ -935,7 +936,7 @@ name = "test-repo"
             "1000000000000000000000000000000000000000",
         )
         .unwrap();
-        fs::create_dir_all(&repo_dir.join(GFS_DIR).join(OBJECTS_DIR).join("10"))
+        fs::create_dir_all(repo_dir.join(GFS_DIR).join(OBJECTS_DIR).join("10"))
             .map_err(RepoError::from)
             .unwrap();
 
@@ -976,7 +977,7 @@ name = "test-repo"
         fs::write(&commit_path, serde_json::to_string(&commit).unwrap()).unwrap();
 
         let result = get_snapshot_from_branch(&repo_dir, MAIN_BRANCH).unwrap();
-        assert!(result == String::from("0000000000000000000000000000000000000000"));
+        assert!(result == "0000000000000000000000000000000000000000");
     }
 
     #[test]
@@ -1052,7 +1053,7 @@ name = "test-repo"
             objects_dir
                 .join("00")
                 .join("0000000000000000000000000000000000000000"),
-            "{}".to_string(),
+            "{}",
         )
         .unwrap();
 

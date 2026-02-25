@@ -1,9 +1,9 @@
 use crate::model::errors::CommitError;
 use crate::model::layout::{GFS_DIR, HEAD_FILE, HEADS_DIR, REFS_DIR};
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 
-pub fn get_head(working_dir: &PathBuf) -> Result<String, CommitError> {
+pub fn get_head(working_dir: &Path) -> Result<String, CommitError> {
     let head_path = working_dir.join(GFS_DIR).join(HEAD_FILE);
     let head = fs::read_to_string(head_path)?;
     let trimmed_head = head.trim();
@@ -25,7 +25,7 @@ pub fn get_head(working_dir: &PathBuf) -> Result<String, CommitError> {
     }
 }
 
-pub fn get_head_commit_hash(working_dir: &PathBuf) -> Result<Option<String>, CommitError> {
+pub fn get_head_commit_hash(working_dir: &Path) -> Result<Option<String>, CommitError> {
     let head = get_head(working_dir)?;
     let commit_path = working_dir
         .join(GFS_DIR)
@@ -42,7 +42,7 @@ pub fn get_head_commit_hash(working_dir: &PathBuf) -> Result<Option<String>, Com
 }
 
 #[cfg(test)]
-pub fn set_head(working_dir: &PathBuf, reference: &str) -> Result<(), CommitError> {
+pub fn set_head(working_dir: &Path, reference: &str) -> Result<(), CommitError> {
     let head_path = working_dir.join(GFS_DIR).join(HEAD_FILE);
     let trimmed_ref = reference.trim();
 

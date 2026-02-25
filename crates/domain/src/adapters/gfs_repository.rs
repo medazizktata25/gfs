@@ -64,12 +64,9 @@ fn set_workspace_dir_permissions(path: &Path) -> std::io::Result<()> {
             .arg("0700")
             .arg(path)
             .status()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         if !status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "chmod -R 0700 failed",
-            ));
+            return Err(std::io::Error::other("chmod -R 0700 failed"));
         }
     }
     Ok(())
@@ -121,11 +118,11 @@ impl Repository for GfsRepository {
         let mut commit = Commit::from_new_commit(&new_commit, commit_hash.clone());
 
         // 3. Enrich with database_provider and database_version from repo config.
-        if let Ok(config) = GfsConfig::load(&repo) {
-            if let Some(env) = config.environment {
-                commit.database_provider = Some(env.database_provider);
-                commit.database_version = Some(env.database_version);
-            }
+        if let Ok(config) = GfsConfig::load(&repo)
+            && let Some(env) = config.environment
+        {
+            commit.database_provider = Some(env.database_provider);
+            commit.database_version = Some(env.database_version);
         }
 
         // 4. Enrich with files list, file stats, and snapshot physical size.
@@ -317,15 +314,11 @@ impl Repository for GfsRepository {
         let mut current = start;
 
         loop {
-            if let Some(ref until) = until_hash {
-                if current == *until {
-                    break;
-                }
+            if let Some(ref until) = until_hash && current == *until {
+                break;
             }
-            if let Some(limit) = options.limit {
-                if commits.len() >= limit {
-                    break;
-                }
+            if let Some(limit) = options.limit && commits.len() >= limit {
+                break;
             }
 
             let mut commit = repo_layout::get_commit_from_hash(repo, &current).map_err(map_err)?;
