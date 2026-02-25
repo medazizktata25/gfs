@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 gfs-domain = { workspace = true }
 gfs-compute-docker        = { workspace = true }
+gfs-storage-file   = { workspace = true }
 gfs-mcp            = { workspace = true }
 chrono             = { workspace = true }
 clap               = { workspace = true }

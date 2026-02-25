@@ -32,10 +32,9 @@ pub async fn commit(
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (path, message, author, author_email);
-        anyhow::bail!(
-            "commit requires a storage backend; only macOS (APFS) is supported at this time"
-        )
+        use gfs_storage_file::FileStorage;
+        let storage: Arc<dyn StoragePort> = Arc::new(FileStorage::new());
+        run(path, message, author, author_email, storage).await
     }
 }
 

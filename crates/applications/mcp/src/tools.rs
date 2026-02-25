@@ -365,11 +365,29 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (repo_path, author, author_email);
-        json_err(
-            "commit requires a storage backend; only macOS (APFS) is supported at this time",
-            Some("UNSUPPORTED_PLATFORM"),
-        )
+        use gfs_domain::ports::storage::StoragePort;
+        let storage: Arc<dyn StoragePort> = Arc::new(gfs_storage_file::FileStorage::new());
+        let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
+        let compute: Arc<dyn Compute> = Arc::new(
+            DockerCompute::new().map_err(|e| to_error_data(format!("Docker: {e}")))?,
+        );
+        let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+        containers::register_all(registry.as_ref())
+            .map_err(|e| to_error_data(format!("register providers: {e}")))?;
+        let use_case = CommitRepoUseCase::new(repository.clone(), compute, storage, registry);
+        let branch = repository
+            .get_current_branch(&repo_path)
+            .await
+            .unwrap_or_else(|_| "HEAD".to_string());
+        let commit_hash = use_case
+            .run(repo_path, message.to_string(), author, author_email, None, None)
+            .await
+            .map_err(|e| to_error_data(e.to_string()))?;
+        json_ok(json!({
+            "branch": branch,
+            "commit_id": commit_hash,
+            "message": message,
+        }))
     }
 }
 

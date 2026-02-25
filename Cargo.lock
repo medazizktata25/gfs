@@ -622,6 +622,7 @@ dependencies = [
  "gfs-domain",
  "gfs-mcp",
  "gfs-storage-apfs",
+ "gfs-storage-file",
  "rmcp",
  "serde_json",
  "tokio",
@@ -682,6 +683,7 @@ dependencies = [
  "gfs-compute-docker",
  "gfs-domain",
  "gfs-storage-apfs",
+ "gfs-storage-file",
  "rmcp",
  "serde",
  "serde_json",
@@ -693,6 +695,18 @@ dependencies = [
 
 [[package]]
 name = "gfs-storage-apfs"
+version = "1.0.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "gfs-domain",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "gfs-storage-file"
 version = "1.0.0"
 dependencies = [
  "async-trait",
