@@ -6,6 +6,11 @@
 #![allow(dead_code)] // Helpers used by different test binaries
 
 use std::path::Path;
+use std::sync::Mutex;
+
+/// Global lock for stdout/stderr redirection. The `gag` crate's Redirect is process-global;
+/// concurrent tests would otherwise get "Redirect already exists" when running in parallel.
+static REDIRECT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Run gfs CLI in-process with the given args. Returns (success, stdout, stderr).
 /// Args should be like ["gfs", "init", path] or ["gfs", "commit", "-m", "msg", "--path", path].
@@ -18,6 +23,8 @@ where
 
     #[cfg(unix)]
     {
+        let _guard = REDIRECT_LOCK.lock().expect("redirect lock");
+
         let stdout_file = tempfile::NamedTempFile::new().expect("temp stdout");
         let stderr_file = tempfile::NamedTempFile::new().expect("temp stderr");
         let stdout_path = stdout_file.path().to_path_buf();

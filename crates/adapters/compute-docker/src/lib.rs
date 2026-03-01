@@ -124,6 +124,7 @@ impl Compute for DockerCompute {
                     .collect(),
             ),
             host_config: Some(host_config),
+            user: definition.user.clone(),
             cmd: if definition.args.is_empty() {
                 None
             } else {

@@ -188,6 +188,10 @@ pub struct ComputeDefinition {
     /// Host path to bind-mount onto `data_dir`; if `Some`, enables persistent storage.
     pub host_data_dir: Option<PathBuf>,
 
+    /// Optional "uid:gid" to run the container as (e.g. host user for bind mounts).
+    /// When set, files created in host_data_dir are owned by this user on the host.
+    pub user: Option<String>,
+
     /// Directory for instance logs (optional).
     pub logs_dir: Option<PathBuf>,
 

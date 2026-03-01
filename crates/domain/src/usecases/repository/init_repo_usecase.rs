@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::utils::current_user;
+
 use crate::model::config::{EnvironmentConfig, RuntimeConfig};
 use crate::ports::compute::{Compute, ComputeError, StartOptions};
 use crate::ports::database_provider::DatabaseProviderRegistry;
@@ -111,6 +113,13 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             .get_workspace_data_dir_for_head(repo_path)
             .await?;
         definition.host_data_dir = Some(workspace_data_dir);
+
+        // Run container as host user so files in bind-mounted data dir are owned by current user.
+        // This avoids "Permission denied" when gfs commit copies the workspace for snapshotting.
+        #[cfg(unix)]
+        {
+            definition.user = current_user::current_user_uid_gid();
+        }
 
         let id = self.compute.provision(&definition).await?;
         self.compute.start(&id, StartOptions::default()).await?;
@@ -449,6 +458,7 @@ mod tests {
                 ports: vec![],
                 data_dir: PathBuf::from("/data"),
                 host_data_dir: None,
+                user: None,
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],

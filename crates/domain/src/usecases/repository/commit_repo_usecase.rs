@@ -716,6 +716,7 @@ mod tests {
                 ports: vec![],
                 data_dir: PathBuf::from("/data"),
                 host_data_dir: None,
+                user: None,
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],

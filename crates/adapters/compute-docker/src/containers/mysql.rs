@@ -52,6 +52,7 @@ impl MysqlProvider {
             }],
             data_dir: PathBuf::from(CONTAINER_DATA_DIR),
             host_data_dir: None, // set by caller at provision time
+            user: None,
             logs_dir: None,
             conf_dir: None,
             args: vec![],
@@ -264,6 +265,7 @@ impl DatabaseProvider for MysqlProvider {
                     ports: vec![],
                     data_dir: PathBuf::from("/data"),
                     host_data_dir: None, // set by orchestrator
+                    user: None,
                     logs_dir: None,
                     conf_dir: None,
                     args: vec![],
@@ -284,6 +286,7 @@ impl DatabaseProvider for MysqlProvider {
                     ports: vec![],
                     data_dir: PathBuf::from("/data"),
                     host_data_dir: None, // set by orchestrator
+                    user: None,
                     logs_dir: None,
                     conf_dir: None,
                     args: vec![],
@@ -320,6 +323,7 @@ impl DatabaseProvider for MysqlProvider {
                     ports: vec![],
                     data_dir: PathBuf::from("/data"),
                     host_data_dir: None, // set by orchestrator
+                    user: None,
                     logs_dir: None,
                     conf_dir: None,
                     args: vec![],
@@ -519,6 +523,7 @@ COLUMNS_EOF
                 ports: vec![],
                 data_dir: PathBuf::from("/tmp"),
                 host_data_dir: None,
+                user: None,
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],

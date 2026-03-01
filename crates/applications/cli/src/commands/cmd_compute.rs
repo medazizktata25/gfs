@@ -9,6 +9,7 @@ use gfs_domain::ports::database_provider::{
     DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
 };
 use gfs_domain::repo_utils::repo_layout;
+use gfs_domain::utils::current_user;
 
 use crate::ComputeAction;
 use crate::cli_utils::{get_repo_dir, relativize_to_repo};
@@ -274,6 +275,10 @@ async fn start_restart_or_recreate(
         definition.image = format!("{}:{}", base, env.database_version);
     }
     definition.host_data_dir = Some(std::path::PathBuf::from(&active));
+    #[cfg(unix)]
+    {
+        definition.user = current_user::current_user_uid_gid();
+    }
     let new_id = compute.provision(&definition).await?;
     let status = compute.start(&new_id, Default::default()).await?;
 
