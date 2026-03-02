@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false   
       matrix:
         include:
           # Linux x86_64
