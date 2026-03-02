@@ -21,13 +21,6 @@ jobs:
             artifact_name: gfs-linux-x64
             archive_name: gfs-linux-x64.tar.gz
 
-          # Linux ARM64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            binary_name: gfs
-            artifact_name: gfs-linux-arm64
-            archive_name: gfs-linux-arm64.tar.gz
-
           # macOS x86_64
           - os: macos-latest-large
             target: x86_64-apple-darwin
@@ -58,10 +51,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross (for Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install cross
-
       - name: Cache cargo registry
         uses: actions/cache@v5
         with:
@@ -75,19 +64,13 @@ jobs:
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo build
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
         uses: actions/cache@v5
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build (native)
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p gfs-cli
-
-      - name: Build (cross - Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cross build --release --target ${{ matrix.target }} -p gfs-cli
 
       - name: Create archive (tar.gz for Linux)
         if: runner.os == 'Linux'
@@ -199,7 +182,6 @@ jobs:
             ### Supported Platforms
 
             - **Linux x86_64**: `gfs-linux-x64.tar.gz`
-            - **Linux ARM64**: `gfs-linux-arm64.tar.gz`
             - **macOS x86_64**: `gfs-darwin-x64.zip`
             - **macOS ARM64**: `gfs-darwin-arm64.zip`
             - **Windows x86_64**: `gfs-windows-x86_64.tar.gz`
