@@ -4,6 +4,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::model::commit::NewCommit;
+use crate::model::config::GlobalSettings;
 use crate::ports::compute::{Compute, ComputeError, InstanceId, InstanceState};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
 use crate::ports::repository::{Repository, RepositoryError};
@@ -100,18 +101,46 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         let environment = self.repository.get_environment_config(&path).await?;
         let mount_point = self.repository.get_mount_point(&path).await?;
 
-        // Use user config as fallback for author / committer.
+        // Resolve author / committer with fallback chain:
+        //   CLI args → repo-local config → global ~/.gfs/config.toml → git config → "user"
         let user_config = self.repository.get_user_config(&path).await?;
+        let global_config = GlobalSettings::load();
+        let git_config = repo_layout::get_git_user_config();
+
         let resolved_author = author
             .or_else(|| user_config.as_ref().and_then(|u| u.name.clone()))
+            .or_else(|| {
+                global_config
+                    .as_ref()
+                    .and_then(|g| g.user.as_ref().and_then(|u| u.name.clone()))
+            })
+            .or_else(|| git_config.name.clone())
             .unwrap_or_else(|| "user".to_string());
-        let resolved_author_email =
-            author_email.or_else(|| user_config.as_ref().and_then(|u| u.email.clone()));
+        let resolved_author_email = author_email
+            .or_else(|| user_config.as_ref().and_then(|u| u.email.clone()))
+            .or_else(|| {
+                global_config
+                    .as_ref()
+                    .and_then(|g| g.user.as_ref().and_then(|u| u.email.clone()))
+            })
+            .or_else(|| git_config.email.clone());
         let resolved_committer = committer
             .or_else(|| user_config.as_ref().and_then(|u| u.name.clone()))
+            .or_else(|| {
+                global_config
+                    .as_ref()
+                    .and_then(|g| g.user.as_ref().and_then(|u| u.name.clone()))
+            })
+            .or_else(|| git_config.name.clone())
             .unwrap_or_else(|| "user".to_string());
-        let resolved_committer_email =
-            committer_email.or_else(|| user_config.as_ref().and_then(|u| u.email.clone()));
+        let resolved_committer_email = committer_email
+            .or_else(|| user_config.as_ref().and_then(|u| u.email.clone()))
+            .or_else(|| {
+                global_config
+                    .as_ref()
+                    .and_then(|g| g.user.as_ref().and_then(|u| u.email.clone()))
+            })
+            .or_else(|| git_config.email.clone());
 
         // 2. Extract and store schema (best-effort) while the container is still running.
         //    Must run before pausing, since schema extraction requires a live database connection.

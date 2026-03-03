@@ -1,10 +1,17 @@
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::errors::RepoError;
 use crate::model::layout::{CONFIG_FILE, GFS_DIR};
+
+/// Returns the user's home directory ($HOME on Unix, %USERPROFILE% on Windows).
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserConfig {
@@ -65,6 +72,44 @@ impl GfsConfig {
         let content =
             toml::to_string_pretty(self).map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
         std::fs::write(config_path, content)?;
+        Ok(())
+    }
+}
+
+/// Global GFS settings stored in `~/.gfs/config.toml`.
+///
+/// Provides system-wide defaults for user identity (name, email) that apply
+/// to every repository, similar to `~/.gitconfig`.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct GlobalSettings {
+    #[serde(default)]
+    pub user: Option<UserConfig>,
+}
+
+impl GlobalSettings {
+    /// Path to the global config file: `$HOME/.gfs/config.toml`.
+    pub fn path() -> Option<PathBuf> {
+        home_dir().map(|h| h.join(".gfs").join("config.toml"))
+    }
+
+    /// Load global settings from `~/.gfs/config.toml`.
+    /// Returns `None` if the file does not exist or cannot be parsed.
+    pub fn load() -> Option<Self> {
+        let path = Self::path()?;
+        let content = std::fs::read_to_string(path).ok()?;
+        toml::from_str(&content).ok()
+    }
+
+    /// Save global settings to `~/.gfs/config.toml`, creating `~/.gfs/` if needed.
+    pub fn save(&self) -> Result<(), RepoError> {
+        let path = Self::path()
+            .ok_or_else(|| RepoError::InvalidConfig("cannot determine home directory".into()))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content =
+            toml::to_string_pretty(self).map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
+        std::fs::write(path, content)?;
         Ok(())
     }
 }
@@ -149,6 +194,40 @@ mod tests {
         // Pass path where .gfs does not exist; save writes to repo_path/.gfs/config.toml
         let result = config.save(dir.path());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn global_settings_load_save_roundtrip() {
+        // Override HOME to a temp directory so we don't touch the real ~/.gfs.
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test; no other threads read HOME concurrently.
+        unsafe { std::env::set_var("HOME", dir.path()) };
+
+        let settings = GlobalSettings {
+            user: Some(UserConfig {
+                name: Some("Bob".into()),
+                email: Some("bob@example.com".into()),
+            }),
+        };
+        settings.save().unwrap();
+
+        let loaded = GlobalSettings::load().unwrap();
+        assert_eq!(
+            loaded.user.as_ref().unwrap().name.as_deref(),
+            Some("Bob")
+        );
+        assert_eq!(
+            loaded.user.as_ref().unwrap().email.as_deref(),
+            Some("bob@example.com")
+        );
+    }
+
+    #[test]
+    fn global_settings_load_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test; no other threads read HOME concurrently.
+        unsafe { std::env::set_var("HOME", dir.path()) };
+        assert!(GlobalSettings::load().is_none());
     }
 
     #[test]

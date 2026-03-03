@@ -179,9 +179,13 @@ enum TopLevel {
         author_email: Option<String>,
     },
 
-    /// Read or write repository config (e.g. user.name, user.email)
+    /// Read or write repository or global config (e.g. user.name, user.email)
     Config {
-        /// Path to the GFS repository root (default: current directory)
+        /// Apply to global config (~/.gfs/config.toml) instead of repo-local .gfs/config.toml
+        #[arg(long, short = 'g')]
+        global: bool,
+
+        /// Path to the GFS repository root (default: current directory); ignored with --global
         #[arg(long)]
         path: Option<PathBuf>,
 
@@ -413,8 +417,14 @@ where
             author,
             author_email,
         } => commands::cmd_commit::commit(path, message, author, author_email).await?,
-        TopLevel::Config { path, key, value } => {
-            commands::cmd_config::run(path, key, value).map_err(|e| anyhow::anyhow!("{}", e))?;
+        TopLevel::Config {
+            path,
+            key,
+            value,
+            global,
+        } => {
+            commands::cmd_config::run(path, key, value, global)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
         }
         TopLevel::Checkout {
             path,

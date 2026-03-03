@@ -262,6 +262,33 @@ pub fn get_user_config(repo_path: &Path) -> Result<Option<UserConfig>, RepoError
     Ok(config.user)
 }
 
+/// Read user identity from `git config` (local → global → system).
+/// Returns a `UserConfig` whose fields are `None` when git is unavailable
+/// or no value is configured.
+pub fn get_git_user_config() -> UserConfig {
+    UserConfig {
+        name: run_git_config("user.name"),
+        email: run_git_config("user.email"),
+    }
+}
+
+fn run_git_config(key: &str) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["config", key])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            }
+        })
+}
+
 /// Create `.gfs/snapshots/<first 2 chars of hash>/<remaining 62 chars>/` and
 /// return the full destination path.
 ///
