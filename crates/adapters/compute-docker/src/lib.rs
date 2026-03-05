@@ -42,6 +42,37 @@ impl DockerCompute {
         let docker = bollard::Docker::connect_with_local_defaults()?;
         Ok(Self { docker })
     }
+
+    async fn bind_mount_spec(&self, host_path: &str, container_path: &str) -> String {
+        if self.is_podman_engine().await {
+            // Podman commonly requires SELinux relabeling for bind mounts on Linux.
+            // Keep this Podman-specific so Docker behavior stays unchanged.
+            format!("{}:{}:Z", host_path, container_path)
+        } else {
+            format!("{}:{}", host_path, container_path)
+        }
+    }
+
+    async fn is_podman_engine(&self) -> bool {
+        let Ok(version) = self.docker.version().await else {
+            return false;
+        };
+
+        if version
+            .version
+            .as_deref()
+            .map(|v| v.to_ascii_lowercase().contains("podman"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
+        version
+            .components
+            .unwrap_or_default()
+            .iter()
+            .any(|component| component.name.to_ascii_lowercase().contains("podman"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +135,7 @@ impl Compute for DockerCompute {
         if let Some(ref host_data) = definition.host_data_dir {
             let host_path = host_data.to_string_lossy();
             let container_path = definition.data_dir.to_string_lossy();
-            binds.push(format!("{}:{}", host_path, container_path));
+            binds.push(self.bind_mount_spec(&host_path, &container_path).await);
         }
 
         let host_config = bollard::service::HostConfig {
@@ -530,7 +561,7 @@ impl Compute for DockerCompute {
         if let Some(ref host_data) = definition.host_data_dir {
             let host_path = host_data.to_string_lossy();
             let container_path = definition.data_dir.to_string_lossy();
-            binds.push(format!("{}:{}", host_path, container_path));
+            binds.push(self.bind_mount_spec(&host_path, &container_path).await);
         }
 
         let host_config = bollard::service::HostConfig {

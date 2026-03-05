@@ -25,7 +25,7 @@ pub async fn run_extract(
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
     let compute = Arc::new(
-        DockerCompute::new().context("failed to connect to Docker daemon (is Docker running?)")?,
+        DockerCompute::new().context("failed to connect to Docker/Podman daemon (is your container runtime running?)")?,
     );
 
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());

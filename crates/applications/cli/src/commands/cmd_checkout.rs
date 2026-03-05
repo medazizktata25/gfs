@@ -40,7 +40,7 @@ pub async fn checkout(
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute: Arc<dyn Compute> = Arc::new(
-        DockerCompute::new().context("failed to connect to Docker daemon (is Docker running?)")?,
+        DockerCompute::new().context("failed to connect to Docker/Podman daemon (is your container runtime running?)")?,
     );
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     gfs_compute_docker::containers::register_all(registry.as_ref())

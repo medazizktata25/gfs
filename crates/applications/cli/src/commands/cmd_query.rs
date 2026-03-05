@@ -46,7 +46,7 @@ pub async fn run(
 
     // Set up compute and registry
     let compute = Arc::new(
-        DockerCompute::new().context("failed to connect to Docker daemon (is Docker running?)")?,
+        DockerCompute::new().context("failed to connect to Docker/Podman daemon (is your container runtime running?)")?,
     );
 
     let registry_impl = InMemoryDatabaseProviderRegistry::new();
