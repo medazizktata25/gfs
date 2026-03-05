@@ -21,6 +21,7 @@ use gfs_domain::usecases::repository::{
     import_repo_usecase::ImportRepoUseCase, init_repo_usecase::InitRepositoryUseCase,
     log_repo_usecase::LogRepoUseCase, status_repo_usecase::StatusRepoUseCase,
 };
+use gfs_telemetry::TelemetryClient;
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -200,11 +201,18 @@ pub struct DiffSchemaRequest {
     pub path: Option<String>,
 }
 
+// --- Telemetry source for MCP: detect cursor/claude_code/ci, fallback to "mcp" ---
+fn mcp_source() -> &'static str {
+    let s = gfs_telemetry::detect_source();
+    if s == "cli" { "mcp" } else { s }
+}
+
 // --- Handler ---
 
 #[derive(Debug, Clone)]
 pub struct GfsMcpHandler {
     tool_router: ToolRouter<Self>,
+    telemetry: TelemetryClient,
 }
 
 impl Default for GfsMcpHandler {
@@ -218,6 +226,7 @@ impl GfsMcpHandler {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            telemetry: TelemetryClient::new(),
         }
     }
 
@@ -228,7 +237,9 @@ impl GfsMcpHandler {
         &self,
         _: Parameters<ListProvidersRequest>,
     ) -> Result<CallToolResult, McpError> {
-        do_list_providers().await
+        let result = do_list_providers().await;
+        self.track_mcp("list_providers", &result);
+        result
     }
 
     #[tool(
@@ -241,7 +252,9 @@ impl GfsMcpHandler {
         let args = json!({
             "path": req.path,
         });
-        do_status(&args).await
+        let result = do_status(&args).await;
+        self.track_mcp("status", &result);
+        result
     }
 
     #[tool(
@@ -257,7 +270,9 @@ impl GfsMcpHandler {
             "author": req.author,
             "author_email": req.author_email,
         });
-        do_commit(&args).await
+        let result = do_commit(&args).await;
+        self.track_mcp("commit", &result);
+        result
     }
 
     #[tool(
@@ -273,7 +288,9 @@ impl GfsMcpHandler {
             "from": req.from,
             "until": req.until,
         });
-        do_log(&args).await
+        let result = do_log(&args).await;
+        self.track_mcp("log", &result);
+        result
     }
 
     #[tool(
@@ -288,7 +305,9 @@ impl GfsMcpHandler {
             "create_branch": req.create_branch,
             "path": req.path,
         });
-        do_checkout(&args).await
+        let result = do_checkout(&args).await;
+        self.track_mcp("checkout", &result);
+        result
     }
 
     #[tool(
@@ -303,7 +322,9 @@ impl GfsMcpHandler {
             "database_provider": req.database_provider,
             "database_version": req.database_version,
         });
-        do_init(&args).await
+        let result = do_init(&args).await;
+        self.track_mcp("init", &result);
+        result
     }
 
     #[tool(
@@ -322,7 +343,9 @@ impl GfsMcpHandler {
             "logs_no_stdout": req.logs_no_stdout,
             "logs_no_stderr": req.logs_no_stderr,
         });
-        do_compute(&args).await
+        let result = do_compute(&args).await;
+        self.track_mcp("compute", &result);
+        result
     }
 
     #[tool(
@@ -338,7 +361,9 @@ impl GfsMcpHandler {
             "format": req.format,
             "id": req.id,
         });
-        do_export(&args).await
+        let result = do_export(&args).await;
+        self.track_mcp("export", &result);
+        result
     }
 
     #[tool(
@@ -354,7 +379,9 @@ impl GfsMcpHandler {
             "format": req.format,
             "id": req.id,
         });
-        do_import(&args).await
+        let result = do_import(&args).await;
+        self.track_mcp("import", &result);
+        result
     }
 
     #[tool(
@@ -369,7 +396,9 @@ impl GfsMcpHandler {
             "database": req.database,
             "query": req.query,
         });
-        do_query(&args).await
+        let result = do_query(&args).await;
+        self.track_mcp("query", &result);
+        result
     }
 
     #[tool(
@@ -380,7 +409,9 @@ impl GfsMcpHandler {
         Parameters(req): Parameters<ExtractSchemaRequest>,
     ) -> Result<CallToolResult, McpError> {
         let args = json!({ "path": req.path });
-        do_extract_schema(&args).await
+        let result = do_extract_schema(&args).await;
+        self.track_mcp("extract_schema", &result);
+        result
     }
 
     #[tool(
@@ -396,7 +427,9 @@ impl GfsMcpHandler {
             "metadata_only": req.metadata_only,
             "ddl_only": req.ddl_only,
         });
-        do_show_schema(&args).await
+        let result = do_show_schema(&args).await;
+        self.track_mcp("show_schema", &result);
+        result
     }
 
     #[tool(
@@ -411,7 +444,43 @@ impl GfsMcpHandler {
             "commit2": req.commit2,
             "path": req.path,
         });
-        do_diff_schema(&args).await
+        let result = do_diff_schema(&args).await;
+        self.track_mcp("diff_schema", &result);
+        result
+    }
+}
+
+impl GfsMcpHandler {
+    /// Track a tool invocation. Uses `"mcp"` as source (or `"cursor"`/`"claude_code"` if detected).
+    fn track_mcp(&self, command: &'static str, result: &Result<CallToolResult, McpError>) {
+        let source = mcp_source();
+        let version = env!("CARGO_PKG_VERSION");
+        let os = std::env::consts::OS;
+        match result {
+            Ok(_) => {
+                self.telemetry.track(
+                    "command_executed",
+                    vec![
+                        ("command", json!(command)),
+                        ("source", json!(source)),
+                        ("version", json!(version)),
+                        ("os", json!(os)),
+                    ],
+                );
+            }
+            Err(_) => {
+                self.telemetry.track(
+                    "command_failed",
+                    vec![
+                        ("command", json!(command)),
+                        ("source", json!(source)),
+                        ("version", json!(version)),
+                        ("os", json!(os)),
+                        ("error_category", json!("McpError")),
+                    ],
+                );
+            }
+        }
     }
 }
 

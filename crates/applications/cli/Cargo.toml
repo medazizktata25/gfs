@@ -28,7 +28,8 @@ name = "schema_extract_postgres"
 path = "tests/schema/extract_postgres.rs"
 
 [dependencies]
-gfs-domain = { workspace = true }
+gfs-domain     = { workspace = true }
+gfs-telemetry  = { workspace = true }
 gfs-compute-docker        = { workspace = true }
 gfs-storage-file   = { workspace = true }
 gfs-mcp            = { workspace = true }

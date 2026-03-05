@@ -53,6 +53,8 @@ rmcp = { version = "0.16.0", features = [
     "transport-streamable-http-server",
     "transport-io",
 ] }
+posthog-rs             = { version = "0.4", default-features = false }
+uuid                   = { version = "1", features = ["v4"] }
 gfs-domain                 = { path = "crates/domain" }
 gfs-telemetry              = { path = "crates/telemetry" }
 gfs-config                 = { path = "crates/config" }

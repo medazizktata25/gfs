@@ -13,8 +13,9 @@ name = "gfs-mcp"
 path = "src/main.rs"
 
 [dependencies]
-rmcp = { workspace = true }
-gfs-domain = { workspace = true }
+rmcp          = { workspace = true }
+gfs-domain    = { workspace = true }
+gfs-telemetry = { workspace = true }
 gfs-compute-docker = { workspace = true }
 gfs-storage-file = { workspace = true }
 tokio = { workspace = true }

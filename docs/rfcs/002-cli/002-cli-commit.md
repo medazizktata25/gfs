@@ -20,8 +20,8 @@ gfs commit -m <message> [--path <dir>] [--author <name>] [--author-email <email>
 |------|----------|-------------|
 | `-m`, `--message` | **yes** | Commit message. Must be non-empty. |
 | `--path` | no | Path to the GFS repository root (directory that contains `.gfs/`). Defaults to the current working directory. |
-| `--author` | no | Override the author name. Falls back to `user.name` from the repo config, then `"user"`. |
-| `--author-email` | no | Override the author e-mail. Falls back to `user.email` from the repo config. |
+| `--author` | no | Override the author name. Falls back through: repo config → global config → git config → `"user"`. |
+| `--author-email` | no | Override the author e-mail. Falls back through: repo config → global config → git config. |
 
 The **committer** is set to the same value as the author (same name/email) unless overridden at the use-case level.
 
@@ -87,8 +87,8 @@ error: storage error: volume not found: '/mnt/my-vol'
 | Field | Source |
 |-------|--------|
 | `message` | `--message` / `-m` CLI flag |
-| `author` | `--author` flag → `user.name` in repo config → `"user"` |
-| `author_email` | `--author-email` flag → `user.email` in repo config |
+| `author` | `--author` flag → `user.name` in `.gfs/config.toml` → `user.name` in `~/.gfs/config.toml` → `git config user.name` → `"user"` |
+| `author_email` | `--author-email` flag → `user.email` in `.gfs/config.toml` → `user.email` in `~/.gfs/config.toml` → `git config user.email` |
 | `committer` / `committer_email` | Same as author |
 | `snapshot_hash` | Returned `SnapshotId.0` from `StoragePort::snapshot` |
 | `parents` | Current commit id read from `Repository::get_current_commit_id`; `None` when `"0"` (initial commit) |

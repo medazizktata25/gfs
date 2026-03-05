@@ -13,6 +13,8 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use gfs_domain::ports::storage::{CloneOptions, SnapshotId, SnapshotOptions, VolumeId};
+use gfs_telemetry::TelemetryClient;
+use serde_json::json;
 
 use crate::output::ColorMode;
 
@@ -179,9 +181,13 @@ enum TopLevel {
         author_email: Option<String>,
     },
 
-    /// Read or write repository config (e.g. user.name, user.email)
+    /// Read or write repository or global config (e.g. user.name, user.email)
     Config {
-        /// Path to the GFS repository root (default: current directory)
+        /// Apply to global config (~/.gfs/config.toml) instead of repo-local .gfs/config.toml
+        #[arg(long, short = 'g')]
+        global: bool,
+
+        /// Path to the GFS repository root (default: current directory); ignored with --global
         #[arg(long)]
         path: Option<PathBuf>,
 
@@ -380,6 +386,26 @@ enum StorageAction {
 // Run entry point
 // ---------------------------------------------------------------------------
 
+fn command_name(cmd: &TopLevel) -> &'static str {
+    match cmd {
+        TopLevel::Init { .. } => "init",
+        TopLevel::Commit { .. } => "commit",
+        TopLevel::Config { .. } => "config",
+        TopLevel::Checkout { .. } => "checkout",
+        TopLevel::Export { .. } => "export",
+        TopLevel::Import { .. } => "import",
+        TopLevel::Providers { .. } => "providers",
+        TopLevel::Log { .. } => "log",
+        TopLevel::Status { .. } => "status",
+        TopLevel::Query { .. } => "query",
+        TopLevel::Schema { .. } => "schema",
+        TopLevel::Storage { .. } => "storage",
+        TopLevel::Compute { .. } => "compute",
+        TopLevel::Mcp { .. } => "mcp",
+        TopLevel::Version => "version",
+    }
+}
+
 /// Run the CLI with the given arguments. Returns `Ok(ExitCode::SUCCESS)` on success,
 /// or `Err` with an error message. Use for programmatic invocation and unit tests.
 pub async fn run<I, T>(args: I) -> Result<ExitCode>
@@ -397,92 +423,139 @@ where
     let cli = Cli::try_parse_from(args_os)?;
     cli.color.init();
 
-    match cli.command {
-        TopLevel::Init {
-            path,
-            database_provider,
-            database_version,
-        } => {
-            commands::cmd_init::init(path, database_provider, database_version)
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-        }
-        TopLevel::Commit {
-            message,
-            path,
-            author,
-            author_email,
-        } => commands::cmd_commit::commit(path, message, author, author_email).await?,
-        TopLevel::Config { path, key, value } => {
-            commands::cmd_config::run(path, key, value).map_err(|e| anyhow::anyhow!("{}", e))?;
-        }
-        TopLevel::Checkout {
-            path,
-            create_branch,
-            revision,
-        } => commands::cmd_checkout::checkout(path, revision, create_branch).await?,
-        TopLevel::Export {
-            path,
-            output_dir,
-            format,
-            id,
-        } => commands::cmd_export::run(path, output_dir, format, id).await?,
-        TopLevel::Import {
-            path,
-            file,
-            format,
-            id,
-        } => commands::cmd_import::run(path, file, format, id).await?,
-        TopLevel::Providers { provider } => {
-            commands::cmd_providers::run(provider).map_err(|e| anyhow::anyhow!("{}", e))?;
-        }
-        TopLevel::Log {
-            path,
-            max_count,
-            from,
-            until,
-            full_hash,
-        } => commands::cmd_log::log(path, max_count, from, until, full_hash).await?,
-        TopLevel::Status { path, output } => commands::cmd_status::run(path, output).await?,
-        TopLevel::Query {
-            path,
-            database,
-            query,
-        } => commands::cmd_query::run(path, database, query).await?,
-        TopLevel::Schema { action } => match action {
-            SchemaAction::Extract {
+    // Skip telemetry for Version and Mcp (MCP tracks its own events)
+    let skip_telemetry = matches!(cli.command, TopLevel::Version | TopLevel::Mcp { .. });
+    let cmd_name = command_name(&cli.command);
+    let telemetry = TelemetryClient::new();
+    let source = gfs_telemetry::detect_source();
+    let version = env!("CARGO_PKG_VERSION");
+    let os = std::env::consts::OS;
+
+    // Capture color before moving cli.command (ColorMode is Copy)
+    let color = cli.color;
+
+    let result: Result<()> = async move {
+        match cli.command {
+            TopLevel::Init {
                 path,
-                output,
-                compact,
-            } => commands::cmd_schema::run_extract(path, output, compact).await?,
-            SchemaAction::Show {
-                commit,
-                path,
-                metadata_only,
-                ddl_only,
-            } => commands::cmd_schema::run_show(commit, path, metadata_only, ddl_only).await?,
-            SchemaAction::Diff {
-                commit1,
-                commit2,
-                path,
-                pretty,
-                json,
-                no_color,
+                database_provider,
+                database_version,
             } => {
-                let no_color = no_color || cli.color == ColorMode::Never;
-                commands::cmd_schema::run_diff(commit1, commit2, path, pretty, json, no_color)
-                    .await?
+                commands::cmd_init::init(path, database_provider, database_version)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
             }
-        },
-        TopLevel::Storage { action } => run_storage(action).await?,
-        TopLevel::Compute { path, action } => run_compute(path, action).await?,
-        TopLevel::Mcp { path, action } => {
-            let action = action.unwrap_or(McpAction::Stdio);
-            commands::cmd_mcp::run(path, action).await?;
+            TopLevel::Commit {
+                message,
+                path,
+                author,
+                author_email,
+            } => commands::cmd_commit::commit(path, message, author, author_email).await?,
+            TopLevel::Config {
+                path,
+                key,
+                value,
+                global,
+            } => {
+                commands::cmd_config::run(path, key, value, global)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            }
+            TopLevel::Checkout {
+                path,
+                create_branch,
+                revision,
+            } => commands::cmd_checkout::checkout(path, revision, create_branch).await?,
+            TopLevel::Export {
+                path,
+                output_dir,
+                format,
+                id,
+            } => commands::cmd_export::run(path, output_dir, format, id).await?,
+            TopLevel::Import {
+                path,
+                file,
+                format,
+                id,
+            } => commands::cmd_import::run(path, file, format, id).await?,
+            TopLevel::Providers { provider } => {
+                commands::cmd_providers::run(provider).map_err(|e| anyhow::anyhow!("{}", e))?;
+            }
+            TopLevel::Log {
+                path,
+                max_count,
+                from,
+                until,
+                full_hash,
+            } => commands::cmd_log::log(path, max_count, from, until, full_hash).await?,
+            TopLevel::Status { path, output } => commands::cmd_status::run(path, output).await?,
+            TopLevel::Query {
+                path,
+                database,
+                query,
+            } => commands::cmd_query::run(path, database, query).await?,
+            TopLevel::Schema { action } => match action {
+                SchemaAction::Extract {
+                    path,
+                    output,
+                    compact,
+                } => commands::cmd_schema::run_extract(path, output, compact).await?,
+                SchemaAction::Show {
+                    commit,
+                    path,
+                    metadata_only,
+                    ddl_only,
+                } => commands::cmd_schema::run_show(commit, path, metadata_only, ddl_only).await?,
+                SchemaAction::Diff {
+                    commit1,
+                    commit2,
+                    path,
+                    pretty,
+                    json,
+                    no_color,
+                } => {
+                    let no_color = no_color || color == ColorMode::Never;
+                    commands::cmd_schema::run_diff(commit1, commit2, path, pretty, json, no_color)
+                        .await?
+                }
+            },
+            TopLevel::Storage { action } => run_storage(action).await?,
+            TopLevel::Compute { path, action } => run_compute(path, action).await?,
+            TopLevel::Mcp { path, action } => {
+                let action = action.unwrap_or(McpAction::Stdio);
+                commands::cmd_mcp::run(path, action).await?;
+            }
+            TopLevel::Version => commands::cmd_version::run(),
         }
-        TopLevel::Version => commands::cmd_version::run(),
+        Ok(())
+    }
+    .await;
+
+    if !skip_telemetry {
+        if let Err(ref e) = result {
+            telemetry.track(
+                "command_failed",
+                vec![
+                    ("command", json!(cmd_name)),
+                    ("source", json!(source)),
+                    ("version", json!(version)),
+                    ("os", json!(os)),
+                    ("error_category", json!(gfs_telemetry::error_category(e))),
+                ],
+            );
+        } else {
+            telemetry.track(
+                "command_executed",
+                vec![
+                    ("command", json!(cmd_name)),
+                    ("source", json!(source)),
+                    ("version", json!(version)),
+                    ("os", json!(os)),
+                ],
+            );
+        }
     }
 
+    result?;
     Ok(ExitCode::SUCCESS)
 }
 
