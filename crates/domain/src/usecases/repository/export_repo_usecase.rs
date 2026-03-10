@@ -89,32 +89,36 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
         // Resolve output directory: use provided path or default to .gfs/exports/
         let output_dir = if let Some(dir) = output_dir {
             // Validate that the output directory is within the repository (security)
-            let canonical_path = std::fs::canonicalize(path)
-                .map_err(|e| ExportRepoError::Config(format!("cannot canonicalize repo path: {e}")))?;
-            
+            let canonical_path = std::fs::canonicalize(path).map_err(|e| {
+                ExportRepoError::Config(format!("cannot canonicalize repo path: {e}"))
+            })?;
+
             // Resolve output directory relative to repo
             let resolved_output = if dir.is_absolute() {
                 dir.clone()
             } else {
                 path.join(&dir)
             };
-            
+
             // Validate: canonicalize if exists, otherwise validate path structure
             if resolved_output.exists() {
-                let canonical_output = std::fs::canonicalize(&resolved_output)
-                    .map_err(|e| ExportRepoError::Config(format!("cannot canonicalize output dir: {e}")))?;
+                let canonical_output = std::fs::canonicalize(&resolved_output).map_err(|e| {
+                    ExportRepoError::Config(format!("cannot canonicalize output dir: {e}"))
+                })?;
                 if !canonical_output.starts_with(&canonical_path) {
-                    return Err(ExportRepoError::Config(
-                        format!("output directory must be within repository: {}", dir.display())
-                    ));
+                    return Err(ExportRepoError::Config(format!(
+                        "output directory must be within repository: {}",
+                        dir.display()
+                    )));
                 }
             } else {
                 // For non-existent paths, check that resolved path is within repo
                 // by ensuring it starts with the canonical repo path
                 if !resolved_output.starts_with(&canonical_path) {
-                    return Err(ExportRepoError::Config(
-                        format!("output directory must be within repository: {}", dir.display())
-                    ));
+                    return Err(ExportRepoError::Config(format!(
+                        "output directory must be within repository: {}",
+                        dir.display()
+                    )));
                 }
             }
             dir
@@ -488,7 +492,9 @@ mod tests {
             Arc::new(MockRegistry),
         );
         let output_dir = dir.path().join("export_out");
-        let result = usecase.run(dir.path(), Some(output_dir.clone()), "sql").await;
+        let result = usecase
+            .run(dir.path(), Some(output_dir.clone()), "sql")
+            .await;
         assert!(result.is_ok());
         let output = result.unwrap();
         assert_eq!(output.format, "sql");

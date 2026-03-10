@@ -58,7 +58,7 @@ where
             // Last resort: use system temp (may fail on Linux with Docker)
             std::env::temp_dir()
         });
-    
+
     let temp = Builder::new()
         .prefix("gfs-test-")
         .tempdir_in(&temp_base)
@@ -78,8 +78,7 @@ where
     assert!(
         init_ok,
         "gfs init should succeed\nstdout: {}\nstderr: {}",
-        init_stdout,
-        init_stderr
+        init_stdout, init_stderr
     );
 
     // 2. Register container for cleanup as soon as we have it (runs on drop, including panic)
