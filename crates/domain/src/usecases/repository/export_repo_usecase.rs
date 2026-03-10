@@ -75,7 +75,7 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
     ///
     /// - `path`: GFS repository root.
     /// - `output_dir`: host directory where the export file will be written (created if absent).
-    ///                  If `None`, defaults to `.gfs/exports/` within the repository.
+    ///   If `None`, defaults to `.gfs/exports/` within the repository.
     /// - `format`: export format identifier (e.g. `"sql"`, `"custom"`).
     pub async fn run(
         &self,
