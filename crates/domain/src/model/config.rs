@@ -215,8 +215,9 @@ mod tests {
     fn global_settings_load_save_roundtrip() {
         // Override HOME to a temp directory so we don't touch the real ~/.gfs.
         let dir = tempfile::tempdir().unwrap();
+        let home_path = dir.path().to_string_lossy().to_string();
         // SAFETY: single-threaded test; no other threads read HOME concurrently.
-        unsafe { std::env::set_var("HOME", dir.path()) };
+        unsafe { std::env::set_var("HOME", &home_path) };
 
         let settings = GlobalSettings {
             user: Some(UserConfig {
@@ -238,8 +239,9 @@ mod tests {
     #[test]
     fn global_settings_load_missing_returns_none() {
         let dir = tempfile::tempdir().unwrap();
+        let home_path = dir.path().to_string_lossy().to_string();
         // SAFETY: single-threaded test; no other threads read HOME concurrently.
-        unsafe { std::env::set_var("HOME", dir.path()) };
+        unsafe { std::env::set_var("HOME", &home_path) };
         assert!(GlobalSettings::load().is_none());
     }
 

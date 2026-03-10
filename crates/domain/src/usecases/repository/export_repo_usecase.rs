@@ -75,15 +75,52 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
     ///
     /// - `path`: GFS repository root.
     /// - `output_dir`: host directory where the export file will be written (created if absent).
+    ///                  If `None`, defaults to `.gfs/exports/` within the repository.
     /// - `format`: export format identifier (e.g. `"sql"`, `"custom"`).
     pub async fn run(
         &self,
         path: &Path,
-        output_dir: PathBuf,
+        output_dir: Option<PathBuf>,
         format: &str,
     ) -> Result<ExportOutput, ExportRepoError> {
         // 1. Load repo config.
         let config = GfsConfig::load(path).map_err(|e| ExportRepoError::Config(e.to_string()))?;
+
+        // Resolve output directory: use provided path or default to .gfs/exports/
+        let output_dir = if let Some(dir) = output_dir {
+            // Validate that the output directory is within the repository (security)
+            let canonical_path = std::fs::canonicalize(path)
+                .map_err(|e| ExportRepoError::Config(format!("cannot canonicalize repo path: {e}")))?;
+            
+            // Resolve output directory relative to repo
+            let resolved_output = if dir.is_absolute() {
+                dir.clone()
+            } else {
+                path.join(&dir)
+            };
+            
+            // Validate: canonicalize if exists, otherwise validate path structure
+            if resolved_output.exists() {
+                let canonical_output = std::fs::canonicalize(&resolved_output)
+                    .map_err(|e| ExportRepoError::Config(format!("cannot canonicalize output dir: {e}")))?;
+                if !canonical_output.starts_with(&canonical_path) {
+                    return Err(ExportRepoError::Config(
+                        format!("output directory must be within repository: {}", dir.display())
+                    ));
+                }
+            } else {
+                // For non-existent paths, check that resolved path is within repo
+                // by ensuring it starts with the canonical repo path
+                if !resolved_output.starts_with(&canonical_path) {
+                    return Err(ExportRepoError::Config(
+                        format!("output directory must be within repository: {}", dir.display())
+                    ));
+                }
+            }
+            dir
+        } else {
+            path.join(".gfs").join("exports")
+        };
 
         let provider_name = config
             .environment
@@ -451,7 +488,7 @@ mod tests {
             Arc::new(MockRegistry),
         );
         let output_dir = dir.path().join("export_out");
-        let result = usecase.run(dir.path(), output_dir.clone(), "sql").await;
+        let result = usecase.run(dir.path(), Some(output_dir.clone()), "sql").await;
         assert!(result.is_ok());
         let output = result.unwrap();
         assert_eq!(output.format, "sql");
@@ -477,7 +514,7 @@ mod tests {
             Arc::new(MockRegistry),
         );
         let output_dir = dir.path().join("export_out");
-        let result = usecase.run(dir.path(), output_dir, "sql").await;
+        let result = usecase.run(dir.path(), Some(output_dir), "sql").await;
         assert!(matches!(result, Err(ExportRepoError::TaskFailed { .. })));
     }
 
@@ -504,7 +541,7 @@ mod tests {
             Arc::new(MockRegistry),
         );
         let result = usecase
-            .run(dir.path(), dir.path().to_path_buf(), "sql")
+            .run(dir.path(), Some(dir.path().to_path_buf()), "sql")
             .await;
         assert!(matches!(result, Err(ExportRepoError::NotConfigured(_))));
     }
@@ -535,7 +572,7 @@ mod tests {
             Arc::new(MockRegistry),
         );
         let result = usecase
-            .run(dir.path(), dir.path().to_path_buf(), "sql")
+            .run(dir.path(), Some(dir.path().to_path_buf()), "sql")
             .await;
         assert!(matches!(result, Err(ExportRepoError::NotConfigured(_))));
     }
@@ -559,7 +596,7 @@ mod tests {
             Arc::new(MockRegistry),
         );
         let result = usecase
-            .run(dir.path(), dir.path().to_path_buf(), "sql")
+            .run(dir.path(), Some(dir.path().to_path_buf()), "sql")
             .await;
         assert!(matches!(result, Err(ExportRepoError::ProviderNotFound(_))));
     }
@@ -583,7 +620,7 @@ mod tests {
             Arc::new(MockRegistry),
         );
         let result = usecase
-            .run(dir.path(), dir.path().to_path_buf(), "custom")
+            .run(dir.path(), Some(dir.path().to_path_buf()), "custom")
             .await;
         assert!(matches!(result, Err(ExportRepoError::UnsupportedFormat(_))));
     }

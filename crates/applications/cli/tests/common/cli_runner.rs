@@ -73,7 +73,7 @@ pub fn gfs_init(path: &Path) -> bool {
 
 /// Convenience: gfs init --database-provider postgres --database-version 17 <path>
 pub fn gfs_init_with_db(path: &Path) -> bool {
-    let (ok, _, _) = run_gfs([
+    let (ok, stdout, stderr) = run_gfs([
         "gfs",
         "init",
         "--database-provider",
@@ -82,6 +82,9 @@ pub fn gfs_init_with_db(path: &Path) -> bool {
         "17",
         path.to_str().unwrap(),
     ]);
+    if !ok {
+        eprintln!("gfs init failed:\nstdout: {}\nstderr: {}", stdout, stderr);
+    }
     ok
 }
 

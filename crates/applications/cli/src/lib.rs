@@ -219,8 +219,9 @@ enum TopLevel {
         path: Option<PathBuf>,
 
         /// Directory where the export file will be written (created if absent)
+        /// Defaults to .gfs/exports/ if not provided
         #[arg(long)]
-        output_dir: PathBuf,
+        output_dir: Option<PathBuf>,
 
         /// Export format (e.g. sql, custom)
         #[arg(long)]

@@ -13,7 +13,7 @@ use crate::output::{cyan, green};
 
 pub async fn run(
     path: Option<PathBuf>,
-    output_dir: PathBuf,
+    output_dir: Option<PathBuf>,
     format: String,
     id: Option<String>,
 ) -> Result<()> {
