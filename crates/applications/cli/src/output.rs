@@ -91,9 +91,7 @@ use std::io::{self, Write};
 pub fn println_safe(args: std::fmt::Arguments) -> io::Result<()> {
     match writeln!(io::stdout(), "{}", args) {
         Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-            Ok(())
-        }
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         Err(e) => Err(e),
     }
 }

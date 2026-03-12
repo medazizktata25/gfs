@@ -1,5 +1,7 @@
 edition          = "2024"
 max_width        = 100
 use_field_init_shorthand = true
-imports_granularity      = "Crate"
-group_imports            = "StdExternalCrate"
+# imports_granularity and group_imports are unstable features requiring nightly
+# Removed to avoid warnings in CI/CD pipelines using stable Rust
+# imports_granularity      = "Crate"
+# group_imports            = "StdExternalCrate"
