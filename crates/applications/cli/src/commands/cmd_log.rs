@@ -37,7 +37,7 @@ pub async fn log(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     for cwr in &commits {
-        print_commit_block(cwr, full_hash);
+        print_commit_block(cwr, full_hash)?;
     }
 
     Ok(())
@@ -47,14 +47,16 @@ pub async fn log(
 // Display (git-style format)
 // ---------------------------------------------------------------------------
 
-fn print_commit_block(cwr: &gfs_domain::model::commit::CommitWithRefs, full_hash: bool) {
+fn print_commit_block(
+    cwr: &gfs_domain::model::commit::CommitWithRefs,
+    full_hash: bool,
+) -> std::io::Result<()> {
     let hash_full = cwr
         .commit
         .hash
         .as_deref()
         .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
 
-    // Display short or full hash based on flag
     let hash_display =
         gfs_domain::repo_utils::repo_layout::format_commit_hash(hash_full, full_hash);
 
@@ -63,12 +65,12 @@ fn print_commit_block(cwr: &gfs_domain::model::commit::CommitWithRefs, full_hash
     } else {
         format!(" ({})", cwr.refs.join(", "))
     };
-    println!(
+    println_safe!(
         "{} {}{}",
         dimmed("commit"),
         dimmed(hash_display),
         green(refs_str)
-    );
+    )?;
 
     let author = &cwr.commit.author;
     let author_email = cwr.commit.author_email.as_deref().unwrap_or("");
@@ -82,17 +84,18 @@ fn print_commit_block(cwr: &gfs_domain::model::commit::CommitWithRefs, full_hash
             dimmed(author_email)
         )
     };
-    println!("{}", author_line);
+    println_safe!("{}", author_line)?;
 
     let date_str = cwr.commit.author_date.format("%a %b %e %H:%M:%S %Y %z");
-    println!("{}   {}", dimmed("Date:"), date_str);
+    println_safe!("{}   {}", dimmed("Date:"), date_str)?;
 
-    println!();
+    println_safe!()?;
     for line in cwr.commit.message.lines() {
-        println!("    {}", line);
+        println_safe!("    {}", line)?;
     }
     if !cwr.commit.message.ends_with('\n') && !cwr.commit.message.is_empty() {
-        println!();
+        println_safe!()?;
     }
-    println!();
+    println_safe!()?;
+    Ok(())
 }

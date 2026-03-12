@@ -79,3 +79,33 @@ pub fn bold(s: impl AsRef<str>) -> String {
     let s = s.as_ref().to_string();
     format!("{}", s.if_supports_color(Stream::Stdout, |t| t.bold()))
 }
+
+// ---------------------------------------------------------------------------
+// Safe printing helpers - handle broken pipe errors gracefully
+// ---------------------------------------------------------------------------
+
+use std::io::{self, Write};
+
+/// Safely print a line, handling broken pipe errors gracefully.
+/// Returns Ok(()) on success or broken pipe, Err for other errors.
+pub fn println_safe(args: std::fmt::Arguments) -> io::Result<()> {
+    match writeln!(io::stdout(), "{}", args) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Macro for safe printing that handles broken pipe errors.
+/// Use this instead of println! when output may be piped.
+#[macro_export]
+macro_rules! println_safe {
+    () => {
+        $crate::output::println_safe(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::output::println_safe(format_args!($($arg)*))
+    };
+}

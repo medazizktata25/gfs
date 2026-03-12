@@ -2,9 +2,10 @@
 //!
 //! Provides a programmatic interface to run the CLI. Use `run()` for testing or embedding.
 
+#[macro_use]
+pub mod output;
 mod cli_utils;
 mod commands;
-pub mod output;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
