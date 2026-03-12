@@ -24,7 +24,7 @@ use gfs_domain::ports::compute::{
 };
 use tracing::instrument;
 
-use crate::error::classify;
+use crate::error::{classify, classify_with_mount_path};
 
 /// Host path string suitable for Docker bind mounts. Verbatim Windows paths
 /// (`\\?\...`) break Docker’s `host:container` parsing; map them to normal paths.
@@ -286,11 +286,12 @@ impl Compute for DockerCompute {
             .name(&name)
             .build();
 
+        let mount_path = definition.host_data_dir.clone();
         let _create = self
             .docker
             .create_container(Some(options), config)
             .await
-            .map_err(|e| classify(&name, e))?;
+            .map_err(|e| classify_with_mount_path(&name, e, mount_path))?;
 
         // Store the container name in config (not the ID) so that after restart/recreate
         // the same name can be used to look up the container; Docker assigns a new ID on recreate.
@@ -707,10 +708,11 @@ impl Compute for DockerCompute {
             .name(&task_name)
             .build();
 
+        let mount_path = definition.host_data_dir.clone();
         self.docker
             .create_container(Some(create_opts), config)
             .await
-            .map_err(|e| classify(&task_name, e))?;
+            .map_err(|e| classify_with_mount_path(&task_name, e, mount_path))?;
 
         // 6. Connect to the linked instance's network if needed.
         if let Some(network) = &linked_network {
