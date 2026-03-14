@@ -21,7 +21,8 @@ pub async fn init(
     let target_path = path.unwrap_or_else(get_repo_dir);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute: Arc<dyn Compute> = Arc::new(DockerCompute::new().map_err(|e| e.to_string())?);
+    let compute: Arc<dyn Compute> =
+        Arc::new(DockerCompute::new().map_err(|e| DockerCompute::format_connection_error(&e))?);
 
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())?;

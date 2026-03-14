@@ -48,7 +48,7 @@ fn resolve_id(path: Option<PathBuf>, action: &ComputeAction) -> Result<String> {
 
 pub async fn run(path: Option<PathBuf>, action: ComputeAction) -> Result<()> {
     let compute = DockerCompute::new()
-        .map_err(|e| anyhow::anyhow!("failed to connect to Docker/Podman daemon: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{}", DockerCompute::format_connection_error(&e)))?;
     let id = resolve_id(path.clone(), &action)?;
     dispatch(&compute, &id, action, path).await
 }

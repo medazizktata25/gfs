@@ -539,8 +539,10 @@ async fn do_status(args: &serde_json::Value) -> Result<CallToolResult, McpError>
     let repo_path = repo_path_from_value(args);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute =
-        Arc::new(DockerCompute::new().map_err(|e| to_error_data(format!("Docker: {e}")))?);
+    let compute = Arc::new(
+        DockerCompute::new()
+            .map_err(|e| to_error_data(DockerCompute::format_connection_error(&e).to_string()))?,
+    );
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -591,7 +593,9 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         let storage: Arc<dyn StoragePort> = Arc::new(gfs_storage_apfs::ApfsStorage::new());
         let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
         let compute: Arc<dyn Compute> =
-            Arc::new(DockerCompute::new().map_err(|e| to_error_data(format!("Docker: {e}")))?);
+            Arc::new(DockerCompute::new().map_err(|e| {
+                to_error_data(DockerCompute::format_connection_error(&e).to_string())
+            })?);
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
         containers::register_all(registry.as_ref())
             .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -624,7 +628,9 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         let storage: Arc<dyn StoragePort> = Arc::new(gfs_storage_file::FileStorage::new());
         let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
         let compute: Arc<dyn Compute> =
-            Arc::new(DockerCompute::new().map_err(|e| to_error_data(format!("Docker: {e}")))?);
+            Arc::new(DockerCompute::new().map_err(|e| {
+                to_error_data(DockerCompute::format_connection_error(&e).to_string())
+            })?);
         let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
         containers::register_all(registry.as_ref())
             .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -747,8 +753,10 @@ async fn do_init(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
         .map(String::from);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute =
-        Arc::new(DockerCompute::new().map_err(|e| to_error_data(format!("Docker: {e}")))?);
+    let compute = Arc::new(
+        DockerCompute::new()
+            .map_err(|e| to_error_data(DockerCompute::format_connection_error(&e).to_string()))?,
+    );
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -799,7 +807,8 @@ async fn do_compute(args: &serde_json::Value) -> Result<CallToolResult, McpError
         }
     };
 
-    let compute = DockerCompute::new().map_err(|e| to_error_data(format!("Docker: {e}")))?;
+    let compute = DockerCompute::new()
+        .map_err(|e| to_error_data(DockerCompute::format_connection_error(&e).to_string()))?;
     let instance_id = InstanceId(id);
 
     let result = match action {
