@@ -45,9 +45,10 @@ pub async fn run(
     let container_name = &runtime.container_name;
 
     // Set up compute and registry
-    let compute = Arc::new(DockerCompute::new().context(
-        "failed to connect to Docker/Podman daemon (is your container runtime running?)",
-    )?);
+    let compute = Arc::new(
+        DockerCompute::new()
+            .map_err(|e| anyhow::anyhow!("{}", DockerCompute::format_connection_error(&e)))?,
+    );
 
     let registry_impl = InMemoryDatabaseProviderRegistry::new();
     gfs_compute_docker::containers::register_all(&registry_impl)

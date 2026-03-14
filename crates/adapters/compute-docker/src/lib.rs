@@ -108,6 +108,73 @@ impl DockerCompute {
         }
     }
 
+    /// Convert a bollard connection error into a user-friendly error message.
+    /// Detects common connection failure scenarios and provides actionable hints.
+    pub fn format_connection_error(err: &bollard::errors::Error) -> String {
+        let err_str = err.to_string();
+        let err_lower = err_str.to_ascii_lowercase();
+
+        let is_connection_error = err_lower.contains("connect")
+            || err_lower.contains("connection refused")
+            || err_lower.contains("connection reset")
+            || err_lower.contains("no such file")
+            || err_lower.contains("permission denied")
+            || err_lower.contains("hyper legacy client");
+
+        if !is_connection_error {
+            return format!("Docker connection error: {}", err_str);
+        }
+
+        let is_permission_error =
+            err_lower.contains("permission denied") || err_lower.contains("access denied");
+
+        let is_socket_missing =
+            err_lower.contains("no such file") || err_lower.contains("cannot connect");
+
+        #[cfg(unix)]
+        let hints = if is_permission_error {
+            vec![
+                "Docker/Podman daemon is running but current user lacks permissions",
+                "Add your user to the docker group: sudo usermod -aG docker $USER",
+                "Or run with sudo (not recommended for security)",
+                "For Podman rootless: ensure podman socket is accessible",
+            ]
+        } else if is_socket_missing {
+            vec![
+                "Docker/Podman daemon is not running",
+                "Start Docker: sudo systemctl start docker (or start Docker Desktop)",
+                "Start Podman: systemctl --user start podman.socket (for rootless)",
+                "Verify: docker ps or podman ps",
+            ]
+        } else {
+            vec![
+                "Docker/Podman daemon is not accessible",
+                "Check if Docker/Podman service is running",
+                "Verify socket permissions: ls -l /var/run/docker.sock",
+                "For Podman rootless: check XDG_RUNTIME_DIR/podman/podman.sock",
+            ]
+        };
+
+        #[cfg(windows)]
+        let hints = vec![
+            "Docker Desktop is not running",
+            "Start Docker Desktop from the Start menu",
+            "Verify Docker is running: docker ps",
+        ];
+
+        format!(
+            "GFS was not able to connect to Docker/Podman.\n\n\
+            Check the following:\n{}\n\n\
+            Original error: {}",
+            hints
+                .iter()
+                .map(|h| format!("- {}", h))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            err_str
+        )
+    }
+
     #[cfg(unix)]
     fn podman_socket_path() -> Option<std::path::PathBuf> {
         let from_xdg = std::env::var_os("XDG_RUNTIME_DIR")
@@ -978,8 +1045,8 @@ impl DockerCompute {
 }
 
 #[cfg(test)]
-mod host_path_tests {
-    use super::{host_path_for_docker_bind, resolve_host_bind_path};
+mod tests {
+    use super::{host_path_for_docker_bind, resolve_host_bind_path, DockerCompute};
     use std::path::Path;
 
     #[test]
@@ -1015,5 +1082,80 @@ mod host_path_tests {
         let current = std::env::current_dir().expect("current dir");
         let resolved = resolve_host_bind_path(Path::new("target")).expect("resolve relative path");
         assert_eq!(resolved, current.join("target"));
+    }
+
+    #[test]
+    fn format_connection_error_connection_refused() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "connection refused".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("GFS was not able to connect to Docker/Podman"));
+        assert!(formatted.contains("Check the following"));
+        assert!(formatted.contains("connection refused"));
+    }
+
+    #[test]
+    fn format_connection_error_permission_denied() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 403,
+            message: "permission denied".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("GFS was not able to connect to Docker/Podman"));
+        #[cfg(unix)]
+        {
+            assert!(formatted.contains("permission denied"));
+            assert!(formatted.contains("docker group"));
+        }
+    }
+
+    #[test]
+    fn format_connection_error_socket_missing() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "no such file or directory".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("GFS was not able to connect to Docker/Podman"));
+        #[cfg(unix)]
+        {
+            assert!(formatted.contains("not running"));
+            assert!(formatted.contains("systemctl"));
+        }
+    }
+
+    #[test]
+    fn format_connection_error_hyper_legacy_client() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "Error in the hyper legacy client: client error (Connect)".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("GFS was not able to connect to Docker/Podman"));
+        assert!(formatted.contains("hyper legacy client"));
+    }
+
+    #[test]
+    fn format_connection_error_generic_error() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "some other error".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("Docker connection error"));
+        assert!(formatted.contains("some other error"));
+    }
+
+    #[test]
+    fn format_connection_error_includes_original_error() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "connection refused".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("Original error"));
+        assert!(formatted.contains("connection refused"));
     }
 }
