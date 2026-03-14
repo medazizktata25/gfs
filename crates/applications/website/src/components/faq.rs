@@ -31,7 +31,19 @@ pub fn Faq() -> impl IntoView {
         },
         FaqItem {
             question: "Is GFS open source?",
-            answer: "Yes, GFS is licensed under the Elastic License v2 (ELv2) and the source code is available on GitHub.",
+            answer: "Yes, GFS is licensed under the MIT license and the source code is available on GitHub.",
+        },
+        FaqItem {
+            question: "Can I use GFS with AI coding agents?",
+            answer: "Yes, GFS is designed to work with AI coding agents. It provides a Git-like interface for managing database changes, allowing agents to create branches, roll back, and avoid data loss. GFS also brings productivity tools for agents such as importing, exporting, and querying data without consuming extra tokens for such repetitive actions.",
+        },
+        FaqItem {
+            question: "Can I use GFS in my company?",
+            answer: "Yes, GFS is free to use for personal and commercial purposes. You can use it in your company without any limitations. If you need a production ready database versioning system, check https://guepard.run. Guepard Platform is a commercial database versioning system that is designed to be used in production workflows.",
+        },
+        FaqItem {
+            question: "What is the difference between GFS and Guepard Platform?",
+            answer: "Guepard Platform provides a Cloud and On-Premise database versioning system. It support a large number of databases and versions and provides a control plante and more enterprise features for teams and organizations. GFS is a local database versioning system that is designed to be used for development and testing purposes. If you are a developer or a small team, GFS is a great choice. If you are a large team or an organization that needs support and more enterprise features, Guepard Platform is a great choice.",
         },
     ];
 

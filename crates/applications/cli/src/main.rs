@@ -13,8 +13,11 @@ async fn main() {
         )
         .init();
 
-    if let Err(err) = gfs_cli::run(std::env::args()).await {
-        eprintln!("{} {err:#}", red("error:"));
-        std::process::exit(1);
+    match gfs_cli::run(std::env::args()).await {
+        Ok(exit_code) => std::process::exit(exit_code),
+        Err(err) => {
+            eprintln!("{} {err:#}", red("error:"));
+            std::process::exit(1);
+        }
     }
 }

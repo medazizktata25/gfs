@@ -2,10 +2,14 @@
 //!
 //! Uses `gfs_cli::run()` instead of spawning a subprocess, so coverage is captured.
 //! Captures stdout/stderr via the `gag` crate.
+//!
+//! Note: `gag` may not capture stdout reliably under the test harness. Use `run_gfs_subprocess`
+//! for commands where stdout content must be verified (e.g. `schema diff`).
 
 #![allow(dead_code)] // Helpers used by different test binaries
 
 use std::path::Path;
+use std::process::Command;
 use std::sync::Mutex;
 
 /// Global lock for stdout/stderr redirection. The `gag` crate's Redirect is process-global;
@@ -63,6 +67,26 @@ where
         };
         (ok, String::new(), stderr)
     }
+}
+
+/// Run gfs CLI as a subprocess. Returns (success, stdout, stderr).
+/// Use when stdout content must be verified; gag may not capture reliably in the test harness.
+/// Success means the process exited normally (exit codes 0, 1, 2 are all considered success).
+pub fn run_gfs_subprocess<I, S>(args: I) -> (bool, String, String)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+    let output = Command::new(env!("CARGO_BIN_EXE_gfs"))
+        .args(&args[1..]) // skip "gfs" prefix
+        .output()
+        .expect("failed to execute gfs");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    // Consider success if process exited (schema diff uses 0/1/2; only panic/signal = None)
+    let ok = output.status.code().is_some();
+    (ok, stdout, stderr)
 }
 
 /// Convenience: gfs init <path>

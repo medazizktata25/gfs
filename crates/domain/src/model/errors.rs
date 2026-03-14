@@ -50,6 +50,8 @@ pub enum RepoError {
         prefix: String,
         matches: Vec<String>,
     },
+    #[error("repository already initialized at {0}")]
+    AlreadyInitialized(PathBuf),
 }
 
 fn format_matches(matches: &[String]) -> String {
@@ -72,6 +74,10 @@ impl RepoError {
 
     pub fn missing_file(path: PathBuf) -> Self {
         RepoError::MissingFile(path)
+    }
+
+    pub fn already_initialized(path: PathBuf) -> Self {
+        RepoError::AlreadyInitialized(path)
     }
 }
 

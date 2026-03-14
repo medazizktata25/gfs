@@ -72,8 +72,8 @@ fn schema_diff_agentic_format_default() {
 
     let hash2 = repo_layout::get_current_commit_id(repo_path).unwrap();
 
-    // Run diff (default agentic format)
-    let (ok, stdout, _) = cli_runner::run_gfs([
+    // Run diff (default agentic format). Use subprocess for reliable stdout capture.
+    let (ok, stdout, _) = cli_runner::run_gfs_subprocess([
         "gfs",
         "schema",
         "diff",
@@ -167,8 +167,8 @@ fn schema_diff_pretty_format() {
 
     let hash2 = repo_layout::get_current_commit_id(repo_path).unwrap();
 
-    // Run diff with --pretty flag
-    let (ok, stdout, _) = cli_runner::run_gfs([
+    // Run diff with --pretty flag. Use subprocess for reliable stdout capture.
+    let (ok, stdout, _) = cli_runner::run_gfs_subprocess([
         "gfs",
         "schema",
         "diff",
@@ -377,13 +377,13 @@ fn schema_diff_json_format() {
 
     let hash1 = repo_layout::get_current_commit_id(repo_path).unwrap();
 
-    // Add another table
+    // Add another table (nullable columns only to avoid breaking changes)
     let (ok, _, _) = cli_runner::run_gfs([
         "gfs",
         "query",
         "--path",
         repo_path.to_str().unwrap(),
-        "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT);",
+        "CREATE TABLE orders (id INT, user_id INT);",
     ]);
     assert!(ok, "CREATE TABLE orders failed");
 
@@ -400,8 +400,8 @@ fn schema_diff_json_format() {
 
     let hash2 = repo_layout::get_current_commit_id(repo_path).unwrap();
 
-    // Run diff with --json flag
-    let (ok, stdout, _) = cli_runner::run_gfs([
+    // Run diff with --json flag. Use subprocess for reliable stdout capture.
+    let (ok, stdout, _) = cli_runner::run_gfs_subprocess([
         "gfs",
         "schema",
         "diff",
@@ -505,8 +505,8 @@ fn schema_diff_json_no_changes() {
 
     let hash = repo_layout::get_current_commit_id(repo_path).unwrap();
 
-    // Diff same commit with --json
-    let (ok, stdout, _) = cli_runner::run_gfs([
+    // Diff same commit with --json. Use subprocess for reliable stdout capture.
+    let (ok, stdout, _) = cli_runner::run_gfs_subprocess([
         "gfs",
         "schema",
         "diff",

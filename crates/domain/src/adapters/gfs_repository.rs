@@ -27,6 +27,9 @@ fn map_err(e: RepoError) -> RepositoryError {
     match e {
         RepoError::RevisionNotFound(rev) => RepositoryError::RevisionNotFound(rev),
         RepoError::NoRepoFound(path) => RepositoryError::NotFound(path.display().to_string()),
+        RepoError::AlreadyInitialized(path) => {
+            RepositoryError::AlreadyInitialized(path.display().to_string())
+        }
         _ => RepositoryError::Internal(e.to_string()),
     }
 }

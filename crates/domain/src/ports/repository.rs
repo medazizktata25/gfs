@@ -25,6 +25,9 @@ pub enum RepositoryError {
     #[error("merge conflict: {0}")]
     Conflict(String),
 
+    #[error("repository already initialized at '{0}'")]
+    AlreadyInitialized(String),
+
     #[error("remote error ({remote}): {message}")]
     Remote { remote: String, message: String },
 

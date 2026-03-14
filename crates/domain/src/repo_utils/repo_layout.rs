@@ -71,11 +71,7 @@ pub fn init_repo_layout(working_dir: &Path, mount_point: Option<String>) -> Resu
 
     if gfs_dir.exists() {
         validate_repo_layout(&gfs_dir)?;
-        tracing::info!("Using existing .gfs directory at {}", gfs_dir.display());
-        if let Some(mount_point) = mount_point {
-            update_project_mount_point(working_dir, mount_point)?;
-        }
-        return Ok(());
+        return Err(RepoError::already_initialized(gfs_dir));
     }
 
     tracing::info!(
@@ -1266,6 +1262,16 @@ name = "test-repo"
 
         let result = get_current_branch(&repo_dir).unwrap();
         assert!(result == MAIN_BRANCH);
+    }
+
+    #[test]
+    fn init_repo_layout_fails_when_already_initialized() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        init_repo_layout(&repo_dir, None).unwrap();
+
+        let result = init_repo_layout(&repo_dir, None);
+        assert!(matches!(result, Err(RepoError::AlreadyInitialized(_))));
     }
 
     #[test]

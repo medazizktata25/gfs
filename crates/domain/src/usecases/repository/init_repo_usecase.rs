@@ -169,7 +169,8 @@ mod tests {
         ConnectionParams, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
         ProviderError, Result as RegistryResult, SIGTERM, SupportedFeature,
     };
-    use crate::ports::repository::Repository;
+    use crate::adapters::gfs_repository::GfsRepository;
+    use crate::ports::repository::{Repository, RepositoryError};
 
     struct MockRepository;
 
@@ -593,5 +594,33 @@ mod tests {
             result,
             Err(InitRepoError::UnknownDatabaseProvider(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn init_fails_when_repository_already_initialized() {
+        let usecase = InitRepositoryUseCase::new(
+            Arc::new(GfsRepository::new()),
+            Arc::new(MockCompute),
+            Arc::new(MockRegistry),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // First init succeeds
+        let first = usecase.run(path.clone(), None, None, None).await;
+        assert!(first.is_ok(), "first init should succeed: {:?}", first);
+
+        // Second init fails with AlreadyInitialized
+        let second = usecase.run(path, None, None, None).await;
+        assert!(
+            matches!(
+                second,
+                Err(InitRepoError::Repository(
+                    RepositoryError::AlreadyInitialized(_)
+                ))
+            ),
+            "second init should fail with AlreadyInitialized: {:?}",
+            second
+        );
     }
 }

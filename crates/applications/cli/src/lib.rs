@@ -8,7 +8,6 @@ pub mod output;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::error::ErrorKind;
@@ -407,9 +406,10 @@ fn command_name(cmd: &TopLevel) -> &'static str {
     }
 }
 
-/// Run the CLI with the given arguments. Returns `Ok(ExitCode::SUCCESS)` on success,
-/// or `Err` with an error message. Use for programmatic invocation and unit tests.
-pub async fn run<I, T>(args: I) -> Result<ExitCode>
+/// Run the CLI with the given arguments. Returns `Ok(exit_code)` on success (0 for most
+/// commands; 1 or 2 for `schema diff` when there are changes). Returns `Err` on failure.
+/// Use for programmatic invocation and unit tests.
+pub async fn run<I, T>(args: I) -> Result<i32>
 where
     I: IntoIterator<Item = T>,
     T: AsRef<str>,
@@ -425,7 +425,7 @@ where
         Ok(c) => c,
         Err(e) if e.kind() == ErrorKind::DisplayVersion || e.kind() == ErrorKind::DisplayHelp => {
             e.print().expect("writing version/help to stdout/stderr");
-            return Ok(ExitCode::SUCCESS);
+            return Ok(0);
         }
         Err(e) => return Err(e.into()),
     };
@@ -442,7 +442,7 @@ where
     // Capture color before moving cli.command (ColorMode is Copy)
     let color = cli.color;
 
-    let result: Result<()> = async move {
+    let result: Result<i32> = async move {
         match cli.command {
             TopLevel::Init {
                 path,
@@ -452,13 +452,17 @@ where
                 commands::cmd_init::init(path, database_provider, database_version)
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(0)
             }
             TopLevel::Commit {
                 message,
                 path,
                 author,
                 author_email,
-            } => commands::cmd_commit::commit(path, message, author, author_email).await?,
+            } => {
+                commands::cmd_commit::commit(path, message, author, author_email).await?;
+                Ok(0)
+            }
             TopLevel::Config {
                 path,
                 key,
@@ -467,26 +471,37 @@ where
             } => {
                 commands::cmd_config::run(path, key, value, global)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(0)
             }
             TopLevel::Checkout {
                 path,
                 create_branch,
                 revision,
-            } => commands::cmd_checkout::checkout(path, revision, create_branch).await?,
+            } => {
+                commands::cmd_checkout::checkout(path, revision, create_branch).await?;
+                Ok(0)
+            }
             TopLevel::Export {
                 path,
                 output_dir,
                 format,
                 id,
-            } => commands::cmd_export::run(path, output_dir, format, id).await?,
+            } => {
+                commands::cmd_export::run(path, output_dir, format, id).await?;
+                Ok(0)
+            }
             TopLevel::Import {
                 path,
                 file,
                 format,
                 id,
-            } => commands::cmd_import::run(path, file, format, id).await?,
+            } => {
+                commands::cmd_import::run(path, file, format, id).await?;
+                Ok(0)
+            }
             TopLevel::Providers { provider } => {
                 commands::cmd_providers::run(provider).map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(0)
             }
             TopLevel::Log {
                 path,
@@ -494,25 +509,40 @@ where
                 from,
                 until,
                 full_hash,
-            } => commands::cmd_log::log(path, max_count, from, until, full_hash).await?,
-            TopLevel::Status { path, output } => commands::cmd_status::run(path, output).await?,
+            } => {
+                commands::cmd_log::log(path, max_count, from, until, full_hash).await?;
+                Ok(0)
+            }
+            TopLevel::Status { path, output } => {
+                commands::cmd_status::run(path, output).await?;
+                Ok(0)
+            }
             TopLevel::Query {
                 path,
                 database,
                 query,
-            } => commands::cmd_query::run(path, database, query).await?,
+            } => {
+                commands::cmd_query::run(path, database, query).await?;
+                Ok(0)
+            }
             TopLevel::Schema { action } => match action {
                 SchemaAction::Extract {
                     path,
                     output,
                     compact,
-                } => commands::cmd_schema::run_extract(path, output, compact).await?,
+                } => {
+                    commands::cmd_schema::run_extract(path, output, compact).await?;
+                    Ok(0)
+                }
                 SchemaAction::Show {
                     commit,
                     path,
                     metadata_only,
                     ddl_only,
-                } => commands::cmd_schema::run_show(commit, path, metadata_only, ddl_only).await?,
+                } => {
+                    commands::cmd_schema::run_show(commit, path, metadata_only, ddl_only).await?;
+                    Ok(0)
+                }
                 SchemaAction::Diff {
                     commit1,
                     commit2,
@@ -523,18 +553,27 @@ where
                 } => {
                     let no_color = no_color || color == ColorMode::Never;
                     commands::cmd_schema::run_diff(commit1, commit2, path, pretty, json, no_color)
-                        .await?
+                        .await
                 }
             },
-            TopLevel::Storage { action } => run_storage(action).await?,
-            TopLevel::Compute { path, action } => run_compute(path, action).await?,
+            TopLevel::Storage { action } => {
+                run_storage(action).await?;
+                Ok(0)
+            }
+            TopLevel::Compute { path, action } => {
+                run_compute(path, action).await?;
+                Ok(0)
+            }
             TopLevel::Mcp { path, action } => {
                 let action = action.unwrap_or(McpAction::Stdio);
                 commands::cmd_mcp::run(path, action).await?;
+                Ok(0)
             }
-            TopLevel::Version => commands::cmd_version::run(),
+            TopLevel::Version => {
+                commands::cmd_version::run();
+                Ok(0)
+            }
         }
-        Ok(())
     }
     .await;
 
@@ -563,8 +602,7 @@ where
         }
     }
 
-    result?;
-    Ok(ExitCode::SUCCESS)
+    result
 }
 
 // ---------------------------------------------------------------------------

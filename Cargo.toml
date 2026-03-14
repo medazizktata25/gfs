@@ -16,7 +16,7 @@ members = [
 version      = "0.1.12"
 edition      = "2024"
 authors      = ["Guepard Corp <team@guepard.run>"]
-license      = "ELv2"
+license      = "MIT"
 repository   = "https://github.com/Guepard-Corp/gfs"
 rust-version = "1.93"
 

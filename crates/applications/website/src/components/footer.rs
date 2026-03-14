@@ -27,7 +27,7 @@ pub fn Footer() -> impl IntoView {
                     <div class="footer-section">
                         <h3>"Legal"</h3>
                         <ul>
-                            <li><a href="https://github.com/Guepard-Corp/gfs/blob/main/LICENCE" target="_blank">"License (ELv2)"</a></li>
+                            <li><a href="https://github.com/Guepard-Corp/gfs/blob/main/LICENCE" target="_blank">"License (MIT)"</a></li>
                             <li><a href="https://github.com/Guepard-Corp/gfs/blob/main/CODE_OF_CONDUCT.md" target="_blank">"Code of Conduct"</a></li>
                             <li><a href="https://github.com/Guepard-Corp/gfs/blob/main/SECURITY.md" target="_blank">"Security"</a></li>
                         </ul>

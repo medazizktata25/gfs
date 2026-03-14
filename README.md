@@ -461,7 +461,7 @@ cargo run --bin gfs status
 ```bash
 cargo test                        # Run all tests
 cargo test-all                    # Full suite including E2E (sequential)
-RUST_TEST_THREADS=1 cargo test    # Alternative sequential execution
+cargo test -- --test-threads=1    # Alternative sequential execution
 cargo cov                         # Generate coverage report
 cargo test <test_name>            # Run specific tests
 cargo test -- --nocapture         # Run with output
