@@ -1069,7 +1069,7 @@ async fn do_export(args: &serde_json::Value) -> Result<CallToolResult, McpError>
 
     let use_case = ExportRepoUseCase::new(compute, registry);
     let output = use_case
-        .run(&repo_path, output_dir, format)
+        .run(&repo_path, Some(output_dir), format)
         .await
         .map_err(|e| to_error_data(e.to_string()))?;
 

@@ -265,13 +265,20 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
 
         // 2. Export schema DDL using ExportRepoUseCase with "schema" format.
         let export_use_case = ExportRepoUseCase::new(self.compute.clone(), self.registry.clone());
-        let temp_dir = std::env::temp_dir().join(format!(
+        let temp_dir = repo_path.join(".gfs").join("tmp").join(format!(
             "gfs-schema-{}-{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));
+        std::fs::create_dir_all(temp_dir.parent().unwrap()).map_err(|e| {
+            tracing::warn!("Failed to create temp directory: {}", e);
+            Box::new(std::io::Error::other(format!(
+                "cannot create temp directory: {}",
+                e
+            ))) as Box<dyn std::error::Error>
+        })?;
         let export_output = export_use_case
-            .run(repo_path, temp_dir.clone(), "schema")
+            .run(repo_path, Some(temp_dir.clone()), "schema")
             .await
             .map_err(|e| {
                 tracing::warn!("Schema DDL export failed: {}", e);
