@@ -104,8 +104,8 @@ fn log_shows_short_hash_by_default() {
     // Get the full hash
     let full_hash = repo_layout::get_current_commit_id(repo_path).expect("get commit hash");
 
-    // Run log and capture output
-    let (ok, stdout, _) = cli_runner::gfs_log(repo_path, None);
+    // Run log via subprocess so stdout is reliably captured (gag is unreliable for content checks).
+    let (ok, stdout, _) = cli_runner::gfs_log_subprocess(repo_path, None);
     assert!(ok, "log should succeed");
 
     // Verify short hash (7 chars) is displayed
@@ -149,8 +149,8 @@ fn log_shows_full_hash_with_flag() {
     // Get the full hash
     let full_hash = repo_layout::get_current_commit_id(repo_path).expect("get commit hash");
 
-    // Run log with --full-hash flag
-    let (ok, stdout, _) = cli_runner::run_gfs([
+    // Run log with --full-hash via subprocess so stdout is reliably captured.
+    let (ok, stdout, _) = cli_runner::run_gfs_subprocess([
         "gfs",
         "log",
         "--full-hash",
@@ -224,11 +224,15 @@ fn short_hash_works_with_tilde_notation() {
         "postgres should accept connections"
     );
 
-    // Make three commits
-    for i in 1..=3 {
-        let (ok, _, _) = cli_runner::gfs_commit(repo_path, &format!("commit {}", i), None, None);
-        assert!(ok, "commit {} should succeed", i);
-    }
+    // Make three commits; capture hash after first commit (the one we expect after ~2).
+    let (ok, _, _) = cli_runner::gfs_commit(repo_path, "commit 1", None, None);
+    assert!(ok, "commit 1 should succeed");
+    let hash1 = repo_layout::get_current_commit_id(repo_path).expect("get commit hash");
+
+    let (ok, _, _) = cli_runner::gfs_commit(repo_path, "commit 2", None, None);
+    assert!(ok, "commit 2 should succeed");
+    let (ok, _, _) = cli_runner::gfs_commit(repo_path, "commit 3", None, None);
+    assert!(ok, "commit 3 should succeed");
 
     let hash3 = repo_layout::get_current_commit_id(repo_path).expect("get commit hash");
 
@@ -238,9 +242,9 @@ fn short_hash_works_with_tilde_notation() {
     let (ok, _, _) = cli_runner::gfs_checkout(repo_path, &revision);
     assert!(ok, "checkout with short hash and tilde should succeed");
 
-    // Verify we're 2 commits back (at commit 1 which is the initial commit "0")
+    // Verify we're 2 commits back (at commit 1). The first commit has a real hash, not "0".
     let current = repo_layout::get_current_commit_id(repo_path).expect("get current commit");
-    assert_eq!(current, "0", "should be checked out to initial commit");
+    assert_eq!(current, hash1, "should be checked out to first commit (hash1)");
 }
 
 #[test]

@@ -188,6 +188,21 @@ pub fn gfs_log(path: &Path, max_count: Option<usize>) -> (bool, String, String) 
     run_gfs(args)
 }
 
+/// gfs log via subprocess so stdout is reliably captured (use when verifying log output).
+pub fn gfs_log_subprocess(path: &Path, max_count: Option<usize>) -> (bool, String, String) {
+    let mut args: Vec<String> = vec![
+        "gfs".into(),
+        "log".into(),
+        "--path".into(),
+        path.to_str().unwrap().into(),
+    ];
+    if let Some(n) = max_count {
+        args.push("-n".into());
+        args.push(n.to_string());
+    }
+    run_gfs_subprocess(args)
+}
+
 /// Convenience: gfs compute --path <path> status
 pub fn gfs_compute_status(path: &Path) -> (bool, String, String) {
     run_gfs(["gfs", "compute", "--path", path.to_str().unwrap(), "status"])
