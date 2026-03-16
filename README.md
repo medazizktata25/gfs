@@ -49,7 +49,7 @@
 
 ## Important Notice
 
-This project is under active development and not yet suitable for production use. Expect breaking changes, incomplete features, and evolving APIs.
+This project is under active development. Expect changes, incomplete features, and evolving APIs.
 
 ## What is GFS?
 
