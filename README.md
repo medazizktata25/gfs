@@ -452,7 +452,7 @@ cargo build
 Run commands using cargo:
 
 ```bash
-cargo run --bin gfs init --database-provider postgres --database-version 17
+cargo run --bin gfs init --database-provider postgres --database-version 17 [--port 65432]
 cargo run --bin gfs commit -m "v1"
 cargo run --bin gfs log
 cargo run --bin gfs status

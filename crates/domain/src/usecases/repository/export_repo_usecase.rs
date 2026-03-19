@@ -112,9 +112,15 @@ impl<R: DatabaseProviderRegistry> ExportRepoUseCase<R> {
                     )));
                 }
             } else {
-                // For non-existent paths, check that resolved path is within repo
-                // by ensuring it starts with the canonical repo path
-                if !resolved_output.starts_with(&canonical_path) {
+                // For non-existent paths the path can't be canonicalized directly.
+                // Canonicalize the nearest existing ancestor (usually the repo root itself)
+                // to resolve symlinks (e.g. /tmp → /private/tmp on macOS) before comparing.
+                let canonical_output = resolved_output
+                    .parent()
+                    .and_then(|p| std::fs::canonicalize(p).ok())
+                    .map(|p| p.join(resolved_output.file_name().unwrap_or_default()))
+                    .unwrap_or(resolved_output.clone());
+                if !canonical_output.starts_with(&canonical_path) {
                     return Err(ExportRepoError::Config(format!(
                         "output directory must be within repository: {}",
                         dir.display()
@@ -479,6 +485,7 @@ mod tests {
         let env = EnvironmentConfig {
             database_provider: "postgres".into(),
             database_version: "17".into(),
+            database_port: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),
@@ -507,6 +514,7 @@ mod tests {
         let env = EnvironmentConfig {
             database_provider: "postgres".into(),
             database_version: "17".into(),
+            database_port: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),
@@ -564,6 +572,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 database_provider: "postgres".into(),
                 database_version: "17".into(),
+                database_port: None,
             }),
             runtime: Some(RuntimeConfig {
                 runtime_provider: "docker".into(),
@@ -589,6 +598,7 @@ mod tests {
         let env = EnvironmentConfig {
             database_provider: "mysql".into(),
             database_version: "8".into(),
+            database_port: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),
@@ -613,6 +623,7 @@ mod tests {
         let env = EnvironmentConfig {
             database_provider: "postgres".into(),
             database_version: "17".into(),
+            database_port: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),

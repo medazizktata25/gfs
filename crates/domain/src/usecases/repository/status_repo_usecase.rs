@@ -603,6 +603,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 database_provider: "postgres".into(),
                 database_version: "17".into(),
+                database_port: None,
             }),
             runtime: Some(RuntimeConfig {
                 runtime_provider: "docker".into(),

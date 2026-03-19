@@ -106,6 +106,13 @@ pub enum ComputeAction {
         #[arg(long, default_missing_value = "true", num_args = 0..=1)]
         stderr: Option<bool>,
     },
+    /// Read or write a compute config value (e.g. db.port)
+    Config {
+        /// Config key (currently only `db.port` is supported)
+        key: String,
+        /// Value to set
+        value: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +167,10 @@ enum TopLevel {
         /// Database version (e.g. 17 for postgres). Required when --database-provider is set.
         #[arg(long)]
         database_version: Option<String>,
+
+        /// Host port to bind for the database container (e.g. 5432). Default: Docker auto-assigns.
+        #[arg(long)]
+        port: Option<u16>,
     },
 
     /// Record a commit of the current repository state
@@ -449,8 +460,9 @@ where
                 path,
                 database_provider,
                 database_version,
+                port,
             } => {
-                commands::cmd_init::init(path, database_provider, database_version)
+                commands::cmd_init::init(path, database_provider, database_version, port)
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 Ok(0)

@@ -23,6 +23,8 @@ pub struct UserConfig {
 pub struct EnvironmentConfig {
     pub database_provider: String,
     pub database_version: String,
+    #[serde(default)]
+    pub database_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +154,7 @@ mod tests {
             environment: Some(EnvironmentConfig {
                 database_provider: "postgres".into(),
                 database_version: "17".into(),
+                database_port: Some(5432),
             }),
             runtime: Some(RuntimeConfig {
                 runtime_provider: "docker".into(),
@@ -167,6 +170,10 @@ mod tests {
         assert_eq!(
             loaded.environment.as_ref().unwrap().database_provider,
             "postgres"
+        );
+        assert_eq!(
+            loaded.environment.as_ref().unwrap().database_port,
+            Some(5432)
         );
         assert_eq!(loaded.runtime.as_ref().unwrap().container_name, "c1");
     }
