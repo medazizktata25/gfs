@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-cli"
-version = "0.1.13"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-compute-docker"
-version = "0.1.13"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bollard",
@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-config"
-version = "0.1.13"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-domain"
-version = "0.1.13"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-mcp"
-version = "0.1.13"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "atty",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-storage-apfs"
-version = "0.1.13"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-storage-file"
-version = "0.1.13"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-telemetry"
-version = "0.1.13"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "gfs-domain",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "gfs-website"
-version = "0.1.13"
+version = "0.2.0"
 dependencies = [
  "console_error_panic_hook",
  "leptos",
@@ -2099,9 +2099,9 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "posthog-rs"
-version = "0.4.3"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f42508f04262bd31d4865363a2f665d56e337a8ddbc1de02c006697c489312a"
+checksum = "a2682eb4ad4996a9c48f049fae86dcaa0e8a421f16bfa051380847ffb283396e"
 dependencies = [
  "chrono",
  "derive_builder",
