@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-23
+
+Binaries for this release are available on [GitHub Releases](https://github.com/Guepard-Corp/gfs/releases/tag/v0.2.0).
+
+### Features
+
+- feat: improve Docker connection error messages with actionable hints when Docker is not running or the user lacks permission
+
+### Bug Fixes
+
+- fix: recreate compute when container has been manually removed from Docker
+
+### Chores
+
+- chore: add --port flag to gfs init and gfs compute config db.port
+
 ## [0.1.13] - 2026-03-14
 
 Binaries for this release are available on [GitHub Releases](https://github.com/Guepard-Corp/gfs/releases/tag/v0.1.13).
@@ -52,7 +68,8 @@ Binaries for this release are available on [GitHub Releases](https://github.com/
 
 Binaries for this release are available on [GitHub Releases](https://github.com/Guepard-Corp/gfs/releases/tag/v0.1.3).
 
-[Unreleased]: https://github.com/Guepard-Corp/gfs/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/Guepard-Corp/gfs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Guepard-Corp/gfs/compare/v0.1.13...v0.2.0
 [0.1.13]: https://github.com/Guepard-Corp/gfs/releases/tag/v0.1.13
 [0.1.12]: https://github.com/Guepard-Corp/gfs/releases/tag/v0.1.12
 [0.1.10]: https://github.com/Guepard-Corp/gfs/releases/tag/v0.1.10

@@ -9,12 +9,13 @@ pub fn CommandInit() -> impl IntoView {
             <p class="lead">"Initialize a new GFS repository."</p>
 
             <h2>"Usage"</h2>
-            <CodeBlock code="gfs init --database-provider <PROVIDER> --database-version <VERSION>"/>
+            <CodeBlock code="gfs init --database-provider <PROVIDER> --database-version <VERSION> [--port <PORT>]"/>
 
             <h2>"Options"</h2>
             <ul>
                 <li><code>"--database-provider"</code>" (required) - Database type (e.g., "<code>"postgres"</code>", "<code>"mysql"</code>")"</li>
                 <li><code>"--database-version"</code>" (required) - Database version (e.g., "<code>"17"</code>" for PostgreSQL, "<code>"8.0"</code>" for MySQL)"</li>
+                <li><code>"--port"</code>" (optional) - Host port to bind for the database container (e.g., "<code>"5432"</code>"). Defaults to Docker auto-assigning a free port."</li>
             </ul>
 
             <h2>"Description"</h2>
@@ -32,6 +33,9 @@ pub fn CommandInit() -> impl IntoView {
 
             <h3>"Initialize with MySQL 8.0"</h3>
             <CodeBlock code="gfs init --database-provider mysql --database-version 8.0"/>
+
+            <h3>"Initialize on a fixed host port"</h3>
+            <CodeBlock code="gfs init --database-provider postgres --database-version 17 --port 5432"/>
 
             <h2>"What Happens"</h2>
             <ol>

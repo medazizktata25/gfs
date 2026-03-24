@@ -20,6 +20,7 @@ pub fn CommandCompute() -> impl IntoView {
                 <li><code>"pause"</code>" - Pause the container"</li>
                 <li><code>"unpause"</code>" - Unpause the container"</li>
                 <li><code>"logs"</code>" - View container logs"</li>
+                <li><code>"config <KEY> <VALUE>"</code>" - Read or write a compute config value"</li>
             </ul>
 
             <h2>"Logs Options"</h2>
@@ -30,12 +31,22 @@ pub fn CommandCompute() -> impl IntoView {
                 <li><code>"--stdout"</code>" / "<code>"--stderr"</code>" - Toggle stdout/stderr"</li>
             </ul>
 
+            <h2>"Compute Config Keys"</h2>
+            <p>"Use "<code>"gfs compute config <KEY> <VALUE>"</code>" to update runtime settings. Changes take effect after "<code>"gfs compute restart"</code>"."</p>
+            <ul>
+                <li><code>"db.port"</code>" - Host port bound to the database container (e.g., "<code>"5432"</code>"). Useful when you need the database reachable on a fixed port."</li>
+            </ul>
+
             <h2>"Examples"</h2>
             <h3>"Start the database"</h3>
             <CodeBlock code="gfs compute start"/>
 
             <h3>"View recent logs"</h3>
             <CodeBlock code="gfs compute logs --tail 50"/>
+
+            <h3>"Change the host port and apply it"</h3>
+            <CodeBlock code="gfs compute config db.port 5432
+gfs compute restart"/>
 
             <h2>"See Also"</h2>
             <ul>
