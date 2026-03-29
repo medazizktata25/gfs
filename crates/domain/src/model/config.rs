@@ -133,9 +133,14 @@ impl GlobalSettings {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     use crate::model::layout::GFS_DIR;
+
+    /// `global_settings_*` tests mutate `HOME`; serialize them so parallel test runs don't race.
+    static HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn config_load_and_save() {
@@ -220,10 +225,11 @@ mod tests {
 
     #[test]
     fn global_settings_load_save_roundtrip() {
+        let _home_guard = HOME_TEST_LOCK.lock().unwrap();
         // Override HOME to a temp directory so we don't touch the real ~/.gfs.
         let dir = tempfile::tempdir().unwrap();
         let home_path = dir.path().to_string_lossy().to_string();
-        // SAFETY: single-threaded test; no other threads read HOME concurrently.
+        // SAFETY: protected by HOME_TEST_LOCK; no concurrent HOME readers in other tests.
         unsafe { std::env::set_var("HOME", &home_path) };
 
         let settings = GlobalSettings {
@@ -245,9 +251,10 @@ mod tests {
 
     #[test]
     fn global_settings_load_missing_returns_none() {
+        let _home_guard = HOME_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let home_path = dir.path().to_string_lossy().to_string();
-        // SAFETY: single-threaded test; no other threads read HOME concurrently.
+        // SAFETY: protected by HOME_TEST_LOCK.
         unsafe { std::env::set_var("HOME", &home_path) };
         assert!(GlobalSettings::load().is_none());
     }

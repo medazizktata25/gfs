@@ -185,6 +185,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // read-only HEAD is enforced with chmod; Windows needs different ACL setup
     fn test_set_head_error() {
         let temp_dir = TempDir::new().unwrap();
         let working_dir = temp_dir.path().to_path_buf();
