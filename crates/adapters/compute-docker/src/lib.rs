@@ -8,9 +8,13 @@
 //!
 //! * Log timestamps are taken from the Docker log frame header (when
 //!   `timestamps=true`); otherwise the current UTC time is used as a fallback.
+//! * On Windows, host bind paths are normalized (extended `\\?\` prefixes are
+//!   stripped) so Docker’s bind parser does not mis-handle `host:container` specs.
 
 pub mod containers;
 mod error;
+
+use std::path::Path;
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
@@ -21,6 +25,27 @@ use gfs_domain::ports::compute::{
 use tracing::instrument;
 
 use crate::error::classify;
+
+/// Host path string suitable for Docker bind mounts. Verbatim Windows paths
+/// (`\\?\...`) break Docker’s `host:container` parsing; map them to normal paths.
+fn host_path_for_docker_bind(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        let s = s.as_ref();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{}", rest);
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+        s.to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DockerCompute
@@ -197,7 +222,7 @@ impl Compute for DockerCompute {
 
         let mut binds = Vec::new();
         if let Some(ref host_data) = definition.host_data_dir {
-            let host_path = host_data.to_string_lossy();
+            let host_path = host_path_for_docker_bind(host_data);
             let container_path = definition.data_dir.to_string_lossy();
             binds.push(self.bind_mount_spec(&host_path, &container_path).await);
         }
@@ -621,7 +646,7 @@ impl Compute for DockerCompute {
         // 4. Bind mounts for data exchange.
         let mut binds = Vec::new();
         if let Some(ref host_data) = definition.host_data_dir {
-            let host_path = host_data.to_string_lossy();
+            let host_path = host_path_for_docker_bind(host_data);
             let container_path = definition.data_dir.to_string_lossy();
             binds.push(self.bind_mount_spec(&host_path, &container_path).await);
         }
@@ -828,5 +853,38 @@ impl DockerCompute {
             return Err(ComputeError::Internal(msg));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod host_path_tests {
+    use super::host_path_for_docker_bind;
+    use std::path::Path;
+
+    #[test]
+    #[cfg(windows)]
+    fn strips_verbatim_drive_prefix() {
+        assert_eq!(
+            host_path_for_docker_bind(Path::new(r"\\?\C:\Users\test")),
+            r"C:\Users\test"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn strips_verbatim_unc_prefix() {
+        assert_eq!(
+            host_path_for_docker_bind(Path::new(r"\\?\UNC\server\share\dir")),
+            r"\\server\share\dir"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn passthrough_non_windows() {
+        assert_eq!(
+            host_path_for_docker_bind(Path::new("/tmp/foo/bar")),
+            "/tmp/foo/bar"
+        );
     }
 }
