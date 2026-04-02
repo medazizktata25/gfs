@@ -45,7 +45,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         if !status.success() {
             return Err(std::io::Error::other("cp -cRp failed"));
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -60,7 +60,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         if !status.success() {
             return Err(std::io::Error::other("cp --reflink=auto -a failed"));
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
