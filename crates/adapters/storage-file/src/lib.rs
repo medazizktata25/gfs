@@ -6,7 +6,7 @@
 //! |---|---|---|---|
 //! | macOS | `cp -cRp` (APFS clonefile COW) | `chmod -R a-w` | `diskutil info` / `df -k` |
 //! | Linux | `cp --reflink=auto -a` (Btrfs/XFS COW or deep copy) | `chmod -R a-w` | `df --block-size=1` |
-//! | Windows | `robocopy /E /COPYALL` | `icacls /deny *:(W) /T` | PowerShell `Get-PSDrive` |
+//! | Windows | `robocopy /E /COPY:DAT` | `attrib +R /S /D` | PowerShell `Get-PSDrive` |
 //!
 //! # mount / unmount
 //!
@@ -118,31 +118,46 @@ async fn make_read_only(path: &Path) -> Result<()> {
     Ok(())
 }
 
-// ── Windows: icacls read-only helper ──────────────────────────────────────
+// ── Windows: attrib +R read-only helper ──────────────────────────────────
 
 #[cfg(target_os = "windows")]
 async fn make_read_only(path: &Path) -> Result<()> {
-    // Deny write access to everyone (*) recursively.
-    let out = Command::new("icacls")
-        .args([
-            path.to_string_lossy().as_ref(),
-            "/deny",
-            "*:(W)",
-            "/T",
-            "/Q",
-        ])
+    let p = path.to_string_lossy().into_owned();
+    // Set read-only on the directory itself.
+    let out = Command::new("cmd")
+        .args(["/C", "attrib", "+R", &p])
         .output()
         .await
         .map_err(StorageError::Io)?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(StorageError::Internal(format!(
-            "icacls /deny failed for '{}': {}",
-            path.display(),
-            stderr.trim()
-        )));
+        return Err(attrib_error(path, &out));
+    }
+    let contents = format!(r"{}\*", p);
+    let out = Command::new("cmd")
+        .args(["/C", "attrib", "+R", "/S", "/D", &contents])
+        .output()
+        .await
+        .map_err(StorageError::Io)?;
+    if !out.status.success() {
+        return Err(attrib_error(path, &out));
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn attrib_error(path: &Path, out: &std::process::Output) -> StorageError {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    StorageError::Internal(format!(
+        "attrib +R failed for '{}': {}{}",
+        path.display(),
+        stderr.trim(),
+        if stdout.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", stdout.trim())
+        }
+    ))
 }
 
 // ── Cross-platform directory copy ──────────────────────────────────────────
@@ -152,10 +167,8 @@ async fn make_read_only(path: &Path) -> Result<()> {
 /// * **macOS** – `cp -cRp` triggers clonefile(2) COW on APFS.
 /// * **Linux** – `cp --reflink=auto -a` uses Btrfs/XFS COW when available,
 ///   and falls back to a regular deep copy on other filesystems.
-/// * **Windows** – `robocopy /E /COPYALL` mirrors a directory tree including
-///   all attributes and timestamps.
+/// * **Windows** – `robocopy /E /COPY:DAT` (not `/COPYALL`, which needs audit privileges).
 async fn copy_dir(src: &str, dst: &str) -> Result<()> {
-    // Ensure the parent directory of the destination exists.
     let dst_path = Path::new(dst);
     if let Some(parent) = dst_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -171,12 +184,18 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     let (prog, args): (&str, Vec<&str>) = {
-        // robocopy exit codes 0–7 mean success (7 = all ok + some files skipped).
-        // We handle the exit code check manually below.
         (
             "robocopy",
             vec![
-                src, dst, "/E", "/COPYALL", "/NFL", "/NDL", "/NJH", "/NJS", "/NP",
+                src,
+                dst,
+                "/E",
+                "/COPY:DAT",
+                "/NFL",
+                "/NDL",
+                "/NJH",
+                "/NJS",
+                "/NP",
             ],
         )
     };
@@ -190,7 +209,6 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
         .await
         .map_err(StorageError::Io)?;
 
-    // robocopy uses non-zero exit codes (1–7) for success on Windows.
     #[cfg(target_os = "windows")]
     let success = output.status.code().map(|c| c <= 7).unwrap_or(false);
 
@@ -286,7 +304,7 @@ impl StoragePort for FileStorage {
     /// On **macOS** `cp -cRp` uses `clonefile(2)` (COW, instant, zero extra
     /// space until divergence). On **Linux** `cp --reflink=auto -a` does the
     /// same on Btrfs/XFS and falls back to a regular deep copy on ext4 etc.
-    /// On **Windows** `robocopy /E /COPYALL` is used, followed by `icacls`.
+    /// On **Windows** `robocopy /E /COPY:DAT` is used, then `attrib +R /S /D`.
     ///
     /// The destination path is taken from [`SnapshotOptions::label`] (treated
     /// as an absolute or relative path). When no label is given a
@@ -842,6 +860,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_snapshot_is_read_only() {
         let src = make_source();
         let dst = {
@@ -867,22 +886,67 @@ mod tests {
             .await
             .expect("snapshot failed");
 
-        // Writing into the snapshot should fail (permission denied).
         let write_result = fs::write(dst.join("new.txt"), b"oops");
         assert!(
             write_result.is_err(),
             "expected write to read-only snapshot to fail"
         );
 
-        // cleanup
-        #[cfg(unix)]
-        {
-            Command::new("chmod")
-                .args(["-R", "u+w", dst.to_str().unwrap()])
-                .output()
-                .await
-                .ok();
-        }
+        Command::new("chmod")
+            .args(["-R", "u+w", dst.to_str().unwrap()])
+            .output()
+            .await
+            .ok();
+        fs::remove_dir_all(&src).ok();
+        fs::remove_dir_all(&dst).ok();
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_snapshot_is_read_only_windows() {
+        let src = make_source();
+        let dst = {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "gfs-ro-dst-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            p
+        };
+
+        let storage = FileStorage::new();
+        let vol_id = VolumeId(src.to_string_lossy().into_owned());
+        let opts = SnapshotOptions {
+            label: Some(dst.to_string_lossy().into_owned()),
+        };
+
+        storage
+            .snapshot(&vol_id, opts)
+            .await
+            .expect("snapshot failed");
+
+        // attrib +R prevents overwriting existing files
+        let write_result = fs::write(dst.join("hello.txt"), b"overwrite");
+        assert!(
+            write_result.is_err(),
+            "expected overwrite of read-only file in snapshot to fail"
+        );
+
+        // cleanup: remove read-only attribute before deletion
+        let dst_str = dst.to_string_lossy().into_owned();
+        Command::new("cmd")
+            .args(["/C", "attrib", "-R", &dst_str])
+            .output()
+            .await
+            .ok();
+        Command::new("cmd")
+            .args(["/C", "attrib", "-R", "/S", "/D", &format!(r"{}\*", dst_str)])
+            .output()
+            .await
+            .ok();
         fs::remove_dir_all(&src).ok();
         fs::remove_dir_all(&dst).ok();
     }

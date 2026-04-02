@@ -185,6 +185,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_set_head_error() {
         let temp_dir = TempDir::new().unwrap();
         let working_dir = temp_dir.path().to_path_buf();

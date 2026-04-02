@@ -45,8 +45,7 @@ pub fn CommandCompute() -> impl IntoView {
             <CodeBlock code="gfs compute logs --tail 50"/>
 
             <h3>"Change the host port and apply it"</h3>
-            <CodeBlock code="gfs compute config db.port 5432
-gfs compute restart"/>
+            <CodeBlock code={"gfs compute config db.port 5432\ngfs compute restart"}/>
 
             <h2>"See Also"</h2>
             <ul>

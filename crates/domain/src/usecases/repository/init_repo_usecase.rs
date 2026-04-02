@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+#[cfg(unix)]
 use crate::utils::current_user;
 
 use crate::model::config::{EnvironmentConfig, RuntimeConfig};

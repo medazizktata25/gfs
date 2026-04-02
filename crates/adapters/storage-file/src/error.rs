@@ -3,7 +3,7 @@ use gfs_domain::ports::storage::StorageError;
 /// Classify a command's stderr message into the appropriate [`StorageError`] variant.
 ///
 /// Works across Linux and Windows; the same heuristic key-words appear in
-/// errors from `cp`, `robocopy`, `df`, `icacls`, and PowerShell.
+/// errors from `cp`, `robocopy`, `df`, `attrib`, and PowerShell.
 pub(crate) fn classify_stderr(volume_id: &str, stderr: &str) -> StorageError {
     let lower = stderr.to_lowercase();
     if lower.contains("no such")

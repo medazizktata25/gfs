@@ -106,6 +106,10 @@ fn set_workspace_dir_permissions(path: &Path) -> std::io::Result<()> {
             }
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 

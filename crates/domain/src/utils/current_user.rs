@@ -1,5 +1,6 @@
 //! Helpers for current user identification.
 
+#[cfg(unix)]
 use std::process::Command;
 
 /// Return current Unix uid and gid as "uid:gid" for `docker run --user`.

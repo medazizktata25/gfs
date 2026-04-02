@@ -9,6 +9,7 @@ use gfs_domain::ports::database_provider::{
     DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
 };
 use gfs_domain::repo_utils::repo_layout;
+#[cfg(unix)]
 use gfs_domain::utils::current_user;
 
 use crate::ComputeAction;
