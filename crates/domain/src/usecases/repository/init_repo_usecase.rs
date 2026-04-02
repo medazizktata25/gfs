@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::utils::current_user;
+use crate::utils::{current_user, data_dir};
 
 use crate::model::config::{EnvironmentConfig, RuntimeConfig};
 use crate::ports::compute::{Compute, ComputeError, StartOptions};
@@ -39,14 +39,14 @@ pub enum InitRepoError {
 /// dyn-compatible (its `register` method uses `impl Into<String>`).
 pub struct InitRepositoryUseCase<R: DatabaseProviderRegistry> {
     repository: Arc<dyn Repository>,
-    compute: Arc<dyn Compute>,
+    compute: Option<Arc<dyn Compute>>,
     registry: Arc<R>,
 }
 
 impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
     pub fn new(
         repository: Arc<dyn Repository>,
-        compute: Arc<dyn Compute>,
+        compute: Option<Arc<dyn Compute>>,
         registry: Arc<R>,
     ) -> Self {
         Self {
@@ -84,6 +84,12 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         provider_name: String,
         database_version: String,
     ) -> std::result::Result<(), InitRepoError> {
+        let compute = self.compute.as_ref().ok_or_else(|| {
+            InitRepoError::Compute(ComputeError::Internal(
+                "database provisioning requires a compute runtime".into(),
+            ))
+        })?;
+
         let list = self.registry.list();
         let matched_name = list
             .iter()
@@ -112,6 +118,14 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             .repository
             .get_workspace_data_dir_for_head(repo_path)
             .await?;
+        data_dir::prepare_for_database_provider(provider.name(), &workspace_data_dir).map_err(
+            |e| {
+                ComputeError::Internal(format!(
+                    "failed to prepare data dir '{}': {e}",
+                    workspace_data_dir.display()
+                ))
+            },
+        )?;
         definition.host_data_dir = Some(workspace_data_dir);
 
         // Run container as host user so files in bind-mounted data dir are owned by current user.
@@ -121,8 +135,8 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             definition.user = current_user::current_user_uid_gid();
         }
 
-        let id = self.compute.provision(&definition).await?;
-        self.compute.start(&id, StartOptions::default()).await?;
+        let id = compute.provision(&definition).await?;
+        compute.start(&id, StartOptions::default()).await?;
 
         let database_version = provider.version_from_image(&definition);
 
@@ -520,11 +534,8 @@ mod tests {
 
     #[tokio::test]
     async fn init_without_database_provider() {
-        let usecase = InitRepositoryUseCase::new(
-            Arc::new(MockRepository),
-            Arc::new(MockCompute),
-            Arc::new(MockRegistry),
-        );
+        let usecase =
+            InitRepositoryUseCase::new(Arc::new(MockRepository), None, Arc::new(MockRegistry));
         let dir = tempfile::tempdir().unwrap();
         let result = usecase
             .run(dir.path().to_path_buf(), None, None, None)
@@ -536,7 +547,7 @@ mod tests {
     async fn init_with_database_provider() {
         let usecase = InitRepositoryUseCase::new(
             Arc::new(MockRepository),
-            Arc::new(MockCompute),
+            Some(Arc::new(MockCompute)),
             Arc::new(MockRegistry),
         );
         let dir = tempfile::tempdir().unwrap();
@@ -555,7 +566,7 @@ mod tests {
     async fn init_database_version_required() {
         let usecase = InitRepositoryUseCase::new(
             Arc::new(MockRepository),
-            Arc::new(MockCompute),
+            Some(Arc::new(MockCompute)),
             Arc::new(MockRegistry),
         );
         let dir = tempfile::tempdir().unwrap();
@@ -577,7 +588,7 @@ mod tests {
     async fn init_unknown_database_provider() {
         let usecase = InitRepositoryUseCase::new(
             Arc::new(MockRepository),
-            Arc::new(MockCompute),
+            Some(Arc::new(MockCompute)),
             Arc::new(MockRegistry),
         );
         let dir = tempfile::tempdir().unwrap();

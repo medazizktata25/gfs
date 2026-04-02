@@ -42,6 +42,44 @@ impl DockerCompute {
         let docker = bollard::Docker::connect_with_local_defaults()?;
         Ok(Self { docker })
     }
+
+    fn bind_mount(host_path: &str, container_path: &str) -> String {
+        #[cfg(target_os = "linux")]
+        {
+            format!("{host_path}:{container_path}:Z")
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            format!("{host_path}:{container_path}")
+        }
+    }
+
+    async fn wait_for_stable_start(&self, id: &InstanceId) -> Result<InstanceStatus> {
+        let mut last = self.status(id).await?;
+        for _ in 0..5 {
+            match last.state {
+                InstanceState::Stopped | InstanceState::Failed => {
+                    return Err(ComputeError::Internal(format!(
+                        "container '{}' exited during startup (exit {:?})",
+                        id.0, last.exit_code
+                    )));
+                }
+                _ => {}
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            last = self.status(id).await?;
+        }
+
+        match last.state {
+            InstanceState::Stopped | InstanceState::Failed => Err(ComputeError::Internal(format!(
+                "container '{}' exited during startup (exit {:?})",
+                id.0, last.exit_code
+            ))),
+            _ => Ok(last),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -64,8 +102,11 @@ impl Compute for DockerCompute {
             .await
             .map_err(|e| classify(definition.image.as_str(), e))?;
 
-        let prefix = if definition.image.to_ascii_lowercase().contains("mysql") {
+        let image_name = definition.image.to_ascii_lowercase();
+        let prefix = if image_name.contains("mysql") {
             "gfs-mysql"
+        } else if image_name.contains("clickhouse") {
+            "gfs-clickhouse"
         } else {
             "gfs-postgres"
         };
@@ -104,7 +145,7 @@ impl Compute for DockerCompute {
         if let Some(ref host_data) = definition.host_data_dir {
             let host_path = host_data.to_string_lossy();
             let container_path = definition.data_dir.to_string_lossy();
-            binds.push(format!("{}:{}", host_path, container_path));
+            binds.push(Self::bind_mount(&host_path, &container_path));
         }
 
         let host_config = bollard::service::HostConfig {
@@ -157,7 +198,7 @@ impl Compute for DockerCompute {
             )
             .await
             .map_err(|e| classify(&id.0, e))?;
-        self.status(id).await
+        self.wait_for_stable_start(id).await
     }
 
     #[instrument(skip(self))]
@@ -176,7 +217,7 @@ impl Compute for DockerCompute {
             .restart_container(&id.0, None)
             .await
             .map_err(|e| classify(&id.0, e))?;
-        self.status(id).await
+        self.wait_for_stable_start(id).await
     }
 
     #[instrument(skip(self))]
@@ -530,7 +571,7 @@ impl Compute for DockerCompute {
         if let Some(ref host_data) = definition.host_data_dir {
             let host_path = host_data.to_string_lossy();
             let container_path = definition.data_dir.to_string_lossy();
-            binds.push(format!("{}:{}", host_path, container_path));
+            binds.push(Self::bind_mount(&host_path, &container_path));
         }
 
         let host_config = bollard::service::HostConfig {

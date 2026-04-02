@@ -77,6 +77,7 @@ pub async fn run(
         let db_env_var = match provider_name.as_str() {
             "postgres" => "POSTGRES_DB",
             "mysql" => "MYSQL_DATABASE",
+            "clickhouse" => "CLICKHOUSE_DB",
             _ => "DATABASE", // fallback for future providers
         };
 
@@ -103,7 +104,8 @@ pub async fn run(
             anyhow::bail!(
                 "database client '{}' not found. Install it to use 'gfs query'.\n  \
                  - PostgreSQL: install postgresql client tools (psql)\n  \
-                 - MySQL: install mysql client tools",
+                 - MySQL: install mysql client tools\n  \
+                 - ClickHouse: install clickhouse client tools (clickhouse-client)",
                 client_name
             )
         } else {

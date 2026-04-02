@@ -9,7 +9,7 @@ use gfs_domain::ports::database_provider::{
     DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
 };
 use gfs_domain::repo_utils::repo_layout;
-use gfs_domain::utils::current_user;
+use gfs_domain::utils::{current_user, data_dir};
 
 use crate::ComputeAction;
 use crate::cli_utils::{get_repo_dir, relativize_to_repo};
@@ -274,6 +274,8 @@ async fn start_restart_or_recreate(
             .unwrap_or(&definition.image);
         definition.image = format!("{}:{}", base, env.database_version);
     }
+    data_dir::prepare_for_database_provider(provider.name(), std::path::Path::new(&active))
+        .with_context(|| format!("failed to prepare data dir '{active}'"))?;
     definition.host_data_dir = Some(std::path::PathBuf::from(&active));
     #[cfg(unix)]
     {

@@ -33,8 +33,41 @@ fn map_err(e: RepoError) -> RepositoryError {
 
 /// Recursively copy directory contents from `src` into `dst` (dst must exist).
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let source = src.join(".");
+        let status = Command::new("cp")
+            .arg("-cRp")
+            .arg(&source)
+            .arg(dst)
+            .status()
+            .map_err(std::io::Error::other)?;
+        if !status.success() {
+            return Err(std::io::Error::other("cp -cRp failed"));
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let source = src.join(".");
+        let status = Command::new("cp")
+            .args(["--reflink=auto", "-a"])
+            .arg(&source)
+            .arg(dst)
+            .status()
+            .map_err(std::io::Error::other)?;
+        if !status.success() {
+            return Err(std::io::Error::other("cp --reflink=auto -a failed"));
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let mut file_count = 0;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let mut dir_count = 0;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
@@ -48,6 +81,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
             file_count += 1;
         }
     }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     tracing::debug!(
         "copy_dir_all: copied {} files and {} dirs from {:?} to {:?}",
         file_count,
@@ -55,6 +89,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         src,
         dst
     );
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     Ok(())
 }
 

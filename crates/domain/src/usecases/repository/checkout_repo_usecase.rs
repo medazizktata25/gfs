@@ -13,6 +13,7 @@ use crate::model::config::RuntimeConfig;
 use crate::ports::compute::{Compute, ComputeError, InstanceId};
 use crate::ports::database_provider::DatabaseProviderRegistry;
 use crate::ports::repository::{Repository, RepositoryError};
+use crate::utils::{current_user, data_dir};
 
 // ---------------------------------------------------------------------------
 // Error
@@ -171,7 +172,17 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
                 .unwrap_or(definition.image.as_str());
             definition.image = format!("{}:{}", base, environment.database_version);
         }
+        data_dir::prepare_for_database_provider(provider.name(), &active).map_err(|e| {
+            ComputeError::Internal(format!(
+                "failed to prepare data dir '{}': {e}",
+                active.display()
+            ))
+        })?;
         definition.host_data_dir = Some(active.clone());
+        #[cfg(unix)]
+        {
+            definition.user = current_user::current_user_uid_gid();
+        }
         let compute_data_path = definition.data_dir.to_string_lossy().into_owned();
 
         let current_bind = self

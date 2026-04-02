@@ -73,13 +73,18 @@ pub fn gfs_init(path: &Path) -> bool {
 
 /// Convenience: gfs init --database-provider postgres --database-version 17 <path>
 pub fn gfs_init_with_db(path: &Path) -> bool {
+    gfs_init_with_provider(path, "postgres", "17")
+}
+
+/// Convenience: gfs init --database-provider <provider> --database-version <version> <path>
+pub fn gfs_init_with_provider(path: &Path, provider: &str, version: &str) -> bool {
     let (ok, _, _) = run_gfs([
         "gfs",
         "init",
         "--database-provider",
-        "postgres",
+        provider,
         "--database-version",
-        "17",
+        version,
         path.to_str().unwrap(),
     ]);
     ok

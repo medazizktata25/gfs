@@ -21,6 +21,7 @@ use gfs_domain::usecases::repository::{
     import_repo_usecase::ImportRepoUseCase, init_repo_usecase::InitRepositoryUseCase,
     log_repo_usecase::LogRepoUseCase, status_repo_usecase::StatusRepoUseCase,
 };
+use gfs_domain::utils::{current_user, data_dir};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -112,10 +113,10 @@ pub struct CheckoutRequest {
 pub struct InitRequest {
     #[schemars(description = "repo root path")]
     pub path: Option<String>,
-    #[schemars(description = "database provider e.g. postgres, mysql")]
+    #[schemars(description = "database provider e.g. postgres, mysql, clickhouse")]
     pub database_provider: Option<String>,
     #[schemars(
-        description = "database version e.g. 17 for postgres, 8.0 for mysql; required when database_provider is set"
+        description = "database version e.g. 17 for postgres, 8.0 for mysql, 24.8.14.39 for clickhouse; required when database_provider is set"
     )]
     pub database_version: Option<String>,
 }
@@ -222,7 +223,7 @@ impl GfsMcpHandler {
     }
 
     #[tool(
-        description = "List supported database providers (e.g. postgres, mysql) and their versions and features. Use when choosing or checking which databases this GFS server can run. Equivalent to gfs providers."
+        description = "List supported database providers (e.g. postgres, mysql, clickhouse) and their versions and features. Use when choosing or checking which databases this GFS server can run. Equivalent to gfs providers."
     )]
     async fn list_providers(
         &self,
@@ -292,7 +293,7 @@ impl GfsMcpHandler {
     }
 
     #[tool(
-        description = "Initialize a new GFS repository backed by a database. Optional: path. If database_provider is set (e.g. postgres, mysql), database_version is required (e.g. 17 for postgres). Creates repo metadata and can start the database container. Equivalent to gfs init."
+        description = "Initialize a new GFS repository backed by a database. Optional: path. If database_provider is set (e.g. postgres, mysql, clickhouse), database_version is required (e.g. 17 for postgres, 24.8.14.39 for clickhouse). Creates repo metadata and can start the database container. Equivalent to gfs init."
     )]
     async fn init(
         &self,
@@ -678,8 +679,13 @@ async fn do_init(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
         .map(String::from);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute =
-        Arc::new(DockerCompute::new().map_err(|e| to_error_data(format!("Docker: {e}")))?);
+    let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() {
+        Some(Arc::new(
+            DockerCompute::new().map_err(|e| to_error_data(format!("Docker: {e}")))?,
+        ))
+    } else {
+        None
+    };
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())
         .map_err(|e| to_error_data(format!("register providers: {e}")))?;
@@ -919,7 +925,13 @@ async fn start_or_restart(
                 .unwrap_or(&definition.image);
             definition.image = format!("{}:{}", base, env.database_version);
         }
+        data_dir::prepare_for_database_provider(provider.name(), std::path::Path::new(&active))
+            .map_err(|e| to_error_data(format!("failed to prepare data dir '{active}': {e}")))?;
         definition.host_data_dir = Some(std::path::PathBuf::from(&active));
+        #[cfg(unix)]
+        {
+            definition.user = current_user::current_user_uid_gid();
+        }
         let new_id = compute
             .provision(&definition)
             .await
@@ -1105,6 +1117,7 @@ async fn do_query(args: &serde_json::Value) -> Result<CallToolResult, McpError> 
         let db_env_var = match provider_name.as_str() {
             "postgres" => "POSTGRES_DB",
             "mysql" => "MYSQL_DATABASE",
+            "clickhouse" => "CLICKHOUSE_DB",
             _ => "DATABASE", // fallback for future providers
         };
 

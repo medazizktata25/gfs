@@ -27,6 +27,10 @@ path = "tests/import/postgres/import_sql.rs"
 name = "schema_extract_postgres"
 path = "tests/schema/extract_postgres.rs"
 
+[[test]]
+name = "schema_extract_clickhouse"
+path = "tests/schema/extract_clickhouse.rs"
+
 [dependencies]
 gfs-domain = { workspace = true }
 gfs-compute-docker        = { workspace = true }
