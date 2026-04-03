@@ -628,7 +628,7 @@ mod tests {
     async fn init_fails_when_repository_already_initialized() {
         let usecase = InitRepositoryUseCase::new(
             Arc::new(GfsRepository::new()),
-            Arc::new(MockCompute),
+            Some(Arc::new(MockCompute)),
             Arc::new(MockRegistry),
         );
         let dir = tempfile::tempdir().unwrap();

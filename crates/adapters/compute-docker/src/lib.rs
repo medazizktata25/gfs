@@ -163,18 +163,6 @@ impl DockerCompute {
             .unwrap_or(false)
     }
 
-    fn bind_mount(host_path: &str, container_path: &str) -> String {
-        #[cfg(target_os = "linux")]
-        {
-            format!("{host_path}:{container_path}:Z")
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            format!("{host_path}:{container_path}")
-        }
-    }
-
     async fn wait_for_stable_start(&self, id: &InstanceId) -> Result<InstanceStatus> {
         let mut last = self.status(id).await?;
         for _ in 0..5 {
