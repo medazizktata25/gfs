@@ -37,11 +37,8 @@ pub async fn init(
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(registry.as_ref())?;
 
-    let use_case = InitRepositoryUseCase::new(
-        repository.clone(),
-        compute.clone(),
-        registry.clone(),
-    );
+    let use_case =
+        InitRepositoryUseCase::new(repository.clone(), compute.clone(), registry.clone());
     use_case
         .run(
             target_path.clone(),

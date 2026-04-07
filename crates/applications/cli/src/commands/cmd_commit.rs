@@ -86,7 +86,13 @@ async fn run(
         );
     } else {
         let short = &commit_hash[..7.min(commit_hash.len())];
-        println!("{} [{}] {}  {}", green("✓"), cyan(&branch), dimmed(short), message);
+        println!(
+            "{} [{}] {}  {}",
+            green("✓"),
+            cyan(&branch),
+            dimmed(short),
+            message
+        );
     }
     Ok(())
 }

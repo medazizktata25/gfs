@@ -497,9 +497,15 @@ where
                 database_version,
                 port,
             } => {
-                commands::cmd_init::init(path, database_provider, database_version, port, json_output)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                commands::cmd_init::init(
+                    path,
+                    database_provider,
+                    database_version,
+                    port,
+                    json_output,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
                 Ok(0)
             }
             TopLevel::Commit {
@@ -508,7 +514,8 @@ where
                 author,
                 author_email,
             } => {
-                commands::cmd_commit::commit(path, message, author, author_email, json_output).await?;
+                commands::cmd_commit::commit(path, message, author, author_email, json_output)
+                    .await?;
                 Ok(0)
             }
             TopLevel::Config {
@@ -526,7 +533,8 @@ where
                 create_branch,
                 revision,
             } => {
-                commands::cmd_checkout::checkout(path, revision, create_branch, json_output).await?;
+                commands::cmd_checkout::checkout(path, revision, create_branch, json_output)
+                    .await?;
                 Ok(0)
             }
             TopLevel::Branch {
@@ -570,8 +578,7 @@ where
                 graph,
                 all,
             } => {
-                commands::cmd_log::log(path, max_count, from, until, full_hash, graph, all)
-                    .await?;
+                commands::cmd_log::log(path, max_count, from, until, full_hash, graph, all).await?;
                 Ok(0)
             }
             TopLevel::Status { path, output } => {

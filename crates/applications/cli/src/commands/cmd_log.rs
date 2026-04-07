@@ -370,7 +370,6 @@ fn build_merge_line(
     format!("  {}", dimmed(trimmed))
 }
 
-
 fn run_graph(
     repo_path: &Path,
     max_count: Option<usize>,
@@ -443,12 +442,7 @@ fn print_commit_block(
     let author = &cwr.commit.author;
     let author_email = cwr.commit.author_email.as_deref().unwrap_or("");
     if author_email.is_empty() {
-        println!(
-            "{} {} {}",
-            continuation_prefix,
-            dimmed("Author:"),
-            author
-        );
+        println!("{} {} {}", continuation_prefix, dimmed("Author:"), author);
     } else {
         println!(
             "{} {} {} <{}>",
@@ -461,12 +455,7 @@ fn print_commit_block(
 
     // Date line
     let date_str = cwr.commit.author_date.format("%a %b %e %H:%M:%S %Y %z");
-    println!(
-        "{} {}   {}",
-        continuation_prefix,
-        dimmed("Date:"),
-        date_str
-    );
+    println!("{} {}   {}", continuation_prefix, dimmed("Date:"), date_str);
 
     // Blank separator
     println!("{}", continuation_prefix);

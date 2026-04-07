@@ -81,13 +81,7 @@ fn list_branches(repo_path: &std::path::Path) -> Result<()> {
 
         // Get the commit message for this branch tip.
         let subject = repo_layout::get_commit_from_hash(repo_path, hash)
-            .map(|c| {
-                c.message
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            })
+            .map(|c| c.message.lines().next().unwrap_or("").to_string())
             .unwrap_or_default();
 
         if *name == current {
@@ -99,22 +93,14 @@ fn list_branches(repo_path: &std::path::Path) -> Result<()> {
                 subject
             );
         } else {
-            println!(
-                "    {} {} {}",
-                cyan(name),
-                dimmed(short_hash),
-                subject
-            );
+            println!("    {} {} {}", cyan(name), dimmed(short_hash), subject);
         }
     }
 
     Ok(())
 }
 
-fn collect_refs(
-    dir: &std::path::Path,
-    prefix: &str,
-) -> Result<Vec<(String, String)>> {
+fn collect_refs(dir: &std::path::Path, prefix: &str) -> Result<Vec<(String, String)>> {
     let mut result = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -162,11 +148,7 @@ async fn create_branch(
         let use_case = CheckoutRepoUseCase::new(repository, compute, registry);
         let revision = start_point.unwrap_or("").to_string();
         let commit_hash = use_case
-            .run(
-                repo_path.to_path_buf(),
-                revision,
-                Some(name.to_string()),
-            )
+            .run(repo_path.to_path_buf(), revision, Some(name.to_string()))
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
