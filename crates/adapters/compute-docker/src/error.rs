@@ -45,6 +45,7 @@ pub(crate) fn classify_with_mount_path(
                 || msg.contains("mount denied")
                 || msg.contains("cannot mount")
                 || msg.contains("invalid volume specification")
+                || msg.contains("invalid mode")
                 || msg.contains("invalid bind mount")
                 || msg.contains("invalid mount")
             {
