@@ -81,7 +81,10 @@ fn print_all_providers_json(registry: &impl DatabaseProviderRegistry) -> Result<
         })
         .collect();
 
-    println!("{}", serde_json::to_string_pretty(&json!({ "providers": providers }))?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({ "providers": providers }))?
+    );
     Ok(())
 }
 

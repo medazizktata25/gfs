@@ -104,7 +104,10 @@ fn json_log_stdout_is_json_in_empty_repo() {
     assert_eq!(code, 0, "expected log to succeed (empty list ok)");
     assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
-    assert!(v.get("commits").is_some(), "expected log JSON to have commits");
+    assert!(
+        v.get("commits").is_some(),
+        "expected log JSON to have commits"
+    );
 }
 
 #[test]
@@ -152,4 +155,3 @@ fn json_error_compute_logs_without_config_is_json() {
     let v = assert_stdout_json(&stdout);
     assert!(v.get("error").is_some(), "expected error envelope");
 }
-

@@ -63,7 +63,10 @@ fn list_branches(repo_path: &std::path::Path, json_output: bool) -> Result<()> {
     let branches = list_branch_tips(repo_path, false)?;
     if branches.is_empty() {
         if json_output {
-            println!("{}", serde_json::to_string_pretty(&json!({ "branches": [] }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "branches": [] }))?
+            );
             return Ok(());
         }
         println!("  (no branches)");
@@ -103,7 +106,10 @@ fn list_branches(repo_path: &std::path::Path, json_output: bool) -> Result<()> {
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json!({ "branches": out }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "branches": out }))?
+        );
         return Ok(());
     }
 

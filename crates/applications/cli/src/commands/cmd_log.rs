@@ -86,7 +86,10 @@ async fn run_linear(
             .iter()
             .map(|cwr| json_commit(cwr, full_hash))
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json!({ "commits": out }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "commits": out }))?
+        );
         return Ok(());
     }
 
@@ -407,7 +410,10 @@ fn run_graph(
                 json_commit(&cwr, full_hash)
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json!({ "commits": out }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "commits": out }))?
+        );
         return Ok(());
     }
 

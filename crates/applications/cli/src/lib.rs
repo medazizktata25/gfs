@@ -730,7 +730,10 @@ async fn dispatch_storage(
                 .await
                 .map_err(anyhow::Error::from)?;
             if json_output {
-                println!("{}", serde_json::to_string_pretty(&json!({"status":"mounted"}))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"status":"mounted"}))?
+                );
             } else {
                 println!("mounted");
             }
@@ -741,7 +744,10 @@ async fn dispatch_storage(
                 .await
                 .map_err(anyhow::Error::from)?;
             if json_output {
-                println!("{}", serde_json::to_string_pretty(&json!({"status":"unmounted"}))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"status":"unmounted"}))?
+                );
             } else {
                 println!("unmounted");
             }
@@ -821,11 +827,18 @@ async fn dispatch_storage(
     Ok(())
 }
 
-async fn run_compute(path: Option<PathBuf>, action: ComputeAction, json_output: bool) -> Result<()> {
+async fn run_compute(
+    path: Option<PathBuf>,
+    action: ComputeAction,
+    json_output: bool,
+) -> Result<()> {
     commands::cmd_compute::run(path, action, json_output).await
 }
 
-fn print_volume_status(s: &gfs_domain::ports::storage::VolumeStatus, json_output: bool) -> Result<()> {
+fn print_volume_status(
+    s: &gfs_domain::ports::storage::VolumeStatus,
+    json_output: bool,
+) -> Result<()> {
     if json_output {
         println!(
             "{}",
