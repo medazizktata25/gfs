@@ -833,7 +833,7 @@ fn print_volume_status(s: &gfs_domain::ports::storage::VolumeStatus, json_output
                 "volume": {
                     "id": s.id.to_string(),
                     "mount_point": s.mount_point.as_deref().map(|p| p.display().to_string()),
-                    "status": format!("{:?}", s.status),
+                    "status": s.status,
                     "size_bytes": s.size_bytes,
                     "used_bytes": s.used_bytes,
                 }

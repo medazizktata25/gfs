@@ -62,13 +62,13 @@ pub async fn init(
     if json_output {
         println!(
             "{}",
-            json!({
+            serde_json::to_string_pretty(&json!({
                 "path": target_path.display().to_string(),
                 "branch": "main",
                 "config": ".gfs/config.toml",
                 "provider": provider_display,
                 "connection_string": connection_string,
-            })
+            }))?
         );
     } else {
         println!(

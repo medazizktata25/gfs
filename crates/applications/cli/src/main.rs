@@ -5,6 +5,22 @@
 use gfs_cli::output::red;
 use serde_json::json;
 
+fn wants_json(args: &[String]) -> bool {
+    for a in args {
+        if a == "--" {
+            break;
+        }
+        if a == "--json" {
+            return true;
+        }
+        if let Some(rest) = a.strip_prefix("--json=") {
+            let v = rest.trim().to_ascii_lowercase();
+            return matches!(v.as_str(), "1" | "true" | "yes" | "on");
+        }
+    }
+    false
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -16,7 +32,7 @@ async fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
-    let wants_json = args.iter().any(|a| a == "--json");
+    let wants_json = wants_json(&args);
 
     match gfs_cli::run(args).await {
         Ok(exit_code) => std::process::exit(exit_code),
