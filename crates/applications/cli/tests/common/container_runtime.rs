@@ -22,3 +22,22 @@ pub fn runtime_binary() -> &'static str {
         }
     })
 }
+
+/// Create a runtime command pre-configured to target the same Docker daemon
+/// that the `gfs` compute adapter uses.
+///
+/// On some Linux setups, the Docker CLI context (e.g. Docker Desktop) may point
+/// to a different socket than the default `/var/run/docker.sock` used by the API client.
+pub fn runtime_command() -> Command {
+    let bin = runtime_binary();
+    let mut cmd = Command::new(bin);
+
+    #[cfg(unix)]
+    {
+        if bin == "docker" && std::path::Path::new("/var/run/docker.sock").exists() {
+            cmd.env("DOCKER_HOST", "unix:///var/run/docker.sock");
+        }
+    }
+
+    cmd
+}

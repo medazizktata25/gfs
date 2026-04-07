@@ -46,7 +46,7 @@ struct OneOffContainerGuard(String);
 
 impl Drop for OneOffContainerGuard {
     fn drop(&mut self) {
-        let _ = Command::new(common::container_runtime::runtime_binary())
+        let _ = common::container_runtime::runtime_command()
             .args(["rm", "-f", &self.0])
             .output();
     }
@@ -71,10 +71,10 @@ impl Drop for MainContainerCleanup {
         if let Ok(mut id) = self.0.lock()
             && let Some(container_id) = id.take()
         {
-            let _ = Command::new(common::container_runtime::runtime_binary())
+            let _ = common::container_runtime::runtime_command()
                 .args(["stop", &container_id])
                 .output();
-            let _ = Command::new(common::container_runtime::runtime_binary())
+            let _ = common::container_runtime::runtime_command()
                 .args(["rm", "-f", &container_id])
                 .output();
         }
@@ -110,10 +110,10 @@ fn cleanup_main_container(repo_path: &Path) {
         .take_container_id()
         .or_else(|| get_container_id(repo_path));
     if let Some(id) = container_id {
-        let _ = Command::new(common::container_runtime::runtime_binary())
+        let _ = common::container_runtime::runtime_command()
             .args(["stop", &id])
             .output();
-        let _ = Command::new(common::container_runtime::runtime_binary())
+        let _ = common::container_runtime::runtime_command()
             .args(["rm", "-f", &id])
             .output();
     }
@@ -127,7 +127,7 @@ fn get_container_id(repo_path: &Path) -> Option<String> {
 
 fn wait_for_postgres(container_id: &str) -> bool {
     for _ in 0..30 {
-        let ok = Command::new(common::container_runtime::runtime_binary())
+        let ok = common::container_runtime::runtime_command()
             .args([
                 "exec",
                 container_id,
@@ -150,7 +150,7 @@ fn wait_for_postgres(container_id: &str) -> bool {
 
 fn run_pgbench_init(container_id: &str) -> (Duration, String) {
     let start = Instant::now();
-    let out = Command::new(common::container_runtime::runtime_binary())
+    let out = common::container_runtime::runtime_command()
         .args([
             "exec",
             container_id,
@@ -175,7 +175,7 @@ fn run_pgbench_init(container_id: &str) -> (Duration, String) {
 
 #[allow(dead_code)]
 fn run_psql_list_tables(container_id: &str) -> String {
-    let out = Command::new(common::container_runtime::runtime_binary())
+    let out = common::container_runtime::runtime_command()
         .args([
             "exec",
             container_id,
@@ -268,20 +268,20 @@ fn run_one_off_postgres_list_tables_inner(
         args.push("--user");
         args.push(u);
     }
-    let create = Command::new(common::container_runtime::runtime_binary())
+    let create = common::container_runtime::runtime_command()
         .args(args)
         .output()
         .expect("run one-off postgres");
     if !create.status.success() {
         let stderr = String::from_utf8_lossy(&create.stderr);
-        let _ = Command::new(common::container_runtime::runtime_binary())
+        let _ = common::container_runtime::runtime_command()
             .args(["rm", "-f", &name])
             .output();
         panic!("failed to create one-off container: {}", stderr);
     }
     let _guard = OneOffContainerGuard(name.clone());
     for _ in 0..30 {
-        let ok = Command::new(common::container_runtime::runtime_binary())
+        let ok = common::container_runtime::runtime_command()
             .args([
                 "exec", &name, "psql", "-U", "postgres", "-d", "postgres", "-c", "SELECT 1",
             ])
@@ -294,7 +294,7 @@ fn run_one_off_postgres_list_tables_inner(
         thread::sleep(Duration::from_secs(1));
     }
     thread::sleep(Duration::from_secs(2));
-    let out = Command::new(common::container_runtime::runtime_binary())
+    let out = common::container_runtime::runtime_command()
         .args([
             "exec", &name, "psql", "-U", "postgres", "-d", "postgres", "-c", "\\dt",
         ])

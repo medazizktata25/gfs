@@ -25,7 +25,7 @@ fn get_container_id(repo_path: &Path) -> Option<String> {
 /// Wait for Postgres in the container to accept connections. Retries up to 30 times with 1s delay.
 fn wait_for_postgres(container_id: &str) -> bool {
     for _ in 0..30 {
-        let ok = std::process::Command::new(common::container_runtime::runtime_binary())
+        let ok = common::container_runtime::runtime_command()
             .args([
                 "exec",
                 container_id,
@@ -51,10 +51,10 @@ struct ContainerCleanupGuard(String);
 
 impl Drop for ContainerCleanupGuard {
     fn drop(&mut self) {
-        let _ = std::process::Command::new(common::container_runtime::runtime_binary())
+        let _ = common::container_runtime::runtime_command()
             .args(["stop", &self.0])
             .output();
-        let _ = std::process::Command::new(common::container_runtime::runtime_binary())
+        let _ = common::container_runtime::runtime_command()
             .args(["rm", "-f", &self.0])
             .output();
     }
