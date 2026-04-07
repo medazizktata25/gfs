@@ -401,8 +401,11 @@ gfs --json commit -m "checkpoint before migration"
 gfs --json checkout -b feature/migration
 # → {"hash":"b57732d8...","branch":"feature/migration","new_branch":true}
 
-# Branch listing
-gfs branch
+# Repository status (JSON)
+gfs --json status
+
+# Branch listing (JSON)
+gfs --json branch
 
 # Branch topology graph
 gfs log --graph --all

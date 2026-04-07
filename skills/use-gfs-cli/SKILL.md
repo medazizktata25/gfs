@@ -56,7 +56,11 @@ gfs --json export --format sql
 ```
 
 **Supported commands**: `init`, `commit`, `checkout`, `export`, `import`
-`gfs status --output json` also works (predates the global flag).
+
+**Status JSON**:
+- `gfs --json status` outputs JSON by default
+- `gfs status --output json` outputs JSON (explicit format)
+- `gfs status --output table` forces table output (overrides global `--json`)
 
 ### `--color` — Color Control
 
