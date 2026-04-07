@@ -31,7 +31,7 @@ pub enum ExportRepoError {
     #[error("unsupported export format: '{0}'")]
     UnsupportedFormat(String),
 
-    #[error("compute error: {0}")]
+    #[error(transparent)]
     Compute(#[from] ComputeError),
 
     #[error("export task failed (exit {exit_code}): {stderr}")]
