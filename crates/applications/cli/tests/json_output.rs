@@ -12,6 +12,8 @@ fn run_gfs(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let out = Command::new(gfs_bin())
         .current_dir(cwd)
         .args(args)
+        // Keep stderr clean for --json contract assertions.
+        .env("RUST_LOG", "off")
         .output()
         .expect("failed to run gfs");
 
@@ -31,6 +33,13 @@ fn assert_stdout_json(stdout: &str) -> Value {
     })
 }
 
+fn assert_stderr_empty(stderr: &str) {
+    assert!(
+        stderr.trim().is_empty(),
+        "expected empty stderr, got:\n--- stderr ---\n{stderr}"
+    );
+}
+
 #[test]
 fn json_init_stdout_is_json() {
     let tmp = TempDir::new().unwrap();
@@ -48,8 +57,9 @@ fn json_status_stdout_is_json() {
     let tmp = TempDir::new().unwrap();
     run_gfs(tmp.path(), &["init", "."]);
 
-    let (code, stdout, _stderr) = run_gfs(tmp.path(), &["--json", "status"]);
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["--json", "status"]);
     assert_eq!(code, 0, "expected status to succeed");
+    assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
     assert!(
         v.get("current_branch").is_some(),
@@ -60,8 +70,9 @@ fn json_status_stdout_is_json() {
 #[test]
 fn json_providers_stdout_is_json() {
     let tmp = TempDir::new().unwrap();
-    let (code, stdout, _stderr) = run_gfs(tmp.path(), &["--json", "providers"]);
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["--json", "providers"]);
     assert_eq!(code, 0, "expected providers to succeed");
+    assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
     assert!(
         v.get("providers").is_some() || v.get("provider").is_some(),
@@ -74,8 +85,9 @@ fn json_branch_stdout_is_json_in_empty_repo() {
     let tmp = TempDir::new().unwrap();
     run_gfs(tmp.path(), &["init", "."]);
 
-    let (code, stdout, _stderr) = run_gfs(tmp.path(), &["--json", "branch"]);
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["--json", "branch"]);
     assert_eq!(code, 0, "expected branch list to succeed");
+    assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
     assert!(
         v.get("branches").is_some(),
@@ -88,8 +100,9 @@ fn json_log_stdout_is_json_in_empty_repo() {
     let tmp = TempDir::new().unwrap();
     run_gfs(tmp.path(), &["init", "."]);
 
-    let (code, stdout, _stderr) = run_gfs(tmp.path(), &["--json", "log"]);
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["--json", "log"]);
     assert_eq!(code, 0, "expected log to succeed (empty list ok)");
+    assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
     assert!(v.get("commits").is_some(), "expected log JSON to have commits");
 }
@@ -97,8 +110,9 @@ fn json_log_stdout_is_json_in_empty_repo() {
 #[test]
 fn json_error_commit_outside_repo_is_json() {
     let tmp = TempDir::new().unwrap();
-    let (code, stdout, _stderr) = run_gfs(tmp.path(), &["--json", "commit", "-m", "x"]);
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["--json", "commit", "-m", "x"]);
     assert_eq!(code, 1, "expected commit outside repo to fail");
+    assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
     assert!(v.get("error").is_some(), "expected error envelope");
 }
@@ -108,8 +122,9 @@ fn json_error_checkout_main_on_empty_repo_is_json() {
     let tmp = TempDir::new().unwrap();
     run_gfs(tmp.path(), &["init", "."]);
 
-    let (code, stdout, _stderr) = run_gfs(tmp.path(), &["--json", "checkout", "main"]);
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["--json", "checkout", "main"]);
     assert_eq!(code, 1, "expected checkout main on empty repo to fail");
+    assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
     assert!(v.get("error").is_some(), "expected error envelope");
 }
@@ -119,8 +134,21 @@ fn json_error_compute_status_without_config_is_json() {
     let tmp = TempDir::new().unwrap();
     run_gfs(tmp.path(), &["init", "."]);
 
-    let (code, stdout, _stderr) = run_gfs(tmp.path(), &["--json", "compute", "status"]);
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["--json", "compute", "status"]);
     assert_eq!(code, 1, "expected compute status without config to fail");
+    assert_stderr_empty(&stderr);
+    let v = assert_stdout_json(&stdout);
+    assert!(v.get("error").is_some(), "expected error envelope");
+}
+
+#[test]
+fn json_error_compute_logs_without_config_is_json() {
+    let tmp = TempDir::new().unwrap();
+    run_gfs(tmp.path(), &["init", "."]);
+
+    let (code, stdout, stderr) = run_gfs(tmp.path(), &["--json", "compute", "logs"]);
+    assert_eq!(code, 1, "expected compute logs without config to fail");
+    assert_stderr_empty(&stderr);
     let v = assert_stdout_json(&stdout);
     assert!(v.get("error").is_some(), "expected error envelope");
 }
