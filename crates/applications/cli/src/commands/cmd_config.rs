@@ -136,9 +136,7 @@ fn set(repo_path: &std::path::Path, key: &str, value: &str) -> Result<()> {
                 .args(["-f", "-c", "%T", &gfs_dir.to_string_lossy()])
                 .output();
             match output {
-                Ok(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).trim() == "btrfs"
-                }
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "btrfs",
                 _ => false,
             }
         };

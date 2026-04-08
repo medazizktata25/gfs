@@ -9,8 +9,8 @@ use crate::model::layout::{
 use anyhow::Result;
 use std::collections::HashSet;
 use std::fs;
-use std::process::Command;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn is_btrfs(path: &Path) -> bool {
     let output = Command::new("stat")
@@ -74,7 +74,13 @@ fn apply_btrfs_compression(gfs_dir: &Path, algorithm: &str) -> Result<(), RepoEr
     }
 
     let output = Command::new("btrfs")
-        .args(["property", "set", &gfs_dir.to_string_lossy(), "compression", algorithm])
+        .args([
+            "property",
+            "set",
+            &gfs_dir.to_string_lossy(),
+            "compression",
+            algorithm,
+        ])
         .output();
 
     match output {
@@ -96,7 +102,10 @@ fn apply_btrfs_compression(gfs_dir: &Path, algorithm: &str) -> Result<(), RepoEr
 }
 
 fn apply_btrfs_reflink(gfs_dir: &Path) -> Result<(), RepoError> {
-    tracing::info!("Reflink/CoW is enabled by default on btrfs for {}", gfs_dir.display());
+    tracing::info!(
+        "Reflink/CoW is enabled by default on btrfs for {}",
+        gfs_dir.display()
+    );
     Ok(())
 }
 

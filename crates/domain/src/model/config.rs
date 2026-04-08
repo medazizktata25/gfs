@@ -133,7 +133,10 @@ mod tests {
             "postgres"
         );
         assert_eq!(loaded.runtime.as_ref().unwrap().container_name, "c1");
-        assert_eq!(loaded.storage.as_ref().unwrap().compression, Some("zstd".into()));
+        assert_eq!(
+            loaded.storage.as_ref().unwrap().compression,
+            Some("zstd".into())
+        );
         assert!(loaded.storage.as_ref().unwrap().enable_reflink);
     }
 
@@ -171,6 +174,7 @@ mod tests {
             user: None,
             environment: None,
             runtime: None,
+            storage: None,
         };
         // Pass path where .gfs does not exist; save writes to repo_path/.gfs/config.toml
         let result = config.save(dir.path());
