@@ -19,6 +19,9 @@ pub async fn init(
     database_provider: Option<String>,
     database_version: Option<String>,
     database_port: Option<u16>,
+    database_user: Option<String>,
+    database_password: Option<String>,
+    database_name: Option<String>,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::trace!("Initializing Guepard environment at: {:?}", path);
@@ -46,6 +49,9 @@ pub async fn init(
             database_provider,
             database_version,
             database_port,
+            database_user,
+            database_password,
+            database_name,
         )
         .await?;
 
