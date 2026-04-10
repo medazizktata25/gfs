@@ -1,0 +1,15 @@
+[package]
+name               = "gfs-storage-btrfs"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+gfs-domain = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

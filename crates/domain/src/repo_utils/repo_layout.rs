@@ -10,104 +10,6 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-
-fn is_btrfs(path: &Path) -> bool {
-    let output = Command::new("stat")
-        .args(["-f", "-c", "%T", &path.to_string_lossy()])
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() => {
-            let fs_type = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            fs_type == "btrfs"
-        }
-        _ => false,
-    }
-}
-
-pub fn apply_storage_config(gfs_dir: &Path) -> Result<(), RepoError> {
-    let config = match GfsConfig::load(gfs_dir.parent().unwrap_or(gfs_dir)) {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
-    };
-
-    let storage = match &config.storage {
-        Some(s) => s,
-        None => return Ok(()),
-    };
-
-    let is_btrfs_fs = is_btrfs(gfs_dir);
-
-    if let Some(compression) = &storage.compression {
-        if !is_btrfs_fs {
-            tracing::warn!(
-                "compression is only supported on btrfs filesystem. Current filesystem is not btrfs - compression setting will be ignored."
-            );
-        } else {
-            apply_btrfs_compression(gfs_dir, compression)?;
-        }
-    }
-
-    if storage.enable_reflink {
-        if !is_btrfs_fs {
-            tracing::warn!(
-                "reflink is only supported on btrfs filesystem. Current filesystem is not btrfs - reflink setting will be ignored."
-            );
-        } else {
-            apply_btrfs_reflink(gfs_dir)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn apply_btrfs_compression(gfs_dir: &Path, algorithm: &str) -> Result<(), RepoError> {
-    let valid_algos = ["zstd", "zlib", "lzo"];
-    if !valid_algos.contains(&algorithm.to_lowercase().as_str()) {
-        tracing::warn!(
-            "Invalid compression algorithm '{}'. Valid: {:?}",
-            algorithm,
-            valid_algos
-        );
-        return Ok(());
-    }
-
-    let output = Command::new("btrfs")
-        .args([
-            "property",
-            "set",
-            &gfs_dir.to_string_lossy(),
-            "compression",
-            algorithm,
-        ])
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() => {
-            tracing::info!("Enabled {} compression on {}", algorithm, gfs_dir.display());
-        }
-        Ok(o) => {
-            tracing::warn!(
-                "Failed to set compression (not btrfs?): {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-        }
-        Err(e) => {
-            tracing::warn!("btrfs command not available: {}", e);
-        }
-    }
-
-    Ok(())
-}
-
-fn apply_btrfs_reflink(gfs_dir: &Path) -> Result<(), RepoError> {
-    tracing::info!(
-        "Reflink/CoW is enabled by default on btrfs for {}",
-        gfs_dir.display()
-    );
-    Ok(())
-}
 
 pub fn validate_repo_layout(gfs_dir: &Path) -> Result<(), RepoError> {
     // Check HEAD file
@@ -238,9 +140,6 @@ pub fn init_repo_layout(working_dir: &Path, mount_point: Option<String>) -> Resu
     fs::write(&config_path, content).map_err(RepoError::from)?;
 
     tracing::info!("Successfully initialized .gfs directory");
-
-    // Apply storage config (btrfs compression/reflink) if configured
-    apply_storage_config(&gfs_dir)?;
 
     // Set new file marker
     let new_marker_path = gfs_dir.join("new");

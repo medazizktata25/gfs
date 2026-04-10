@@ -59,3 +59,6 @@ tokio              = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gfs-storage-apfs = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gfs-storage-btrfs = { workspace = true }

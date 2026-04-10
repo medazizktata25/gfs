@@ -710,11 +710,35 @@ async fn run_storage(action: StorageAction, json_output: bool) -> Result<()> {
         dispatch_storage(&storage, action, json_output).await
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        if gfs_storage_btrfs::is_btrfs(storage_action_path(&action)) {
+            let storage = gfs_storage_btrfs::BtrfsStorage::new();
+            dispatch_storage(&storage, action, json_output).await
+        } else {
+            use gfs_storage_file::FileStorage;
+            let storage = FileStorage::new();
+            dispatch_storage(&storage, action, json_output).await
+        }
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
     {
         use gfs_storage_file::FileStorage;
         let storage = FileStorage::new();
         dispatch_storage(&storage, action, json_output).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn storage_action_path(action: &StorageAction) -> &std::path::Path {
+    match action {
+        StorageAction::Mount { id, .. }
+        | StorageAction::Unmount { id }
+        | StorageAction::Snapshot { id, .. }
+        | StorageAction::Status { id }
+        | StorageAction::Quota { id } => std::path::Path::new(id),
+        StorageAction::Clone { source, .. } => std::path::Path::new(source),
     }
 }
 

@@ -7,7 +7,6 @@
 //! Resolution order for commits: CLI flag → local → global → git config.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 use anyhow::Result;
 use gfs_domain::model::config::{GfsConfig, GlobalSettings};
@@ -156,31 +155,52 @@ fn set(repo_path: &std::path::Path, key: &str, value: &str) -> Result<()> {
         .save(repo_path)
         .map_err(|e| repo_error_to_anyhow(e, repo_path))?;
 
-    // Apply storage config if storage-related key was changed
-    if key == KEY_STORAGE_COMPRESSION || key == KEY_STORAGE_REFLINK {
-        let is_btrfs = {
-            let output = Command::new("stat")
-                .args(["-f", "-c", "%T", &gfs_dir.to_string_lossy()])
-                .output();
-            match output {
-                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "btrfs",
-                _ => false,
-            }
-        };
-
-        if !is_btrfs {
-            let msg = if key == KEY_STORAGE_COMPRESSION {
-                "Warning: compression is only supported on btrfs. Your filesystem is not btrfs."
-            } else {
-                "Warning: reflink is only supported on btrfs. Your filesystem is not btrfs."
-            };
-            eprintln!("{}", msg);
-        } else if let Err(e) = repo_layout::apply_storage_config(&gfs_dir) {
-            tracing::warn!("Failed to apply storage config: {}", e);
-        }
+    if let Some(storage) = config.storage.as_ref() {
+        apply_storage_settings(key, &gfs_dir, storage);
     }
 
     Ok(())
+}
+
+fn apply_storage_settings(
+    key: &str,
+    gfs_dir: &std::path::Path,
+    storage: &gfs_domain::model::config::StorageConfig,
+) {
+    let should_apply = match key {
+        KEY_STORAGE_COMPRESSION => storage.compression.is_some(),
+        KEY_STORAGE_REFLINK => storage.enable_reflink,
+        _ => false,
+    };
+
+    if !should_apply {
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if !gfs_storage_btrfs::is_btrfs(gfs_dir) {
+            eprintln!("{}", unsupported_storage_message(key));
+            return;
+        }
+
+        gfs_storage_btrfs::apply_storage_config(gfs_dir, storage);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = gfs_dir;
+        let _ = storage;
+        eprintln!("{}", unsupported_storage_message(key));
+    }
+}
+
+fn unsupported_storage_message(key: &str) -> &'static str {
+    if key == KEY_STORAGE_COMPRESSION {
+        "Warning: compression is only supported on btrfs. Your filesystem is not btrfs."
+    } else {
+        "Warning: reflink is only supported on btrfs. Your filesystem is not btrfs."
+    }
 }
 
 // ---------------------------------------------------------------------------

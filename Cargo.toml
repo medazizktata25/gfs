@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/adapters/compute-docker",
     "crates/adapters/storage-apfs",
+    "crates/adapters/storage-btrfs",
     "crates/adapters/storage-file",
     "crates/applications/cli",
     "crates/applications/mcp",
@@ -59,6 +60,7 @@ gfs-domain                 = { path = "crates/domain" }
 gfs-telemetry              = { path = "crates/telemetry" }
 gfs-config                 = { path = "crates/config" }
 gfs-storage-apfs           = { path = "crates/adapters/storage-apfs" }
+gfs-storage-btrfs          = { path = "crates/adapters/storage-btrfs" }
 gfs-storage-file           = { path = "crates/adapters/storage-file" }
 gfs-compute-docker         = { path = "crates/adapters/compute-docker" }
 gfs-mcp                    = { path = "crates/applications/mcp" }

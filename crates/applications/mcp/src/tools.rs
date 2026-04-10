@@ -620,7 +620,47 @@ async fn do_commit(args: &serde_json::Value) -> Result<CallToolResult, McpError>
         }))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        use gfs_domain::model::layout::GFS_DIR;
+        use gfs_domain::ports::storage::StoragePort;
+
+        let storage: Arc<dyn StoragePort> = if gfs_storage_btrfs::is_btrfs(&repo_path.join(GFS_DIR))
+        {
+            Arc::new(gfs_storage_btrfs::BtrfsStorage::from_repo(&repo_path))
+        } else {
+            Arc::new(gfs_storage_file::FileStorage::new())
+        };
+        let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
+        let compute: Arc<dyn Compute> =
+            Arc::new(DockerCompute::new().map_err(|e| to_error_data(e.to_string()))?);
+        let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+        containers::register_all(registry.as_ref())
+            .map_err(|e| to_error_data(format!("register providers: {e}")))?;
+        let use_case = CommitRepoUseCase::new(repository.clone(), compute, storage, registry);
+        let branch = repository
+            .get_current_branch(&repo_path)
+            .await
+            .unwrap_or_else(|_| "HEAD".to_string());
+        let commit_hash = use_case
+            .run(
+                repo_path,
+                message.to_string(),
+                author,
+                author_email,
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| to_error_data(e.to_string()))?;
+        json_ok(json!({
+            "branch": branch,
+            "commit_id": commit_hash,
+            "message": message,
+        }))
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
     {
         use gfs_domain::ports::storage::StoragePort;
         let storage: Arc<dyn StoragePort> = Arc::new(gfs_storage_file::FileStorage::new());

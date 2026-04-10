@@ -989,6 +989,7 @@ dependencies = [
  "gfs-domain",
  "gfs-mcp",
  "gfs-storage-apfs",
+ "gfs-storage-btrfs",
  "gfs-storage-file",
  "gfs-telemetry",
  "once_cell",
@@ -1056,6 +1057,7 @@ dependencies = [
  "gfs-compute-docker",
  "gfs-domain",
  "gfs-storage-apfs",
+ "gfs-storage-btrfs",
  "gfs-storage-file",
  "gfs-telemetry",
  "rmcp",
@@ -1075,6 +1077,17 @@ dependencies = [
  "chrono",
  "gfs-domain",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "gfs-storage-btrfs"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "gfs-domain",
  "tokio",
  "tracing",
 ]
