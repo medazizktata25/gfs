@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -286,6 +286,28 @@ pub trait Compute: Send + Sync {
 
     /// Stop the instance if running, then remove it. Used when recreating a container with a new data bind.
     async fn remove_instance(&self, id: &InstanceId) -> Result<()>;
+
+    /// Stream the contents of `container_path` from inside the running instance
+    /// and unpack them into `dest` on the host.
+    ///
+    /// This is used during `gfs commit` as a permission-safe alternative to the
+    /// host-side `cp` used by the storage adapter.  The Docker daemon reads the
+    /// bind-mounted directory on behalf of the container process (which may be
+    /// root or a different UID), so the host user's read permissions on those
+    /// files do not matter.
+    ///
+    /// The default implementation returns an error; adapters that support this
+    /// operation (e.g. [`DockerCompute`]) override it.
+    async fn stream_snapshot(
+        &self,
+        _id: &InstanceId,
+        _container_path: &str,
+        _dest: &Path,
+    ) -> Result<()> {
+        Err(ComputeError::Internal(
+            "stream_snapshot not supported by this compute runtime".into(),
+        ))
+    }
 
     // -----------------------------------------------------------------------
     // Task execution (sidecar / ephemeral instances)

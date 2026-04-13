@@ -184,7 +184,13 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         definition.host_data_dir = Some(active.clone());
         #[cfg(unix)]
         {
-            definition.user = current_user::current_user_uid_gid();
+            match current_user::current_user_uid_gid() {
+                Some(uid_gid) => definition.user = Some(uid_gid),
+                None => tracing::warn!(
+                    "could not determine host uid:gid; container will run as its default user — \
+                     workspace files may be unreadable by the host user during snapshot"
+                ),
+            }
         }
         let compute_data_path = definition.data_dir.to_string_lossy().into_owned();
 

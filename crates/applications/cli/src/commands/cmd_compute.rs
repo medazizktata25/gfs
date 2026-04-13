@@ -465,7 +465,13 @@ async fn start_restart_or_recreate(
     definition.host_data_dir = Some(std::path::PathBuf::from(&active));
     #[cfg(unix)]
     {
-        definition.user = current_user::current_user_uid_gid();
+        match current_user::current_user_uid_gid() {
+            Some(uid_gid) => definition.user = Some(uid_gid),
+            None => tracing::warn!(
+                "could not determine host uid:gid; container will run as its default user — \
+                 workspace files may be unreadable by the host user during snapshot"
+            ),
+        }
     }
     let new_id = compute.provision(&definition).await?;
     let status = compute.start(&new_id, Default::default()).await?;

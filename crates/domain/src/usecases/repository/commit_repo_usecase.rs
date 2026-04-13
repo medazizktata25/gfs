@@ -204,15 +204,38 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             .ensure_snapshot_path(&path, &snapshot_hash)
             .await?;
 
-        // COW-copy the workspace data dir into the snapshot destination folder.
-        self.storage
-            .snapshot(
-                &volume_id,
-                SnapshotOptions {
-                    label: Some(snapshot_dest.to_string_lossy().into_owned()),
-                },
-            )
-            .await?;
+        // When a compute container is active, stream the snapshot through the
+        // Docker daemon instead of relying on a host-side `cp`.  This bypasses
+        // host read-permission restrictions on bind-mounted files that the
+        // container process may have written as a different UID (e.g. root).
+        //
+        // Fallback: no compute → files are owned by the host user → regular
+        // host-side copy via the storage adapter is safe and uses reflinks.
+        if let (Some(runtime), Some(env)) = (&runtime_config, &environment) {
+            let instance_id = InstanceId(runtime.container_name.clone());
+            let provider =
+                self.registry
+                    .get(&env.database_provider)
+                    .ok_or_else(|| {
+                        CommitRepoError::UnknownDatabaseProvider(env.database_provider.clone())
+                    })?;
+            let container_data_path =
+                provider.definition().data_dir.to_string_lossy().into_owned();
+
+            self.compute
+                .stream_snapshot(&instance_id, &container_data_path, &snapshot_dest)
+                .await
+                .map_err(CommitRepoError::Compute)?;
+        } else {
+            self.storage
+                .snapshot(
+                    &volume_id,
+                    SnapshotOptions {
+                        label: Some(snapshot_dest.to_string_lossy().into_owned()),
+                    },
+                )
+                .await?;
+        }
 
         // 5. Build the new commit.
         //    Use "0" parent when this is the very first real commit.
@@ -629,6 +652,15 @@ mod tests {
         async fn remove_instance(&self, _id: &InstanceId) -> crate::ports::compute::Result<()> {
             Ok(())
         }
+        async fn stream_snapshot(
+            &self,
+            _id: &InstanceId,
+            _container_path: &str,
+            dest: &std::path::Path,
+        ) -> crate::ports::compute::Result<()> {
+            std::fs::create_dir_all(dest).map_err(crate::ports::compute::ComputeError::Io)?;
+            Ok(())
+        }
         async fn get_task_connection_info(
             &self,
             _id: &InstanceId,
@@ -938,15 +970,12 @@ mod tests {
             *compute.unpaused.lock().unwrap(),
             "unpause should have been called"
         );
+        // When compute is active, snapshot goes through stream_snapshot (not storage.snapshot).
+        // Verify storage was NOT called (compute path bypasses it).
         assert_eq!(
             storage.last_volume.lock().unwrap().as_deref(),
-            Some("/vol/main")
-        );
-        // Snapshot destination must be a 64-char hex-named path under /tmp/snapshots/.
-        let label = storage.last_label.lock().unwrap().clone().unwrap();
-        assert!(
-            label.contains("/tmp/snapshots/"),
-            "expected snapshot inside snapshots dir"
+            None,
+            "storage.snapshot should not be called when compute is active"
         );
     }
 

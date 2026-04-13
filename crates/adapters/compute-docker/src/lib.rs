@@ -14,6 +14,7 @@
 pub mod containers;
 mod error;
 
+use std::io::Write as _;
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -875,6 +876,88 @@ impl Compute for DockerCompute {
         let _ = self.docker.remove_container(&task_name, None).await;
 
         result
+    }
+
+    #[instrument(skip(self))]
+    async fn stream_snapshot(
+        &self,
+        id: &InstanceId,
+        container_path: &str,
+        dest: &Path,
+    ) -> Result<()> {
+        let opts = bollard::query_parameters::DownloadFromContainerOptionsBuilder::default()
+            .path(container_path)
+            .build();
+
+        std::fs::create_dir_all(dest).map_err(ComputeError::Io)?;
+        let dest = dest.to_path_buf();
+
+        // std::io::pipe() gives a synchronous (reader, writer) pair backed by
+        // an OS pipe — no heap allocation of the full archive.
+        // The writer end is fed from the async bollard stream; the reader end
+        // is consumed by `tar::Archive` inside a blocking thread.  Both sides
+        // run concurrently so back-pressure is handled by the OS pipe buffer.
+        let (pipe_reader, mut pipe_writer) = std::io::pipe().map_err(ComputeError::Io)?;
+
+        // Spawn the blocking unpack side first so the reader is already
+        // consuming when the writer starts filling the pipe.
+        let unpack = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
+            let mut archive = tar::Archive::new(pipe_reader);
+            archive.set_preserve_permissions(false);
+            let mut files = 0usize;
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let raw_path = entry.path()?.into_owned();
+                // Strip the leading directory component Docker always adds.
+                let stripped: std::path::PathBuf =
+                    raw_path.components().skip(1).collect();
+                if stripped.as_os_str().is_empty() {
+                    continue;
+                }
+                let dest_path = dest.join(&stripped);
+                if entry.header().entry_type().is_dir() {
+                    std::fs::create_dir_all(&dest_path)?;
+                } else {
+                    if let Some(parent) = dest_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    entry.unpack(&dest_path)?;
+                    files += 1;
+                }
+            }
+            Ok(files)
+        });
+
+        // Drive the bollard stream into the pipe writer on the async side.
+        let container_name = id.0.clone();
+        let mut stream = self.docker.download_from_container(&id.0, Some(opts));
+        let write_result: Result<()> = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| classify(&container_name, e))?;
+                pipe_writer.write_all(&chunk).map_err(ComputeError::Io)?;
+            }
+            Ok(())
+        }
+        .await;
+
+        // Drop writer so the reader sees EOF and the unpack task can finish.
+        drop(pipe_writer);
+
+        let files = unpack
+            .await
+            .map_err(|e| ComputeError::Internal(format!("tar unpack task panicked: {e}")))?
+            .map_err(ComputeError::Io)?;
+
+        // Surface any stream error after the unpack has drained.
+        write_result?;
+
+        tracing::info!(
+            container = %id.0,
+            container_path,
+            files,
+            "stream_snapshot: unpacked tar archive from container"
+        );
+        Ok(())
     }
 }
 

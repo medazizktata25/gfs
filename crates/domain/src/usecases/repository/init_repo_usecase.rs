@@ -141,11 +141,15 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         )?;
         definition.host_data_dir = Some(workspace_data_dir);
 
-        // Run container as host user so files in bind-mounted data dir are owned by current user.
-        // This avoids "Permission denied" when gfs commit copies the workspace for snapshotting.
         #[cfg(unix)]
         {
-            definition.user = current_user::current_user_uid_gid();
+            match current_user::current_user_uid_gid() {
+                Some(uid_gid) => definition.user = Some(uid_gid),
+                None => tracing::warn!(
+                    "could not determine host uid:gid; container will run as its default user — \
+                     workspace files may be unreadable by the host user during snapshot"
+                ),
+            }
         }
 
         let id = compute.provision(&definition).await?;
