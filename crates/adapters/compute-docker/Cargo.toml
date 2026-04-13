@@ -12,6 +12,7 @@ async-trait               = { workspace = true }
 bollard                   = { workspace = true }
 chrono                    = { workspace = true }
 futures-util              = { version = "0.3" }
+tar                       = { workspace = true }
 gfs-domain = { workspace = true }
 thiserror                 = { workspace = true }
 tokio                     = { workspace = true }
