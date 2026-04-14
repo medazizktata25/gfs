@@ -113,6 +113,13 @@ pub struct ExecOutput {
     pub stderr: String,
 }
 
+/// Capabilities supported by a compute runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputeCapabilities {
+    pub supports_stream_snapshot: bool,
+    pub supports_exec_as_root: bool,
+}
+
 /// Human-readable description of the connected container runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeDescriptor {
@@ -258,6 +265,22 @@ pub trait Compute: Send + Sync {
     /// Run the given pre-snapshot commands inside the instance (e.g. database CHECKPOINT).
     /// Commands are executed in order; typically provided by the database provider.
     async fn prepare_for_snapshot(&self, id: &InstanceId, commands: &[String]) -> Result<()>;
+
+    /// Return runtime capabilities (used by domain-level invariants).
+    async fn capabilities(&self) -> Result<ComputeCapabilities> {
+        Ok(ComputeCapabilities {
+            supports_stream_snapshot: false,
+            supports_exec_as_root: false,
+        })
+    }
+
+    /// Execute a shell command inside the running instance.
+    ///
+    /// If `user` is `Some`, the runtime attempts to execute as that user (e.g. `"0:0"`).
+    /// Implementations may return an error if user switching is not supported.
+    async fn exec(&self, _id: &InstanceId, _command: &str, _user: Option<&str>) -> Result<ExecOutput> {
+        Err(ComputeError::Internal("exec not supported by this compute runtime".into()))
+    }
 
     /// Describe the connected container runtime (for example Docker or Podman).
     async fn describe_runtime(&self) -> Result<RuntimeDescriptor> {

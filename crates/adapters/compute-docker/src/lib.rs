@@ -21,9 +21,9 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
 use gfs_domain::ports::compute::{
-    Compute, ComputeDefinition, ComputeError, ExecOutput, InstanceConnectionInfo, InstanceId,
-    InstanceState, InstanceStatus, LogEntry, LogStream, LogsOptions, Result, RuntimeDescriptor,
-    StartOptions,
+    Compute, ComputeCapabilities, ComputeDefinition, ComputeError, ExecOutput,
+    InstanceConnectionInfo, InstanceId, InstanceState, InstanceStatus, LogEntry, LogStream,
+    LogsOptions, Result, RuntimeDescriptor, StartOptions,
 };
 use tracing::instrument;
 
@@ -534,7 +534,15 @@ impl Compute for DockerCompute {
             if cmd.trim().is_empty() {
                 continue;
             }
-            self.run_exec_command(id, cmd).await?;
+            let out = self.run_exec_command(id, cmd, Some("0:0")).await?;
+            if out.exit_code != 0 {
+                return Err(ComputeError::Internal(format!(
+                    "prepare_for_snapshot command failed (exit {}): {}\nstderr: {}",
+                    out.exit_code,
+                    cmd,
+                    out.stderr.trim()
+                )));
+            }
         }
 
         if self.is_podman_engine().await
@@ -544,7 +552,15 @@ impl Compute for DockerCompute {
             // on the host. Ensure they are host-readable before filesystem snapshot.
             let escaped = data_mount.replace('\'', "'\"'\"'");
             let chmod_cmd = format!("chmod -R a+rX '{}'", escaped);
-            self.run_exec_command(id, &chmod_cmd).await?;
+            let out = self.run_exec_command(id, &chmod_cmd, Some("0:0")).await?;
+            if out.exit_code != 0 {
+                return Err(ComputeError::Internal(format!(
+                    "prepare_for_snapshot chmod failed (exit {}): {}\nstderr: {}",
+                    out.exit_code,
+                    chmod_cmd,
+                    out.stderr.trim()
+                )));
+            }
         }
 
         Ok(())
@@ -552,6 +568,17 @@ impl Compute for DockerCompute {
 
     async fn describe_runtime(&self) -> Result<RuntimeDescriptor> {
         self.describe_runtime_impl().await
+    }
+
+    async fn capabilities(&self) -> Result<ComputeCapabilities> {
+        Ok(ComputeCapabilities {
+            supports_stream_snapshot: true,
+            supports_exec_as_root: true,
+        })
+    }
+
+    async fn exec(&self, id: &InstanceId, command: &str, user: Option<&str>) -> Result<ExecOutput> {
+        self.run_exec_command(id, command, user).await
     }
 
     #[instrument(skip(self))]
@@ -905,6 +932,14 @@ impl Compute for DockerCompute {
             .path(container_path)
             .build();
 
+        // `gfs commit` may have created a *partial* destination directory when the
+        // fast host snapshot (`cp`) failed mid-flight. That partial tree can contain
+        // non-traversable permissions (e.g. `000` dirs) that would prevent both
+        // cleanup and tar extraction. Be defensive here: repair + remove before
+        // unpacking the streamed snapshot.
+        if dest.exists() {
+            let _ = std::fs::remove_dir_all(dest);
+        }
         std::fs::create_dir_all(dest).map_err(ComputeError::Io)?;
         let dest = dest.to_path_buf();
 
@@ -919,13 +954,59 @@ impl Compute for DockerCompute {
         // consuming when the writer starts filling the pipe.
         let unpack = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
             use std::io;
+            #[cfg(unix)]
+            use std::os::unix::fs::PermissionsExt;
+
+            fn chmod_best_effort(path: &std::path::Path, mode: u32) {
+                #[cfg(unix)]
+                {
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = mode;
+                    let _ = path;
+                }
+            }
+
+            fn repair_tree_for_removal(path: &std::path::Path) {
+                #[cfg(unix)]
+                {
+                    if let Ok(md) = std::fs::symlink_metadata(path) {
+                        if md.is_dir() {
+                            chmod_best_effort(path, 0o700);
+                            if let Ok(rd) = std::fs::read_dir(path) {
+                                for e in rd.flatten() {
+                                    repair_tree_for_removal(&e.path());
+                                }
+                            }
+                        } else {
+                            chmod_best_effort(path, 0o600);
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                }
+            }
+
+            // If a partial snapshot dir exists (created by failed host snapshot), make it
+            // traversable and remove it so the streamed snapshot can be unpacked cleanly.
+            if dest.exists() {
+                repair_tree_for_removal(&dest);
+                let _ = std::fs::remove_dir_all(&dest);
+            }
+            std::fs::create_dir_all(&dest)?;
+            chmod_best_effort(&dest, 0o755);
 
             let mut archive = tar::Archive::new(pipe_reader);
             archive.set_preserve_permissions(false);
             let mut files = 0usize;
             for entry in archive.entries()? {
                 let mut entry = entry?;
-                if entry.header().entry_type().is_symlink() {
+                let ty = entry.header().entry_type();
+                if ty.is_symlink() || ty.is_hard_link() {
                     continue;
                 }
                 let raw_path = entry.path()?.into_owned();
@@ -943,9 +1024,11 @@ impl Compute for DockerCompute {
                 let dest_path = dest.join(&stripped);
                 if entry.header().entry_type().is_dir() {
                     std::fs::create_dir_all(&dest_path)?;
+                    chmod_best_effort(&dest_path, 0o755);
                 } else {
                     if let Some(parent) = dest_path.parent() {
                         std::fs::create_dir_all(parent)?;
+                        chmod_best_effort(parent, 0o755);
                     }
                     entry.unpack(&dest_path)?;
                     files += 1;
@@ -975,7 +1058,17 @@ impl Compute for DockerCompute {
             .map_err(ComputeError::Io)?;
 
         // Surface any stream error after the unpack has drained.
-        write_result?;
+        //
+        // When `tar::Archive` reaches the end-of-archive markers it may stop reading
+        // even if the Docker stream still has trailing padding bytes. That closes the
+        // read end of the pipe and can produce a BrokenPipe on the writer.
+        // This is harmless as long as extraction completed successfully.
+        if let Err(e) = write_result {
+            match &e {
+                ComputeError::Io(ioe) if ioe.kind() == std::io::ErrorKind::BrokenPipe => {}
+                _ => return Err(e),
+            }
+        }
 
         tracing::info!(
             container = %id.0,
@@ -992,12 +1085,19 @@ impl Compute for DockerCompute {
 // ---------------------------------------------------------------------------
 
 impl DockerCompute {
-    async fn run_exec_command(&self, id: &InstanceId, cmd: &str) -> Result<()> {
+    async fn run_exec_command(
+        &self,
+        id: &InstanceId,
+        cmd: &str,
+        user: Option<&str>,
+    ) -> Result<ExecOutput> {
+        const MAX_CAPTURE_BYTES: usize = 256 * 1024; // per-stream cap
+
         let opts = bollard::exec::CreateExecOptions {
             cmd: Some(vec!["sh".into(), "-c".into(), cmd.to_string()]),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
-            user: Some("0:0".into()),
+            user: user.map(|u| u.to_string()),
             ..Default::default()
         };
         let exec = self
@@ -1006,6 +1106,10 @@ impl DockerCompute {
             .await
             .map_err(|e| classify(&id.0, e))?;
 
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut stdout_truncated = false;
+        let mut stderr_truncated = false;
         match self
             .docker
             .start_exec(&exec.id, None::<bollard::exec::StartExecOptions>)
@@ -1013,10 +1117,30 @@ impl DockerCompute {
             .map_err(|e| classify(&id.0, e))?
         {
             bollard::exec::StartExecResults::Attached { output, .. } => {
-                output
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .map_err(|e| classify(&id.0, e))?;
+                let mut output = output;
+                while let Some(item) = output.next().await {
+                    let f = item.map_err(|e| classify(&id.0, e))?;
+                    match f {
+                        bollard::container::LogOutput::StdOut { message }
+                        | bollard::container::LogOutput::Console { message } => {
+                            if stdout.len() < MAX_CAPTURE_BYTES {
+                                let remaining = MAX_CAPTURE_BYTES - stdout.len();
+                                stdout.extend_from_slice(&message[..message.len().min(remaining)]);
+                            } else {
+                                stdout_truncated = true;
+                            }
+                        }
+                        bollard::container::LogOutput::StdErr { message } => {
+                            if stderr.len() < MAX_CAPTURE_BYTES {
+                                let remaining = MAX_CAPTURE_BYTES - stderr.len();
+                                stderr.extend_from_slice(&message[..message.len().min(remaining)]);
+                            } else {
+                                stderr_truncated = true;
+                            }
+                        }
+                        bollard::container::LogOutput::StdIn { .. } => {}
+                    }
+                }
             }
             bollard::exec::StartExecResults::Detached => {}
         }
@@ -1027,14 +1151,23 @@ impl DockerCompute {
             .await
             .map_err(|e| classify(&id.0, e))?;
 
-        if inspect.exit_code != Some(0) {
-            return Err(gfs_domain::ports::compute::ComputeError::Internal(format!(
-                "prepare_for_snapshot command failed (exit {:?}): {}",
-                inspect.exit_code, cmd
-            )));
+        let mut stdout_s = String::from_utf8_lossy(&stdout).into_owned();
+        let mut stderr_s = String::from_utf8_lossy(&stderr).into_owned();
+        if stdout_truncated {
+            stdout_s.push_str("\n<stdout truncated>\n");
+        }
+        if stderr_truncated {
+            stderr_s.push_str("\n<stderr truncated>\n");
         }
 
-        Ok(())
+        Ok(ExecOutput {
+            exit_code: inspect
+                .exit_code
+                .and_then(|c| i32::try_from(c).ok())
+                .unwrap_or(-1),
+            stdout: stdout_s,
+            stderr: stderr_s,
+        })
     }
 
     async fn get_instance_data_mount_container_path(

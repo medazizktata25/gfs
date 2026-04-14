@@ -1,6 +1,7 @@
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -44,12 +45,6 @@ fn storage_error_looks_like_permission_denied(err: &StorageError) -> bool {
     match err {
         StorageError::PermissionDenied(_) => true,
         StorageError::Io(io) => io.kind() == ErrorKind::PermissionDenied,
-        StorageError::Internal(msg) => {
-            let m = msg.as_str();
-            m.contains("Permission denied")
-                || m.contains("EACCES")
-                || (m.contains("cannot open") && m.contains("for reading"))
-        }
         _ => false,
     }
 }
@@ -64,15 +59,6 @@ mod permission_denied_tests {
     fn detects_io_permission_denied() {
         assert!(storage_error_looks_like_permission_denied(
             &StorageError::Io(std::io::Error::from(ErrorKind::PermissionDenied))
-        ));
-    }
-
-    #[test]
-    fn detects_cp_style_internal_message() {
-        assert!(storage_error_looks_like_permission_denied(
-            &StorageError::Internal(
-                "copy 'a' -> 'b' failed: cp: cannot open 'x' for reading: Permission denied".into(),
-            )
         ));
     }
 
@@ -207,6 +193,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
 
         // 3. Prepare the database container for snapshotting (if present).
         let mut was_paused = false;
+        let mut paused_instance_id: Option<InstanceId> = None;
         if let (Some(runtime), Some(env)) = (&runtime_config, &environment) {
             let instance_id = InstanceId(runtime.container_name.clone());
 
@@ -234,6 +221,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             if status.state == InstanceState::Running {
                 self.compute.pause(&instance_id).await?;
                 was_paused = true;
+                paused_instance_id = Some(instance_id);
             }
         }
 
@@ -284,6 +272,11 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                         return Err(CommitRepoError::Storage(e));
                     };
 
+                    tracing::warn!(
+                        error = %e,
+                        "host snapshot failed with permission denied; falling back to stream_snapshot"
+                    );
+
                     let instance_id = InstanceId(runtime.container_name.clone());
                     let provider = self.registry.get(&env.database_provider).ok_or_else(|| {
                         CommitRepoError::UnknownDatabaseProvider(env.database_provider.clone())
@@ -304,10 +297,37 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                         }
                     }
 
-                    self.compute
-                        .stream_snapshot(&instance_id, &container_data_path, &snapshot_dest)
-                        .await
-                        .map_err(CommitRepoError::Compute)?;
+                    let timeout_secs: u64 = match std::env::var("GFS_STREAM_SNAPSHOT_TIMEOUT_SECS")
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                    {
+                        None => 300,
+                        Some(v) if v.is_empty() => 300,
+                        Some(v) => match v.parse::<u64>() {
+                            Ok(0) => 1,
+                            Ok(n) => n,
+                            Err(_) => 300,
+                        },
+                    };
+
+                    tracing::info!(
+                        timeout_secs,
+                        "stream_snapshot timeout configured"
+                    );
+
+                    // Bound the time we keep the DB paused + snapshot in flight.
+                    // On timeout, we still unpause via the outer `was_paused` guard.
+                    tokio::time::timeout(
+                        Duration::from_secs(timeout_secs),
+                        self.compute.stream_snapshot(&instance_id, &container_data_path, &snapshot_dest),
+                    )
+                    .await
+                    .map_err(|_| {
+                        CommitRepoError::Compute(ComputeError::Internal(
+                            format!("stream_snapshot timed out after {timeout_secs}s"),
+                        ))
+                    })?
+                    .map_err(CommitRepoError::Compute)?;
 
                     self.storage
                         .finalize_snapshot(&snapshot_dest)
@@ -318,6 +338,19 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             }
         }
         .await;
+
+        // Always unpause if we paused — even on snapshot failure.
+        if was_paused {
+            if let Some(instance_id) = paused_instance_id.as_ref() {
+                if let Err(unpause_err) = self.compute.unpause(instance_id).await {
+                    tracing::warn!(
+                        error = %unpause_err,
+                        instance = %instance_id,
+                        "failed to unpause instance after snapshot attempt"
+                    );
+                }
+            }
+        }
 
         if let Err(e) = snapshot_result {
             // Best-effort: remove any partially-written snapshot directory so we
@@ -355,12 +388,6 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
 
         // 6. Persist the commit object and advance the branch ref.
         let commit_hash = self.repository.commit(&path, new_commit).await?;
-
-        // 7. Unpause the container if we paused it.
-        if was_paused && let Some(runtime) = &runtime_config {
-            let instance_id = InstanceId(runtime.container_name.clone());
-            self.compute.unpause(&instance_id).await?;
-        }
 
         tracing::info!("Commit created: {}", commit_hash);
         Ok(commit_hash)
@@ -1138,9 +1165,8 @@ mod tests {
         };
         let storage = Arc::new(MockStorage::new("snap-fin"));
         *storage.snapshot_fail.lock().unwrap() =
-            Some(crate::ports::storage::StorageError::Internal(
-                "copy 'src' -> 'dst' failed: cp: cannot open 'x' for reading: Permission denied"
-                    .into(),
+            Some(crate::ports::storage::StorageError::PermissionDenied(
+                "copy failed: Permission denied".into(),
             ));
         let registry = Arc::new(MockRegistry);
 
@@ -1196,7 +1222,7 @@ mod tests {
         };
         let storage = Arc::new(MockStorage::new("snap"));
         *storage.snapshot_fail.lock().unwrap() = Some(
-            crate::ports::storage::StorageError::Internal("copy failed: Permission denied".into()),
+            crate::ports::storage::StorageError::PermissionDenied("copy failed".into()),
         );
         let uc = CommitRepoUseCase::new(Arc::new(repo), compute, storage, Arc::new(MockRegistry));
 

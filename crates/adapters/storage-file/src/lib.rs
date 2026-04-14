@@ -213,6 +213,8 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
 
     let output = Command::new(prog)
         .args(&args)
+        // Avoid locale-dependent stderr parsing (permission denied classification).
+        .env("LANG", "C")
         .output()
         .await
         .map_err(StorageError::Io)?;

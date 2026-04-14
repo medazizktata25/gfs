@@ -43,6 +43,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
             .arg("-cRp")
             .arg(&source)
             .arg(dst)
+            .env("LANG", "C")
             .status()
             .map_err(std::io::Error::other)?;
         if !status.success() {
@@ -58,23 +59,11 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
             .args(["--reflink=auto", "-a"])
             .arg(&source)
             .arg(dst)
+            .env("LANG", "C")
             .output()
             .map_err(std::io::Error::other)?;
         if output.status.success() {
             return Ok(());
-        }
-
-        if is_permission_error_output(&output) {
-            if let Ok(unshare) = run_podman_unshare(&format!(
-                "cp --reflink=auto -a {}/. {}",
-                shell_quote(&src.to_string_lossy()),
-                shell_quote(&dst.to_string_lossy())
-            )) {
-                if unshare.status.success() {
-                    return Ok(());
-                }
-            }
-            // podman unavailable or also failed — report the original cp error
         }
 
         Err(command_error("cp --reflink=auto -a failed", &output))

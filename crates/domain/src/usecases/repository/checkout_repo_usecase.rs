@@ -10,7 +10,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::model::config::RuntimeConfig;
-use crate::ports::compute::{Compute, ComputeError, InstanceId, RuntimeDescriptor};
+use crate::ports::compute::{
+    Compute, ComputeCapabilities, ComputeError, InstanceId, RuntimeDescriptor,
+};
 use crate::ports::database_provider::DatabaseProviderRegistry;
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::utils::{current_user, data_dir};
@@ -193,6 +195,11 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             }
         }
         let compute_data_path = definition.data_dir.to_string_lossy().into_owned();
+        let repair_target = definition
+            .user
+            .clone()
+            .or_else(|| provider.data_dir_owner().map(str::to_string));
+        let startup_probes = provider.container_startup_probes();
 
         let current_bind = self
             .compute
@@ -211,7 +218,17 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         if !paths_differ(&active_str, current_bind.as_deref().unwrap_or("")) {
             tracing::info!("ensure_compute_started_after_checkout: starting existing container");
             match self.compute.start(instance_id, Default::default()).await {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.repair_data_dir_permissions_in_container(
+                        instance_id,
+                        &compute_data_path,
+                        repair_target.as_deref(),
+                    )
+                    .await;
+                    self.assert_container_healthy(instance_id, startup_probes)
+                        .await?;
+                    return Ok(());
+                }
                 Err(ComputeError::NotFound(_)) => {
                     // Container was removed externally; fall through to recreate it.
                     tracing::info!(
@@ -231,6 +248,14 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         }
         let new_id = self.compute.provision(&definition).await?;
         let _ = self.compute.start(&new_id, Default::default()).await?;
+        self.repair_data_dir_permissions_in_container(
+            &new_id,
+            &compute_data_path,
+            repair_target.as_deref(),
+        )
+        .await;
+        self.assert_container_healthy(&new_id, startup_probes)
+            .await?;
         let runtime = self
             .compute
             .describe_runtime()
@@ -250,6 +275,89 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             )
             .await?;
         Ok(())
+    }
+
+    async fn assert_container_healthy(
+        &self,
+        instance_id: &InstanceId,
+        startup_probes: &[&'static str],
+    ) -> std::result::Result<(), CheckoutRepoError> {
+        if startup_probes.is_empty() {
+            return Ok(());
+        }
+
+        let caps = self
+            .compute
+            .capabilities()
+            .await
+            .unwrap_or(ComputeCapabilities {
+                supports_stream_snapshot: false,
+                supports_exec_as_root: false,
+            });
+        if !caps.supports_exec_as_root {
+            return Err(CheckoutRepoError::Compute(ComputeError::Internal(
+                "compute runtime cannot exec as root; cannot validate workspace health after checkout"
+                    .into(),
+            )));
+        }
+
+        for probe in startup_probes {
+            let cmd = probe.trim();
+            if cmd.is_empty() {
+                continue;
+            }
+            let out = self
+                .compute
+                .exec(instance_id, cmd, Some("0:0"))
+                .await
+                .map_err(CheckoutRepoError::Compute)?;
+            if out.exit_code != 0 {
+                return Err(CheckoutRepoError::Compute(ComputeError::Internal(format!(
+                    "database startup probe failed (exit {}): {}\nstdout: {}\nstderr: {}",
+                    out.exit_code,
+                    cmd,
+                    out.stdout.trim(),
+                    out.stderr.trim()
+                ))));
+            }
+        }
+        Ok(())
+    }
+
+    /// Best-effort: ensure the DB process user can read/write its data dir.
+    ///
+    /// This is critical when snapshots were created via `stream_snapshot` because tar extraction
+    /// intentionally does not preserve container ownership/mode bits.
+    async fn repair_data_dir_permissions_in_container(
+        &self,
+        instance_id: &InstanceId,
+        container_data_path: &str,
+        chown_target: Option<&str>,
+    ) {
+        let Some(target) = chown_target.filter(|s| !s.trim().is_empty()) else {
+            return;
+        };
+        let escaped = container_data_path.replace('\'', "'\"'\"'");
+        let cmd = format!("chown -R {target} '{escaped}' && chmod -R 0700 '{escaped}'");
+        let caps = self.compute.capabilities().await.ok();
+        let can_root = caps.map(|c| c.supports_exec_as_root).unwrap_or(false);
+        if !can_root {
+            tracing::warn!(
+                instance = %instance_id,
+                data_dir = container_data_path,
+                "compute runtime cannot exec as root; cannot repair workspace permissions inside container"
+            );
+            return;
+        }
+
+        if let Err(e) = self.compute.exec(instance_id, &cmd, Some("0:0")).await {
+            tracing::warn!(
+                error = %e,
+                instance = %instance_id,
+                data_dir = container_data_path,
+                "failed to repair workspace permissions inside container; continuing"
+            );
+        }
     }
 }
 

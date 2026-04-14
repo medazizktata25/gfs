@@ -220,6 +220,18 @@ impl DatabaseProvider for MysqlProvider {
         Ok(vec![])
     }
 
+    fn data_dir_owner(&self) -> Option<&'static str> {
+        // Official MySQL image runs `mysqld` as `mysql`.
+        Some("mysql:mysql")
+    }
+
+    fn container_startup_probes(&self) -> &'static [&'static str] {
+        &[
+            "mysqladmin ping -h 127.0.0.1 -u root -p\"$MYSQL_ROOT_PASSWORD\" --silent",
+            "mysql -h 127.0.0.1 -u root -p\"$MYSQL_ROOT_PASSWORD\" -e \"SELECT 1;\" >/dev/null",
+        ]
+    }
+
     // -----------------------------------------------------------------------
     // Import / Export
     // -----------------------------------------------------------------------
