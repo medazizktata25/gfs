@@ -43,7 +43,7 @@ use crate::error::classify_diskutil_stderr;
 async fn make_tree_read_only(path: &Path) -> Result<()> {
     let chmod_out = Command::new("chmod")
         .arg("-R")
-        .arg("a-w")
+        .arg("u+rX,u-w,go-rwx")
         .arg(path)
         .output()
         .await
@@ -51,7 +51,7 @@ async fn make_tree_read_only(path: &Path) -> Result<()> {
     if !chmod_out.status.success() {
         let stderr = String::from_utf8_lossy(&chmod_out.stderr);
         return Err(StorageError::Internal(format!(
-            "chmod -R a-w '{}' failed: {}",
+            "chmod -R u+rX,u-w,go-rwx '{}' failed: {}",
             path.display(),
             stderr.trim()
         )));

@@ -64,16 +64,17 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
             return Ok(());
         }
 
-        if is_permission_error_output(&output)
-            && run_podman_unshare(&format!(
+        if is_permission_error_output(&output) {
+            if let Ok(unshare) = run_podman_unshare(&format!(
                 "cp --reflink=auto -a {}/. {}",
                 shell_quote(&src.to_string_lossy()),
                 shell_quote(&dst.to_string_lossy())
-            ))?
-            .status
-            .success()
-        {
-            return Ok(());
+            )) {
+                if unshare.status.success() {
+                    return Ok(());
+                }
+            }
+            // podman unavailable or also failed — report the original cp error
         }
 
         Err(command_error("cp --reflink=auto -a failed", &output))

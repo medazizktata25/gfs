@@ -4,8 +4,8 @@
 //!
 //! | Platform | `snapshot` / `clone` | Read-only lock | `status` / `quota` |
 //! |---|---|---|---|
-//! | macOS | `cp -cRp` (APFS clonefile COW) | `chmod -R a-w` | `diskutil info` / `df -k` |
-//! | Linux | `cp --reflink=auto -a` (Btrfs/XFS COW or deep copy) | `chmod -R a-w` | `df --block-size=1` |
+//! | macOS | `cp -cRp` (APFS clonefile COW) | `chmod -R u+rX,u-w,go-rwx` | `diskutil info` / `df -k` |
+//! | Linux | `cp --reflink=auto -a` (Btrfs/XFS COW or deep copy) | `chmod -R u+rX,u-w,go-rwx` | `df --block-size=1` |
 //! | Windows | `robocopy /E /COPY:DAT` | `attrib +R /S /D` | PowerShell `Get-PSDrive` |
 //!
 //! # mount / unmount
@@ -110,7 +110,7 @@ impl FileStorage {
 async fn make_read_only(path: &Path) -> Result<()> {
     let out = Command::new("chmod")
         .arg("-R")
-        .arg("a-w")
+        .arg("u+rX,u-w,go-rwx")
         .arg(path)
         .output()
         .await
@@ -118,7 +118,7 @@ async fn make_read_only(path: &Path) -> Result<()> {
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(StorageError::Internal(format!(
-            "chmod -R a-w '{}' failed: {}",
+            "chmod -R u+rX,u-w,go-rwx '{}' failed: {}",
             path.display(),
             stderr.trim()
         )));

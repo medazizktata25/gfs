@@ -749,7 +749,7 @@ impl StoragePort for BtrfsStorage {
         #[cfg(target_os = "linux")]
         {
             let output = Command::new("chmod")
-                .args(["-R", "a-w"])
+                .args(["-R", "u+rX,u-w,go-rwx"])
                 .arg(dest)
                 .output()
                 .await
@@ -757,7 +757,7 @@ impl StoragePort for BtrfsStorage {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(StorageError::Internal(format!(
-                    "chmod -R a-w '{}' failed: {}",
+                    "chmod -R u+rX,u-w,go-rwx '{}' failed: {}",
                     dest.display(),
                     stderr.trim()
                 )));
