@@ -21,10 +21,7 @@ pub async fn run(
 ) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
-    let compute = Arc::new(
-        DockerCompute::new()
-            .map_err(|e| anyhow::anyhow!("{}", DockerCompute::format_connection_error(&e)))?,
-    );
+    let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
 
     let _ = id; // container name override reserved for future use.
 

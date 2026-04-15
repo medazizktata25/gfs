@@ -24,10 +24,7 @@ pub async fn run_extract(
 ) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
-    let compute = Arc::new(
-        DockerCompute::new()
-            .map_err(|e| anyhow::anyhow!("{}", DockerCompute::format_connection_error(&e)))?,
-    );
+    let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
 
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     gfs_compute_docker::containers::register_all(registry.as_ref())

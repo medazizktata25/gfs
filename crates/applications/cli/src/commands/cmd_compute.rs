@@ -59,8 +59,7 @@ pub async fn run(path: Option<PathBuf>, action: ComputeAction, json_output: bool
     if let ComputeAction::Config { ref key, ref value } = action {
         return handle_config(path, key, value, json_output);
     }
-    let compute = DockerCompute::new()
-        .map_err(|e| anyhow::anyhow!("{}", DockerCompute::format_connection_error(&e)))?;
+    let compute = DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?;
     let id = resolve_id(path.clone(), &action)?;
     dispatch(&compute, &id, action, path, json_output).await
 }

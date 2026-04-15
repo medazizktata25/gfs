@@ -45,10 +45,7 @@ pub async fn run(
     let container_name = &runtime.container_name;
 
     // Set up compute and registry
-    let compute = Arc::new(
-        DockerCompute::new()
-            .map_err(|e| anyhow::anyhow!("{}", DockerCompute::format_connection_error(&e)))?,
-    );
+    let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
 
     let registry_impl = InMemoryDatabaseProviderRegistry::new();
     gfs_compute_docker::containers::register_all(&registry_impl)

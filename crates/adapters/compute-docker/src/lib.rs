@@ -1046,7 +1046,7 @@ impl DockerCompute {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_path_for_docker_bind, resolve_host_bind_path, DockerCompute};
+    use super::{DockerCompute, host_path_for_docker_bind, resolve_host_bind_path};
     use std::path::Path;
 
     #[test]
