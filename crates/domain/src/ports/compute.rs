@@ -278,8 +278,15 @@ pub trait Compute: Send + Sync {
     ///
     /// If `user` is `Some`, the runtime attempts to execute as that user (e.g. `"0:0"`).
     /// Implementations may return an error if user switching is not supported.
-    async fn exec(&self, _id: &InstanceId, _command: &str, _user: Option<&str>) -> Result<ExecOutput> {
-        Err(ComputeError::Internal("exec not supported by this compute runtime".into()))
+    async fn exec(
+        &self,
+        _id: &InstanceId,
+        _command: &str,
+        _user: Option<&str>,
+    ) -> Result<ExecOutput> {
+        Err(ComputeError::Internal(
+            "exec not supported by this compute runtime".into(),
+        ))
     }
 
     /// Describe the connected container runtime (for example Docker or Podman).

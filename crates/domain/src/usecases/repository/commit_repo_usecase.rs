@@ -337,14 +337,14 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                         .to_string_lossy()
                         .into_owned();
 
-                    if snapshot_dest.exists() {
-                        if let Err(rm_err) = tokio::fs::remove_dir_all(&snapshot_dest).await {
-                            tracing::warn!(
-                                error = %rm_err,
-                                path = %snapshot_dest.display(),
-                                "failed to remove partial snapshot before stream_snapshot fallback"
-                            );
-                        }
+                    if snapshot_dest.exists()
+                        && let Err(rm_err) = tokio::fs::remove_dir_all(&snapshot_dest).await
+                    {
+                        tracing::warn!(
+                            error = %rm_err,
+                            path = %snapshot_dest.display(),
+                            "failed to remove partial snapshot before stream_snapshot fallback"
+                        );
                     }
 
                     let timeout_secs: u64 = match std::env::var("GFS_STREAM_SNAPSHOT_TIMEOUT_SECS")
@@ -404,14 +404,14 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         // Defuse the RAII guard first so Drop doesn't fire a redundant unpause.
         if let Some(mut guard) = unpause_guard.take() {
             guard.defuse();
-            if let Some(instance_id) = paused_instance_id.as_ref() {
-                if let Err(unpause_err) = self.compute.unpause(instance_id).await {
-                    tracing::warn!(
-                        error = %unpause_err,
-                        instance = %instance_id,
-                        "failed to unpause instance after snapshot attempt"
-                    );
-                }
+            if let Some(instance_id) = paused_instance_id.as_ref()
+                && let Err(unpause_err) = self.compute.unpause(instance_id).await
+            {
+                tracing::warn!(
+                    error = %unpause_err,
+                    instance = %instance_id,
+                    "failed to unpause instance after snapshot attempt"
+                );
             }
         }
 
