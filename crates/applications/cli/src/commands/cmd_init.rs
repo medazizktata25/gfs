@@ -29,9 +29,9 @@ pub async fn init(
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
     let compute: Option<Arc<dyn Compute>> = if database_provider.is_some() {
-        Some(Arc::new(DockerCompute::new().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-        })?))
+        Some(Arc::new(
+            DockerCompute::new().map_err(|e| std::io::Error::other(e.to_string()))?,
+        ))
     } else {
         None
     };
