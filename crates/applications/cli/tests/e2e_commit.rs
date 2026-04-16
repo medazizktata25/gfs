@@ -349,7 +349,7 @@ fn commit_with_missing_mount_point_source_fails_gracefully() {
 }
 
 #[test]
-fn commit_with_real_database_snapshots_workspace() {
+fn commit_with_real_postgres_database_snapshots_workspace() {
     let tmp = tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
