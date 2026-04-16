@@ -398,6 +398,7 @@ async fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
         .args(["--reflink=auto", "-a"])
         .arg(&source)
         .arg(dst)
+        .env("LANG", "C")
         .output()
         .await
         .map_err(StorageError::Io)?;
@@ -751,6 +752,7 @@ impl StoragePort for BtrfsStorage {
             let output = Command::new("chmod")
                 .args(["-R", "u+rX,u-w,go-rwx"])
                 .arg(dest)
+                .env("LANG", "C")
                 .output()
                 .await
                 .map_err(StorageError::Io)?;

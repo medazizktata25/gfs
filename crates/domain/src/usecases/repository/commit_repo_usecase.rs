@@ -1,5 +1,6 @@
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,6 +8,7 @@ use thiserror::Error;
 
 use crate::model::commit::NewCommit;
 use crate::model::config::GlobalSettings;
+use crate::model::layout::GFS_DIR;
 use crate::ports::compute::{Compute, ComputeError, InstanceId, InstanceState};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
 use crate::ports::repository::{Repository, RepositoryError};
@@ -95,6 +97,87 @@ impl Drop for UnpauseGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-repo commit lock
+// ---------------------------------------------------------------------------
+
+/// Exclusive advisory lock on `<repo>/.gfs/commit.lock`, held for the duration
+/// of a single `CommitRepoUseCase::run` invocation.
+///
+/// Prevents two concurrent `gfs commit` processes on the same repository from
+/// racing pause/unpause, writing overlapping snapshot directories, or
+/// advancing the branch ref with the same parent — any of which can produce
+/// orphan snapshots or lost commits.
+///
+/// Uses `std::fs::File::try_lock` (stable since Rust 1.89) for a non-blocking
+/// POSIX `flock`. Lock is released on Drop via explicit `unlock`; if the
+/// process is killed, the kernel releases the flock on FD close so a crashed
+/// commit never wedges future commits.
+struct CommitLock {
+    file: File,
+}
+
+impl CommitLock {
+    fn acquire(repo_path: &Path) -> std::result::Result<Self, CommitRepoError> {
+        let gfs_dir = repo_path.join(GFS_DIR);
+        std::fs::create_dir_all(&gfs_dir)
+            .map_err(|e| CommitRepoError::Repository(RepositoryError::Io(e)))?;
+        let lock_path = gfs_dir.join("commit.lock");
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| CommitRepoError::Repository(RepositoryError::Io(e)))?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(TryLockError::WouldBlock) => Err(CommitRepoError::Repository(
+                RepositoryError::Internal(format!(
+                    "another `gfs commit` is already running on this repository \
+                     (lock held at {}); retry once it finishes",
+                    lock_path.display()
+                )),
+            )),
+            Err(TryLockError::Error(e)) => Err(CommitRepoError::Repository(RepositoryError::Io(e))),
+        }
+    }
+}
+
+impl Drop for CommitLock {
+    fn drop(&mut self) {
+        // Best-effort: kernel will release on FD close regardless.
+        let _ = self.file.unlock();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unfrozen-snapshot opt-in
+// ---------------------------------------------------------------------------
+
+/// True when the user has explicitly opted in to proceeding with a commit when
+/// the container cannot be frozen (rootless Podman on cgroup v1, LXC without
+/// freezer, etc.). Default is refusal, because a file-level snapshot of an
+/// unfrozen database is not crash-consistent — pages and WAL can be captured
+/// mid-write.
+fn unfrozen_snapshot_allowed() -> bool {
+    parse_unfrozen_snapshot_flag(std::env::var("GFS_ALLOW_UNFROZEN_SNAPSHOT").ok().as_deref())
+}
+
+/// Pure parser split out from the env read so tests can exercise every accepted
+/// form without mutating process-global state (which is unsafe under Rust 2024
+/// and races with other parallel tests).
+fn parse_unfrozen_snapshot_flag(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod permission_denied_tests {
     use super::storage_error_looks_like_permission_denied;
@@ -120,6 +203,70 @@ mod permission_denied_tests {
         assert!(storage_error_looks_like_permission_denied(
             &StorageError::PermissionDenied("x".into())
         ));
+    }
+}
+
+#[cfg(test)]
+mod unfrozen_snapshot_flag_tests {
+    use super::parse_unfrozen_snapshot_flag;
+
+    #[test]
+    fn absent_defaults_to_refusal() {
+        assert!(!parse_unfrozen_snapshot_flag(None));
+    }
+
+    #[test]
+    fn empty_or_zero_does_not_opt_in() {
+        assert!(!parse_unfrozen_snapshot_flag(Some("")));
+        assert!(!parse_unfrozen_snapshot_flag(Some("0")));
+        assert!(!parse_unfrozen_snapshot_flag(Some("false")));
+        assert!(!parse_unfrozen_snapshot_flag(Some("no")));
+        assert!(!parse_unfrozen_snapshot_flag(Some("off")));
+    }
+
+    #[test]
+    fn explicit_truthy_values_opt_in() {
+        for v in [
+            "1", "true", "TRUE", "True", "yes", "YES", "on", "ON", " 1 ", "  true  ",
+        ] {
+            assert!(
+                parse_unfrozen_snapshot_flag(Some(v)),
+                "expected {v:?} to opt in"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod commit_lock_tests {
+    use super::{CommitLock, CommitRepoError};
+    use crate::ports::repository::RepositoryError;
+
+    #[test]
+    fn second_acquire_reports_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let _first = CommitLock::acquire(dir.path()).expect("first acquire should succeed");
+
+        let second = CommitLock::acquire(dir.path());
+        match second {
+            Err(CommitRepoError::Repository(RepositoryError::Internal(msg))) => {
+                assert!(
+                    msg.contains("another `gfs commit` is already running"),
+                    "unexpected message: {msg}"
+                );
+            }
+            Err(e) => panic!("expected Internal contention error, got {e:?}"),
+            Ok(_) => panic!("expected contention error, but second acquire succeeded"),
+        }
+    }
+
+    #[test]
+    fn acquire_succeeds_after_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _first = CommitLock::acquire(dir.path()).unwrap();
+        }
+        let _second = CommitLock::acquire(dir.path()).expect("lock should be released after drop");
     }
 }
 
@@ -181,6 +328,10 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         // Use canonical path so snapshot dir matches where checkout will read (same physical path).
         let path = std::fs::canonicalize(&path)
             .map_err(|e| CommitRepoError::Repository(RepositoryError::Io(e)))?;
+
+        // Serialize commits per repository. Held until this function returns,
+        // covering pause, snapshot, finalize, and ref advance.
+        let _commit_lock = CommitLock::acquire(&path)?;
 
         // 1. Resolve commit context from the repository.
         let parent_commit_id = self.repository.get_current_commit_id(&path).await?;
@@ -278,11 +429,30 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                         paused_instance_id = Some(instance_id);
                     }
                     Err(ComputeError::PauseUnsupported(ref e)) => {
+                        if !unfrozen_snapshot_allowed() {
+                            return Err(CommitRepoError::Compute(ComputeError::PauseUnsupported(
+                                format!(
+                                    "{e}. Refusing to snapshot an unfrozen database: \
+                                     a file-level copy of a live data directory can \
+                                     capture torn pages and half-applied WAL records, \
+                                     producing a non-crash-consistent snapshot. \
+                                     Options: (1) switch to a runtime that supports \
+                                     cgroup freezing (Docker, or rootful Podman on \
+                                     cgroup v2); (2) upgrade the host to cgroup v2 \
+                                     and use a runtime that honors it; or (3) set \
+                                     GFS_ALLOW_UNFROZEN_SNAPSHOT=1 to proceed with \
+                                     a best-effort snapshot that may require manual \
+                                     WAL replay on restore"
+                                ),
+                            )));
+                        }
                         tracing::warn!(
                             error = %e,
                             instance = %instance_id,
-                            "container pause not available (cgroup v1 or rootless runtime); \
-                             snapshot will be crash-consistent — CHECKPOINT already applied"
+                            "container pause unavailable (cgroup v1 or rootless runtime); \
+                             proceeding with UNFROZEN snapshot per GFS_ALLOW_UNFROZEN_SNAPSHOT — \
+                             snapshot is NOT crash-consistent and may contain torn pages and \
+                             half-applied WAL; restore may require manual recovery"
                         );
                         // No unpause guard: nothing was paused.
                     }
@@ -382,18 +552,27 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     );
 
                     // Bound the time we keep the DB paused + snapshot in flight.
-                    // On timeout, we still unpause via the outer RAII guard.
-                    tokio::time::timeout(
+                    // On timeout or stream error, clean up the partial snapshot dir
+                    // immediately so subsequent commits don't trip over it.
+                    // Unpause always happens via the outer RAII guard regardless.
+                    match tokio::time::timeout(
                         Duration::from_secs(timeout_secs),
                         self.compute.stream_snapshot(&instance_id, &container_data_path, &snapshot_dest),
                     )
                     .await
-                    .map_err(|_| {
-                        CommitRepoError::Compute(ComputeError::Internal(
-                            format!("stream_snapshot timed out after {timeout_secs}s"),
-                        ))
-                    })?
-                    .map_err(CommitRepoError::Compute)?;
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            let _ = tokio::fs::remove_dir_all(&snapshot_dest).await;
+                            return Err(CommitRepoError::Compute(e));
+                        }
+                        Err(_elapsed) => {
+                            let _ = tokio::fs::remove_dir_all(&snapshot_dest).await;
+                            return Err(CommitRepoError::Compute(ComputeError::Internal(
+                                format!("stream_snapshot timed out after {timeout_secs}s"),
+                            )));
+                        }
+                    }
 
                     self.storage
                         .finalize_snapshot(&snapshot_dest)
@@ -403,11 +582,18 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     // The current workspace still has permission-broken files (that's why we
                     // fell back to stream_snapshot). Mark it so the next container start will
                     // run a pre-start ownership repair before booting.
-                    let marker_path = volume_id.0.as_str();
-                    if let Some(parent) =
-                        std::path::Path::new(marker_path).parent()
-                    {
-                        let _ = std::fs::write(parent.join(".needs-repair"), b"");
+                    // Use the canonical workspace path (.gfs/WORKSPACE) rather than volume_id,
+                    // because volume_id may point to a custom mount_point that differs from the
+                    // path where checkout will look for the marker.
+                    let canonical_ws = self.repository.get_active_workspace_data_dir(&path).await;
+                    if let Ok(ws) = canonical_ws {
+                        if let Some(m) = repo_layout::repair_marker_path(&ws) {
+                            let _ = std::fs::write(&m, b"");
+                        }
+                    } else if let Some(m) = repo_layout::repair_marker_path(
+                        std::path::Path::new(volume_id.0.as_str()),
+                    ) {
+                        let _ = std::fs::write(&m, b"");
                     }
 
                     Ok(())
@@ -834,9 +1020,17 @@ mod tests {
                 // Mirror the real `classify()` in compute-docker: cgroup/freeze phrases
                 // map to PauseUnsupported; everything else is a genuine Internal error.
                 let lower = msg.to_ascii_lowercase();
-                let is_pause_unsupported = ["cgroup", "freezing", "freeze", "pause is not",
-                    "cannot pause", "not supported", "rootless"]
-                    .iter().any(|p| lower.contains(p));
+                let is_pause_unsupported = [
+                    "cgroup",
+                    "freezing",
+                    "freeze",
+                    "pause is not",
+                    "cannot pause",
+                    "not supported",
+                    "rootless",
+                ]
+                .iter()
+                .any(|p| lower.contains(p));
                 return Err(if is_pause_unsupported {
                     ComputeError::PauseUnsupported(msg.clone())
                 } else {
@@ -1643,11 +1837,12 @@ mod tests {
     }
 
     /// Rootless Podman on cgroup v1 returns a `PauseUnsupported` error from `pause()`.
-    /// The commit must succeed (not return an error) by proceeding with a
-    /// crash-consistent snapshot, and must NOT call `unpause()` because the
-    /// container was never actually paused.
+    /// By default (no `GFS_ALLOW_UNFROZEN_SNAPSHOT`), the commit must *refuse* with
+    /// a message that surfaces all three workarounds — switching runtime, upgrading
+    /// to cgroup v2, or opting in. No pause/unpause must be issued since the runtime
+    /// rejected the pause request.
     #[tokio::test]
-    async fn commit_succeeds_when_pause_unsupported_cgroup_v1() {
+    async fn commit_refuses_when_pause_unsupported_without_opt_in() {
         let compute = Arc::new(MockCompute {
             state: InstanceState::Running,
             pause_fails_with: Some(
@@ -1687,7 +1882,19 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_ok(), "commit should succeed despite pause failure: {result:?}");
+        match result {
+            Err(CommitRepoError::Compute(ComputeError::PauseUnsupported(msg))) => {
+                assert!(
+                    msg.contains("GFS_ALLOW_UNFROZEN_SNAPSHOT=1"),
+                    "refusal must mention the opt-in env var; got: {msg}"
+                );
+                assert!(
+                    msg.contains("cgroup v2"),
+                    "refusal must mention the cgroup v2 upgrade path; got: {msg}"
+                );
+            }
+            other => panic!("expected PauseUnsupported refusal, got {other:?}"),
+        }
         assert!(
             !*compute.paused.lock().unwrap(),
             "paused flag should be false — pause was rejected by runtime"

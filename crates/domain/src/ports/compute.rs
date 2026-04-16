@@ -29,8 +29,13 @@ pub enum ComputeError {
     NotPaused(String),
 
     /// The runtime does not support cgroup freezing (e.g. rootless Podman on
-    /// cgroup v1).  The snapshot will be crash-consistent rather than
-    /// freeze-consistent, which is safe for PostgreSQL after a CHECKPOINT.
+    /// cgroup v1).  Callers that cannot tolerate torn reads must refuse the
+    /// operation: a file-level snapshot of an unfrozen database can capture
+    /// partially-written pages and half-applied WAL records, and is NOT
+    /// crash-consistent.  `CHECKPOINT` alone does not make such a snapshot
+    /// safe — it only flushes up to a point in time; subsequent writes between
+    /// the CHECKPOINT and the snapshot read are not ordered with respect to the
+    /// per-file tar export.
     #[error("pause not supported by runtime: {0}")]
     PauseUnsupported(String),
 

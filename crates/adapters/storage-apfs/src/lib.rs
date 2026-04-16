@@ -45,6 +45,7 @@ async fn make_tree_read_only(path: &Path) -> Result<()> {
         .arg("-R")
         .arg("u+rX,u-w,go-rwx")
         .arg(path)
+        .env("LANG", "C")
         .output()
         .await
         .map_err(StorageError::Io)?;
@@ -158,6 +159,7 @@ impl StoragePort for ApfsStorage {
 
         let output = Command::new("cp")
             .args(["-cRp", &id.0, dest.to_string_lossy().as_ref()])
+            .env("LANG", "C")
             .output()
             .await
             .map_err(StorageError::Io)?;
@@ -215,6 +217,7 @@ impl StoragePort for ApfsStorage {
 
         let output = Command::new("cp")
             .args(["-cRp", src, &target_id.0])
+            .env("LANG", "C")
             .output()
             .await
             .map_err(StorageError::Io)?;

@@ -1044,15 +1044,16 @@ impl Compute for DockerCompute {
                         .into_owned();
 
                     if !tar_link_target_is_safe(&raw_target) {
-                        return Err(io::Error::new(
-                            ErrorKind::InvalidData,
-                            format!(
-                                "stream_snapshot: symlink '{}' has external target '{}'; \
-                                 cannot capture data outside container data dir",
-                                stripped.display(),
-                                raw_target.display()
-                            ),
-                        ));
+                        // Absolute or parent-escaping targets are legitimate in some DB setups
+                        // (e.g. PostgreSQL external tablespaces: pg_tblspc/<oid> → /mnt/...).
+                        // Capture the symlink as-is so the directory structure is preserved,
+                        // but warn that the target itself is not included in this snapshot.
+                        tracing::warn!(
+                            symlink = %stripped.display(),
+                            target = %raw_target.display(),
+                            "stream_snapshot: symlink points outside container data dir; \
+                             capturing dangling link (target is not snapshotted)"
+                        );
                     }
                     if let Some(parent) = dest_path.parent() {
                         std::fs::create_dir_all(parent)?;
@@ -1096,23 +1097,62 @@ impl Compute for DockerCompute {
                     }
                     let src = dest.join(&link_stripped);
                     if !src.exists() {
-                        tracing::warn!(
-                            path = %stripped.display(),
-                            source = %link_stripped.display(),
-                            "stream_snapshot: hard link source not yet extracted; skipping"
-                        );
-                        continue;
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "stream_snapshot: hard link '{}' references '{}' which has \
+                                 not yet been extracted — tar stream is out of order or the \
+                                 archive is incomplete. This can happen with certain Docker \
+                                 versions that emit links before their source; retrying the \
+                                 commit or upgrading Docker typically resolves it",
+                                stripped.display(),
+                                link_stripped.display()
+                            ),
+                        ));
                     }
                     if let Some(parent) = dest_path.parent() {
                         std::fs::create_dir_all(parent)?;
                         chmod_best_effort(parent, 0o755);
                     }
-                    std::fs::copy(&src, &dest_path)?;
+                    match std::fs::hard_link(&src, &dest_path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() != ErrorKind::PermissionDenied => {
+                            // Cross-device link (EXDEV), unsupported filesystem, etc.:
+                            // fall back to a regular copy so the snapshot still succeeds.
+                            tracing::debug!(
+                                source = %src.display(),
+                                dest = %dest_path.display(),
+                                error = %e,
+                                "stream_snapshot: hard_link failed; falling back to copy"
+                            );
+                            std::fs::copy(&src, &dest_path)?;
+                        }
+                        Err(e) => return Err(e),
+                    }
                     files += 1;
                     continue;
                 }
 
-                if entry.header().entry_type().is_dir() {
+                // Positive allow-list: at this point we've already handled symlinks and
+                // hard links. Anything remaining must be a directory or a regular file
+                // (`is_file()` covers both `Regular` and `Continuous`). Block, char, fifo,
+                // and any future exotic type would otherwise fall through to
+                // `entry.unpack()` and could create device nodes on the host — a container
+                // compromise vector. Reject them explicitly.
+                if !ty.is_dir() && !ty.is_file() {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "stream_snapshot: refusing to extract unexpected tar entry \
+                             type {:?} for '{}'; database workspaces must contain only \
+                             regular files, directories, symlinks, and hard links",
+                            ty,
+                            stripped.display()
+                        ),
+                    ));
+                }
+
+                if ty.is_dir() {
                     std::fs::create_dir_all(&dest_path)?;
                     chmod_best_effort(&dest_path, 0o755);
                 } else {

@@ -66,6 +66,26 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
             return Ok(());
         }
 
+        // On rootless Podman the host user may lack read access to files that are
+        // owned by the container UID namespace.  `podman unshare` enters that
+        // namespace and retries the copy from there.  This path is used during
+        // checkout/restore; commit uses `stream_snapshot` instead.
+        // Guard with is_likely_podman_runtime() to avoid entering Podman's UID
+        // namespace on Docker hosts where a podman binary may still be installed
+        // (which would produce copies with unexpected ownership).
+        if is_permission_error_output(&output)
+            && is_likely_podman_runtime()
+            && run_podman_unshare(&format!(
+                "LANG=C cp --reflink=auto -a {}/. {}",
+                shell_quote(&src.to_string_lossy()),
+                shell_quote(&dst.to_string_lossy())
+            ))
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
         Err(command_error("cp --reflink=auto -a failed", &output))
     }
 
@@ -116,6 +136,46 @@ fn run_podman_unshare(script: &str) -> std::io::Result<std::process::Output> {
 fn is_permission_error_output(output: &std::process::Output) -> bool {
     let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
     stderr.contains("permission denied") || stderr.contains("operation not permitted")
+}
+
+/// Read the real UID of the current process from `/proc/self/status`.
+/// Used by `is_likely_podman_runtime` to locate the rootless Podman socket path.
+#[cfg(target_os = "linux")]
+fn get_current_uid() -> Option<u32> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+        })
+}
+
+/// Returns `true` when the host is running rootless Podman as the container runtime.
+///
+/// Checks, in order:
+/// 1. `DOCKER_HOST` env var — if it contains "podman" it is set to a Podman socket.
+/// 2. `/run/user/<uid>/podman/podman.sock` — rootless Podman per-user socket.
+/// 3. `/run/podman/podman.sock` — system-wide (rootful) Podman socket.
+///
+/// This avoids invoking `podman unshare` on Docker hosts where a `podman` binary
+/// may happen to be installed, which would copy files with wrong UID namespace
+/// ownership.
+#[cfg(target_os = "linux")]
+fn is_likely_podman_runtime() -> bool {
+    if let Ok(host) = std::env::var("DOCKER_HOST")
+        && host.contains("podman")
+    {
+        return true;
+    }
+    if let Some(uid) = get_current_uid() {
+        let sock = std::path::PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"));
+        if sock.exists() {
+            return true;
+        }
+    }
+    std::path::Path::new("/run/podman/podman.sock").exists()
 }
 
 #[cfg(target_os = "linux")]
@@ -560,8 +620,8 @@ impl Repository for GfsRepository {
                 let _ = fs::remove_file(workspace_path.join("postmaster.pid"));
                 let _ = fs::remove_file(workspace_path.join("postmaster.opts"));
                 // Signal that a pre-start ownership repair is required for this workspace.
-                if let Some(parent) = workspace_path.parent() {
-                    let _ = fs::write(parent.join(".needs-repair"), b"");
+                if let Some(marker) = repo_layout::repair_marker_path(&workspace_path) {
+                    let _ = fs::write(marker, b"");
                 }
             } else {
                 tracing::warn!(

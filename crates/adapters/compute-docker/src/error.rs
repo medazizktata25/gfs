@@ -53,17 +53,22 @@ pub(crate) fn classify(container_id: &str, err: bollard::errors::Error) -> Compu
                 _ => {
                     // Rootless Podman / cgroup v1 hosts cannot freeze container
                     // processes.  The daemon surfaces this as a 500 with a message
-                    // containing one of these phrases.
-                    let pause_phrases = [
-                        "cgroup",
-                        "freezing",
-                        "freeze",
-                        "pause is not",
-                        "cannot pause",
-                        "not supported",
-                        "rootless",
-                    ];
-                    if pause_phrases.iter().any(|p| msg.contains(p)) {
+                    // that is semantically about *pausing* being unsupported.
+                    //
+                    // We require the message to be explicitly about pause/freeze
+                    // to avoid false-positives from unrelated 500 errors that
+                    // happen to mention "cgroup" or "not supported" in other contexts
+                    // (e.g. "cgroup memory limit exceeded", "network feature not supported").
+                    let is_about_pause =
+                        msg.contains("pause") || msg.contains("freeze") || msg.contains("freezing");
+                    let is_unsupported_reason = msg.contains("cgroup v1")
+                        || msg.contains("rootless")
+                        || msg.contains("pause is not")
+                        || msg.contains("cannot pause")
+                        || (msg.contains("cgroup")
+                            && (msg.contains("freeze") || msg.contains("pause")))
+                        || (msg.contains("not supported") && is_about_pause);
+                    if is_about_pause && is_unsupported_reason {
                         ComputeError::PauseUnsupported(message.clone())
                     } else {
                         ComputeError::Internal(message.clone())
@@ -134,6 +139,42 @@ mod tests {
     fn classify_500_internal() {
         let err = classify("c1", docker_err(500, "Server error"));
         assert!(matches!(err, ComputeError::Internal(s) if s == "Server error"));
+    }
+
+    #[test]
+    fn classify_500_cgroup_v1_freeze_is_pause_unsupported() {
+        let err = classify(
+            "c1",
+            docker_err(
+                500,
+                "OCI: cgroup v1 does not support freezing a single process",
+            ),
+        );
+        assert!(matches!(err, ComputeError::PauseUnsupported(_)));
+    }
+
+    #[test]
+    fn classify_500_pause_not_supported_rootless_is_pause_unsupported() {
+        let err = classify("c1", docker_err(500, "pause is not supported on rootless"));
+        assert!(matches!(err, ComputeError::PauseUnsupported(_)));
+    }
+
+    #[test]
+    fn classify_500_unrelated_cgroup_error_is_internal() {
+        let err = classify("c1", docker_err(500, "cgroup memory limit exceeded"));
+        assert!(
+            matches!(err, ComputeError::Internal(_)),
+            "unrelated cgroup error must not be classified as PauseUnsupported"
+        );
+    }
+
+    #[test]
+    fn classify_500_unrelated_not_supported_is_internal() {
+        let err = classify("c1", docker_err(500, "network feature not supported"));
+        assert!(
+            matches!(err, ComputeError::Internal(_)),
+            "unrelated 'not supported' message must not be classified as PauseUnsupported"
+        );
     }
 
     #[test]
