@@ -32,10 +32,9 @@ pub async fn run(
         .context("failed to register database providers")?;
 
     let use_case = ExportRepoUseCase::new(compute, registry);
-    let output = use_case
-        .run(&repo_path, output_dir, &format)
-        .await
-        .context("export failed")?;
+    // Do not use `.context("export failed")`: anyhow's context Display only prints that string
+    // and hides the underlying `ExportRepoError` / `ComputeError` message on stderr.
+    let output = use_case.run(&repo_path, output_dir, &format).await?;
 
     if json_output {
         println!(

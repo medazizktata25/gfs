@@ -49,7 +49,7 @@ async fn main() {
                     .unwrap_or_else(|_| "{\"error\":{\"message\":\"serialization failed\"}}".into())
                 );
             } else {
-                eprintln!("{} {err:#}", red("error:"));
+                eprintln!("{} {err}", red("error:"));
             }
             std::process::exit(1);
         }

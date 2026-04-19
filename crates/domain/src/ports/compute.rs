@@ -31,6 +31,13 @@ pub enum ComputeError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("cannot mount {path} to Docker container: {reason}\n\n{suggestion}")]
+    DockerMountFailed {
+        path: PathBuf,
+        reason: String,
+        suggestion: String,
+    },
+
     #[error("internal error: {0}")]
     Internal(String),
 
@@ -38,6 +45,23 @@ pub enum ComputeError {
         "GFS was not able to connect to {0}, check the following:\n  - {0} is running\n  - Current user has permission to connect to {0}\n  - {0} is configured to allow non-privileged user access"
     )]
     NotAvailable(String),
+}
+
+impl ComputeError {
+    pub fn docker_mount_failed(path: PathBuf, reason: String) -> Self {
+        let suggestion = format!(
+            "Solutions:\n\
+             1. Use workspace directory: --output-dir .gfs/exports\n\
+             2. Configure Docker file sharing for: {}\n\
+             3. Use relative paths within repository",
+            path.display()
+        );
+        Self::DockerMountFailed {
+            path,
+            reason,
+            suggestion,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ComputeError>;
@@ -390,5 +414,30 @@ mod tests {
             ComputeError::NotAvailable("Docker".into()).to_string(),
             "GFS was not able to connect to Docker, check the following:\n  - Docker is running\n  - Current user has permission to connect to Docker\n  - Docker is configured to allow non-privileged user access"
         );
+    }
+
+    #[test]
+    fn compute_error_docker_mount_failed() {
+        let path = PathBuf::from("/tmp/test");
+        let err = ComputeError::docker_mount_failed(path.clone(), "invalid mount config".into());
+        let err_str = err.to_string();
+        assert!(err_str.contains("cannot mount"));
+        assert!(err_str.contains("/tmp/test"));
+        assert!(err_str.contains("invalid mount config"));
+        assert!(err_str.contains("Solutions:"));
+        assert!(err_str.contains("--output-dir .gfs/exports"));
+
+        match err {
+            ComputeError::DockerMountFailed {
+                path: err_path,
+                reason,
+                suggestion,
+            } => {
+                assert_eq!(err_path, path);
+                assert_eq!(reason, "invalid mount config");
+                assert!(suggestion.contains("Solutions:"));
+            }
+            _ => panic!("Expected DockerMountFailed"),
+        }
     }
 }
