@@ -458,7 +458,7 @@ fn postgres_test_02_pgbench_commit_compute_status() {
     let (log_ok, log_stdout, log_stderr) = cli_runner::gfs_log(repo_path, Some(2));
     assert!(log_ok, "gfs log -n 2 should succeed; stderr: {log_stderr}");
     if !log_stdout.is_empty() {
-        let commit_count = log_stdout.matches("commit ").count();
+        let commit_count = log_stdout.matches('●').count();
         assert_eq!(
             commit_count, 2,
             "log should show 2 commits; got: {log_stdout}"
