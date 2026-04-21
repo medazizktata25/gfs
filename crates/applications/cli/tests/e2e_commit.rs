@@ -228,7 +228,8 @@ fn log_respects_max_count() {
     assert!(log_ok, "gfs log should succeed; stderr: {log_stderr}");
 
     if !log_stdout.is_empty() {
-        let commit_blocks = log_stdout.matches("commit ").count();
+        // The styled log format uses "● <hash>" per entry, not "commit <hash>".
+        let commit_blocks = log_stdout.matches('●').count();
         assert_eq!(
             commit_blocks, 1,
             "log -n 1 should show exactly one commit; got: {log_stdout}"
