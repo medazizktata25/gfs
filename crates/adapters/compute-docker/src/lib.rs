@@ -1586,6 +1586,21 @@ mod host_path_tests {
     }
 
     #[test]
+    fn format_connection_error_bollard_socket_not_found() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "Socket not found: /var/run/docker.sock".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("GFS was not able to connect to Docker/Podman"));
+        #[cfg(unix)]
+        {
+            assert!(formatted.contains("not running"));
+            assert!(formatted.contains("systemctl"));
+        }
+    }
+
+    #[test]
     fn format_connection_error_hyper_legacy_client() {
         let err = bollard::errors::Error::DockerResponseServerError {
             status_code: 500,
