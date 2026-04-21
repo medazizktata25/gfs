@@ -132,7 +132,9 @@ impl DockerCompute {
                 }
 
                 tracing::debug!("Docker connect error: {default_err}");
-                Err(ComputeError::NotAvailable("Docker".to_string()))
+                Err(ComputeError::NotAvailable(Self::format_connection_error(
+                    &default_err,
+                )))
             }
         }
     }
@@ -147,6 +149,7 @@ impl DockerCompute {
             || err_lower.contains("connection refused")
             || err_lower.contains("connection reset")
             || err_lower.contains("no such file")
+            || err_lower.contains("socket not found")
             || err_lower.contains("permission denied")
             || err_lower.contains("hyper legacy client");
 
@@ -157,8 +160,9 @@ impl DockerCompute {
         let is_permission_error =
             err_lower.contains("permission denied") || err_lower.contains("access denied");
 
-        let is_socket_missing =
-            err_lower.contains("no such file") || err_lower.contains("cannot connect");
+        let is_socket_missing = err_lower.contains("no such file")
+            || err_lower.contains("socket not found")
+            || err_lower.contains("cannot connect");
 
         #[cfg(unix)]
         let hints = if is_permission_error {
