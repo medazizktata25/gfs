@@ -22,7 +22,7 @@ fn is_connection_error(err: &bollard::errors::Error) -> bool {
 /// the message body to produce the most specific `ComputeError`.
 pub(crate) fn classify(container_id: &str, err: bollard::errors::Error) -> ComputeError {
     if is_connection_error(&err) {
-        return ComputeError::NotAvailable("Docker".to_string());
+        return ComputeError::NotAvailable(crate::DockerCompute::format_connection_error(&err));
     }
     classify_with_mount_path(container_id, err, None)
 }

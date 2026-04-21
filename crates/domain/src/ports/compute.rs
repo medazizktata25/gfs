@@ -52,9 +52,7 @@ pub enum ComputeError {
     #[error("internal error: {0}")]
     Internal(String),
 
-    #[error(
-        "GFS was not able to connect to {0}, check the following:\n  - {0} is running\n  - Current user has permission to connect to {0}\n  - {0} is configured to allow non-privileged user access"
-    )]
+    #[error("{0}")]
     NotAvailable(String),
 }
 
@@ -474,8 +472,8 @@ mod tests {
             "internal error: msg"
         );
         assert_eq!(
-            ComputeError::NotAvailable("Docker".into()).to_string(),
-            "GFS was not able to connect to Docker, check the following:\n  - Docker is running\n  - Current user has permission to connect to Docker\n  - Docker is configured to allow non-privileged user access"
+            ComputeError::NotAvailable("runtime unreachable".into()).to_string(),
+            "runtime unreachable"
         );
     }
 
