@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - fix: Windows snapshot/clone use `robocopy /E /COPY:DAT` instead of `/COPYALL` so commits do not require copying audit (SACL) information, which failed on Windows 11 ([issue #34](https://github.com/Guepard-Corp/gfs/issues/34))
+- fix: Correct opencode.json MCP configuration format to use command array with type: local for proper OpenCode integration
 
 ## [0.2.0] - 2026-03-23
 
