@@ -524,14 +524,17 @@ where
                 database_password,
                 database_name,
             } => {
+                let credentials = gfs_domain::usecases::repository::init_repo_usecase::DatabaseCredentials {
+                    user: database_user,
+                    password: database_password,
+                    name: database_name,
+                };
                 commands::cmd_init::init(
                     path,
                     database_provider,
                     database_version,
                     port,
-                    database_user,
-                    database_password,
-                    database_name,
+                    credentials,
                     json_output,
                 )
                 .await

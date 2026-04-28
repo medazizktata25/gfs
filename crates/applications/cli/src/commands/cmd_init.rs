@@ -7,7 +7,9 @@ use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::ports::compute::Compute;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::ports::repository::Repository;
-use gfs_domain::usecases::repository::init_repo_usecase::InitRepositoryUseCase;
+use gfs_domain::usecases::repository::init_repo_usecase::{
+    DatabaseCredentials, InitRepositoryUseCase,
+};
 use gfs_domain::usecases::repository::status_repo_usecase::StatusRepoUseCase;
 use serde_json::json;
 
@@ -19,9 +21,7 @@ pub async fn init(
     database_provider: Option<String>,
     database_version: Option<String>,
     database_port: Option<u16>,
-    database_user: Option<String>,
-    database_password: Option<String>,
-    database_name: Option<String>,
+    credentials: DatabaseCredentials,
     json_output: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::trace!("Initializing Guepard environment at: {:?}", path);
@@ -49,9 +49,7 @@ pub async fn init(
             database_provider,
             database_version,
             database_port,
-            database_user,
-            database_password,
-            database_name,
+            credentials,
         )
         .await?;
 

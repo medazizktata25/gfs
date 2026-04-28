@@ -18,7 +18,8 @@ use gfs_domain::repo_utils::repo_layout;
 use gfs_domain::usecases::repository::{
     checkout_repo_usecase::CheckoutRepoUseCase, commit_repo_usecase::CommitRepoUseCase,
     export_repo_usecase::ExportRepoUseCase, extract_schema_usecase::ExtractSchemaUseCase,
-    import_repo_usecase::ImportRepoUseCase, init_repo_usecase::InitRepositoryUseCase,
+    import_repo_usecase::ImportRepoUseCase,
+    init_repo_usecase::{DatabaseCredentials, InitRepositoryUseCase},
     log_repo_usecase::LogRepoUseCase, status_repo_usecase::StatusRepoUseCase,
 };
 #[cfg(unix)]
@@ -768,9 +769,7 @@ async fn do_init(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
             database_provider.clone(),
             database_version.clone(),
             None,
-            None,
-            None,
-            None,
+            DatabaseCredentials::default(),
         )
         .await
         .map_err(|e| to_error_data(e.to_string()))?;
