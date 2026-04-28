@@ -175,6 +175,18 @@ enum TopLevel {
         /// Host port to bind for the database container (e.g. 5432). Default: Docker auto-assigns.
         #[arg(long)]
         port: Option<u16>,
+
+        /// Database user (if provider is set)
+        #[arg(long)]
+        database_user: Option<String>,
+
+        /// Database password (if provider is set)
+        #[arg(long)]
+        database_password: Option<String>,
+
+        /// Database name (if provider is set)
+        #[arg(long)]
+        database_name: Option<String>,
     },
 
     /// Record a commit of the current repository state
@@ -508,12 +520,22 @@ where
                 database_provider,
                 database_version,
                 port,
+                database_user,
+                database_password,
+                database_name,
             } => {
+                let credentials =
+                    gfs_domain::usecases::repository::init_repo_usecase::DatabaseCredentials {
+                        user: database_user,
+                        password: database_password,
+                        name: database_name,
+                    };
                 commands::cmd_init::init(
                     path,
                     database_provider,
                     database_version,
                     port,
+                    credentials,
                     json_output,
                 )
                 .await

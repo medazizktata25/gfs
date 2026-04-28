@@ -31,6 +31,14 @@ pub enum InitRepoError {
     DatabaseVersionRequired,
 }
 
+/// Optional initial database credentials applied to the provisioned container's env.
+#[derive(Debug, Default, Clone)]
+pub struct DatabaseCredentials {
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub name: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Use case
 // ---------------------------------------------------------------------------
@@ -68,6 +76,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         database_provider: Option<String>,
         database_version: Option<String>,
         database_port: Option<u16>,
+        credentials: DatabaseCredentials,
     ) -> std::result::Result<(), InitRepoError> {
         self.repository.init(&path, mount_point).await?;
 
@@ -75,7 +84,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             let version = database_version
                 .filter(|v| !v.is_empty())
                 .ok_or(InitRepoError::DatabaseVersionRequired)?;
-            self.deploy_database(&path, provider, version, database_port)
+            self.deploy_database(&path, provider, version, database_port, credentials)
                 .await?;
         }
 
@@ -88,6 +97,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         provider_name: String,
         database_version: String,
         database_port: Option<u16>,
+        credentials: DatabaseCredentials,
     ) -> std::result::Result<(), InitRepoError> {
         let compute = self.compute.as_ref().ok_or_else(|| {
             InitRepoError::Compute(ComputeError::Internal(
@@ -123,6 +133,29 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             for mapping in &mut definition.ports {
                 if mapping.compute_port == provider.default_port() {
                     mapping.host_port = Some(port);
+                }
+            }
+        }
+
+        // Apply user-provided credentials if supported by the provider's env vars
+        if let Some(user) = credentials.user {
+            for env in &mut definition.env {
+                if env.name.contains("USER") {
+                    env.default = Some(user.clone());
+                }
+            }
+        }
+        if let Some(password) = credentials.password {
+            for env in &mut definition.env {
+                if env.name.contains("PASSWORD") {
+                    env.default = Some(password.clone());
+                }
+            }
+        }
+        if let Some(db) = credentials.name {
+            for env in &mut definition.env {
+                if env.name.contains("DB") || env.name.contains("DATABASE") {
+                    env.default = Some(db.clone());
                 }
             }
         }
@@ -564,7 +597,14 @@ mod tests {
             InitRepositoryUseCase::new(Arc::new(MockRepository), None, Arc::new(MockRegistry));
         let dir = tempfile::tempdir().unwrap();
         let result = usecase
-            .run(dir.path().to_path_buf(), None, None, None, None)
+            .run(
+                dir.path().to_path_buf(),
+                None,
+                None,
+                None,
+                None,
+                DatabaseCredentials::default(),
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -584,6 +624,7 @@ mod tests {
                 Some("postgres".into()),
                 Some("17".into()),
                 None,
+                DatabaseCredentials::default(),
             )
             .await;
         assert!(result.is_ok());
@@ -604,6 +645,7 @@ mod tests {
                 Some("postgres".into()),
                 None,
                 None,
+                DatabaseCredentials::default(),
             )
             .await;
         assert!(matches!(
@@ -627,6 +669,7 @@ mod tests {
                 Some("mysql".into()),
                 Some("8".into()),
                 None,
+                DatabaseCredentials::default(),
             )
             .await;
         assert!(matches!(
@@ -646,11 +689,22 @@ mod tests {
         let path = dir.path().to_path_buf();
 
         // First init succeeds
-        let first = usecase.run(path.clone(), None, None, None, None).await;
+        let first = usecase
+            .run(
+                path.clone(),
+                None,
+                None,
+                None,
+                None,
+                DatabaseCredentials::default(),
+            )
+            .await;
         assert!(first.is_ok(), "first init should succeed: {:?}", first);
 
         // Second init fails with AlreadyInitialized
-        let second = usecase.run(path, None, None, None, None).await;
+        let second = usecase
+            .run(path, None, None, None, None, DatabaseCredentials::default())
+            .await;
         assert!(
             matches!(
                 second,
