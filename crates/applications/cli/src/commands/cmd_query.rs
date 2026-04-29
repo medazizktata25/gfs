@@ -1,4 +1,4 @@
-//! `gfs query` — query the database using native client (psql, mysql, etc.).
+//! `gfs query` — query the database using native client (psql, mysql, sqlite3, etc.).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use gfs_domain::ports::compute::{Compute, InstanceId};
 use gfs_domain::ports::database_provider::{
     ConnectionParams, DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
 };
+use gfs_domain::repo_utils::repo_layout;
 
 use crate::cli_utils::get_repo_dir;
 
@@ -19,7 +20,7 @@ use crate::cli_utils::get_repo_dir;
 /// Otherwise, executes the query and prints the results.
 ///
 /// The `database` parameter allows overriding the default database name
-/// from the container configuration.
+/// from the container configuration (ignored for file-based providers like SQLite).
 pub async fn run(
     path: Option<PathBuf>,
     database: Option<String>,
@@ -27,7 +28,7 @@ pub async fn run(
 ) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
-    // Load config to get provider name and container name
+    // Load config to get provider name
     let config =
         GfsConfig::load(&repo_path).context("not a GFS repository (run gfs init first)")?;
 
@@ -36,58 +37,68 @@ pub async fn run(
         .as_ref()
         .context("no database configured (run gfs init with --database-provider)")?;
 
-    let runtime = config
-        .runtime
-        .as_ref()
-        .context("no runtime configured (run gfs init with --database-provider)")?;
-
     let provider_name = &environment.database_provider;
-    let container_name = &runtime.container_name;
 
-    // Set up compute and registry
-    let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
-
+    // Set up registry and resolve provider
     let registry_impl = InMemoryDatabaseProviderRegistry::new();
     gfs_compute_docker::containers::register_all(&registry_impl)
         .context("failed to register database providers")?;
     let registry: Arc<dyn DatabaseProviderRegistry> = Arc::new(registry_impl);
 
-    // Get the provider
     let provider = registry
         .get(provider_name)
         .with_context(|| format!("unknown database provider: '{}'", provider_name))?;
 
-    // Get connection info from the running container
-    let instance_id = InstanceId(container_name.clone());
-    let default_port = provider.default_port();
+    let params = if provider.requires_compute() {
+        // Container-based path (PostgreSQL, MySQL, ClickHouse, …)
+        let runtime = config
+            .runtime
+            .as_ref()
+            .context("no runtime configured (run gfs init with --database-provider)")?;
+        let container_name = &runtime.container_name;
 
-    let conn_info = compute
-        .get_connection_info(&instance_id, default_port)
-        .await
-        .context(
-            "failed to get connection info (is the database running? try 'gfs compute start')",
-        )?;
+        let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+        let instance_id = InstanceId(container_name.clone());
+        let default_port = provider.default_port();
 
-    // Override database name if --database flag is provided
-    let mut env = conn_info.env;
-    if let Some(db_name) = database {
-        // Determine the database environment variable based on provider
-        let db_env_var = match provider_name.as_str() {
-            "postgres" => "POSTGRES_DB",
-            "mysql" => "MYSQL_DATABASE",
-            "clickhouse" => "CLICKHOUSE_DB",
-            _ => "DATABASE", // fallback for future providers
-        };
+        let conn_info = compute
+            .get_connection_info(&instance_id, default_port)
+            .await
+            .context(
+                "failed to get connection info (is the database running? try 'gfs compute start')",
+            )?;
 
-        // Remove existing database env var and add the override
-        env.retain(|(k, _)| k != db_env_var);
-        env.push((db_env_var.to_string(), db_name));
-    }
+        let mut env = conn_info.env;
+        if let Some(db_name) = database {
+            let db_env_var = match provider_name.as_str() {
+                "postgres" => "POSTGRES_DB",
+                "mysql" => "MYSQL_DATABASE",
+                "clickhouse" => "CLICKHOUSE_DB",
+                _ => "DATABASE",
+            };
+            env.retain(|(k, _)| k != db_env_var);
+            env.push((db_env_var.to_string(), db_name));
+        }
 
-    let params = ConnectionParams {
-        host: conn_info.host,
-        port: conn_info.port,
-        env,
+        ConnectionParams {
+            host: conn_info.host,
+            port: conn_info.port,
+            env,
+        }
+    } else {
+        // File-based path (SQLite): read database file from the active workspace data dir.
+        let workspace_data_dir = repo_layout::get_active_workspace_data_dir(&repo_path)
+            .context("failed to determine active workspace data directory")?;
+        let db_path = workspace_data_dir.join("db.sqlite");
+
+        ConnectionParams {
+            host: String::new(),
+            port: 0,
+            env: vec![(
+                "SQLITE_DB_PATH".to_string(),
+                db_path.to_string_lossy().into_owned(),
+            )],
+        }
     };
 
     // Build the query command
@@ -103,7 +114,8 @@ pub async fn run(
                 "database client '{}' not found. Install it to use 'gfs query'.\n  \
                  - PostgreSQL: install postgresql client tools (psql)\n  \
                  - MySQL: install mysql client tools\n  \
-                 - ClickHouse: install clickhouse client tools (clickhouse-client)",
+                 - ClickHouse: install clickhouse client tools (clickhouse-client)\n  \
+                 - SQLite: install sqlite3",
                 client_name
             )
         } else {

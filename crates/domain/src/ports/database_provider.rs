@@ -181,6 +181,15 @@ pub trait DatabaseProvider: Send + Sync {
         SIGTERM
     }
 
+    /// Whether this provider requires a running compute instance (container/VM).
+    ///
+    /// File-based databases such as SQLite return `false`; all other providers
+    /// return the default `true`.  When `false`, `init` skips container
+    /// provisioning and `gfs query` reads the file directly.
+    fn requires_compute(&self) -> bool {
+        true
+    }
+
     /// Build a client connection string from host, port, and optional env (credentials, db name).
     fn connection_string(
         &self,

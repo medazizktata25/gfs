@@ -47,6 +47,10 @@ fn storage_error_looks_like_permission_denied(err: &StorageError) -> bool {
     match err {
         StorageError::PermissionDenied(_) => true,
         StorageError::Io(io) => io.kind() == ErrorKind::PermissionDenied,
+        StorageError::Internal(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("permission denied") || lower.contains("operation not permitted")
+        }
         _ => false,
     }
 }

@@ -99,12 +99,6 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         database_port: Option<u16>,
         credentials: DatabaseCredentials,
     ) -> std::result::Result<(), InitRepoError> {
-        let compute = self.compute.as_ref().ok_or_else(|| {
-            InitRepoError::Compute(ComputeError::Internal(
-                "database provisioning requires a compute runtime".into(),
-            ))
-        })?;
-
         let list = self.registry.list();
         let matched_name = list
             .iter()
@@ -184,6 +178,29 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                 ),
             }
         }
+
+        // File-based providers (e.g. SQLite) need no container. Write only
+        // EnvironmentConfig; leaving RuntimeConfig absent signals to commit and
+        // checkout use-cases that there is no container to manage.
+        if !provider.requires_compute() {
+            let database_version = provider.version_from_image(&definition);
+            let environment = EnvironmentConfig {
+                database_provider: provider_name,
+                database_version,
+                database_port,
+            };
+            self.repository
+                .update_environment_config(repo_path, environment)
+                .await?;
+            tracing::info!("Database configured (no container); provider: {}", provider.name());
+            return Ok(());
+        }
+
+        let compute = self.compute.as_ref().ok_or_else(|| {
+            InitRepoError::Compute(ComputeError::Internal(
+                "database provisioning requires a compute runtime".into(),
+            ))
+        })?;
 
         let id = compute.provision(&definition).await?;
         compute.start(&id, StartOptions::default()).await?;
