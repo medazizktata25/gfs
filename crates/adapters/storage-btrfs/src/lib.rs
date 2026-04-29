@@ -653,7 +653,9 @@ impl StoragePort for BtrfsStorage {
                 }
             };
 
-            snapshot_subvolume(source, &dest, true).await?;
+            // Keep snapshots user-deletable with normal tools (`rm -rf`, file managers).
+            // Btrfs read-only snapshots require privileged subvolume deletion on some mounts.
+            snapshot_subvolume(source, &dest, false).await?;
             self.apply_runtime_settings(&dest).await;
 
             return Ok(Snapshot {
@@ -813,5 +815,51 @@ mod tests {
         assert!(!is_subvolume(&regular_dir));
 
         let _ = std::fs::remove_dir_all(&regular_dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn snapshots_are_deletable_with_regular_directory_removal() {
+        let base = std::env::current_dir().unwrap().join(format!(
+            ".gfs-btrfs-delete-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        if !is_btrfs(&base.parent().unwrap_or_else(|| Path::new("."))) {
+            return;
+        }
+
+        let source = base.join("source");
+        let snapshot = base.join("snapshot");
+
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("data.txt"), b"data").unwrap();
+
+        let storage = BtrfsStorage::new();
+        let result = storage
+            .snapshot(
+                &VolumeId(source.to_string_lossy().into_owned()),
+                SnapshotOptions {
+                    label: Some(snapshot.to_string_lossy().into_owned()),
+                },
+            )
+            .await;
+
+        if matches!(result, Err(StorageError::Internal(ref message)) if message.contains("Operation not permitted"))
+        {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        result.unwrap();
+
+        std::fs::remove_dir_all(&snapshot).unwrap();
+        assert!(!snapshot.exists());
+
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
