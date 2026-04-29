@@ -950,7 +950,6 @@ mod tests {
                 matches!(err, StorageError::Internal(_)),
                 "expected Internal for stderr {stderr:?}, got {err:?}"
             );
-        }
     }
-    }
+}
 }
