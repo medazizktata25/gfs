@@ -21,9 +21,7 @@ pub async fn run(
 ) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
-    let compute = Arc::new(DockerCompute::new().context(
-        "failed to connect to Docker/Podman daemon (is your container runtime running?)",
-    )?);
+    let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
 
     let _ = id; // container name override is reserved for future use; use case reads from config.
 
@@ -32,10 +30,9 @@ pub async fn run(
         .context("failed to register database providers")?;
 
     let use_case = ExportRepoUseCase::new(compute, registry);
-    let output = use_case
-        .run(&repo_path, output_dir, &format)
-        .await
-        .context("export failed")?;
+    // Do not use `.context("export failed")`: anyhow's context Display only prints that string
+    // and hides the underlying `ExportRepoError` / `ComputeError` message on stderr.
+    let output = use_case.run(&repo_path, output_dir, &format).await?;
 
     if json_output {
         println!(

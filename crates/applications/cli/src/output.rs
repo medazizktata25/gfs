@@ -80,6 +80,26 @@ pub fn bold(s: impl AsRef<str>) -> String {
     format!("{}", s.if_supports_color(Stream::Stdout, |t| t.bold()))
 }
 
+/// Like `println!` but returns `io::Result<()>` and silently exits on broken pipe.
+///
+/// When `gfs log` is piped to `head` or `less`, the pipe closes early and the
+/// next write returns `BrokenPipe`. We treat that as a clean exit so the user
+/// doesn't see a spurious error message.
+#[macro_export]
+macro_rules! println_safe {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let line = format!($($arg)*);
+        let result = writeln!(std::io::stdout(), "{}", line);
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                std::process::exit(0);
+            }
+            other => other,
+        }
+    }};
+}
+
 /// Brand accent: bright yellow (GFS gold #ffcb51 mapped to ANSI).
 pub fn gold(s: impl AsRef<str>) -> String {
     let s = s.as_ref().to_string();

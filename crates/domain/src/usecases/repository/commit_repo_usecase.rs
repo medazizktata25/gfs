@@ -1,10 +1,14 @@
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 
 use crate::model::commit::NewCommit;
 use crate::model::config::GlobalSettings;
+use crate::model::layout::GFS_DIR;
 use crate::ports::compute::{Compute, ComputeError, InstanceId, InstanceState};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
 use crate::ports::repository::{Repository, RepositoryError};
@@ -34,6 +38,236 @@ pub enum CommitRepoError {
 
     #[error("commit message must not be empty")]
     EmptyMessage,
+}
+
+/// True when host-side snapshot copy failed because the host could not read a file
+/// (e.g. root-owned `0600` under a bind-mounted workspace). Used to fall back to
+/// [`Compute::stream_snapshot`].
+fn storage_error_looks_like_permission_denied(err: &StorageError) -> bool {
+    match err {
+        StorageError::PermissionDenied(_) => true,
+        StorageError::Io(io) => io.kind() == ErrorKind::PermissionDenied,
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RAII unpause guard
+// ---------------------------------------------------------------------------
+
+/// Ensures the paused container is always unpaused, even on task cancellation or
+/// panic, by spawning an async unpause task from its `Drop` impl.
+///
+/// Call [`UnpauseGuard::defuse`] before the explicit unpause on the happy path
+/// to prevent a redundant (and potentially error-logged) double-unpause.
+struct UnpauseGuard {
+    compute: Arc<dyn Compute>,
+    instance_id: Option<InstanceId>,
+}
+
+impl UnpauseGuard {
+    fn new(compute: Arc<dyn Compute>, id: InstanceId) -> Self {
+        Self {
+            compute,
+            instance_id: Some(id),
+        }
+    }
+
+    /// Disarm the guard. The caller takes responsibility for unpausing.
+    fn defuse(&mut self) {
+        self.instance_id = None;
+    }
+}
+
+impl Drop for UnpauseGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.instance_id.take() {
+            let compute = Arc::clone(&self.compute);
+            // `Drop` cannot be async; spawn a background task to do the unpause.
+            tokio::spawn(async move {
+                if let Err(e) = compute.unpause(&id).await {
+                    tracing::warn!(
+                        error = %e,
+                        instance = %id,
+                        "UnpauseGuard: failed to unpause instance on drop"
+                    );
+                }
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-repo commit lock
+// ---------------------------------------------------------------------------
+
+/// Exclusive advisory lock on `<repo>/.gfs/commit.lock`, held for the duration
+/// of a single `CommitRepoUseCase::run` invocation.
+///
+/// Prevents two concurrent `gfs commit` processes on the same repository from
+/// racing pause/unpause, writing overlapping snapshot directories, or
+/// advancing the branch ref with the same parent — any of which can produce
+/// orphan snapshots or lost commits.
+///
+/// Uses `std::fs::File::try_lock` (stable since Rust 1.89) for a non-blocking
+/// POSIX `flock`. Lock is released on Drop via explicit `unlock`; if the
+/// process is killed, the kernel releases the flock on FD close so a crashed
+/// commit never wedges future commits.
+struct CommitLock {
+    file: File,
+}
+
+impl CommitLock {
+    fn acquire(repo_path: &Path) -> std::result::Result<Self, CommitRepoError> {
+        let gfs_dir = repo_path.join(GFS_DIR);
+        std::fs::create_dir_all(&gfs_dir)
+            .map_err(|e| CommitRepoError::Repository(RepositoryError::Io(e)))?;
+        let lock_path = gfs_dir.join("commit.lock");
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| CommitRepoError::Repository(RepositoryError::Io(e)))?;
+
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(TryLockError::WouldBlock) => Err(CommitRepoError::Repository(
+                RepositoryError::Internal(format!(
+                    "another `gfs commit` is already running on this repository \
+                     (lock held at {}); retry once it finishes",
+                    lock_path.display()
+                )),
+            )),
+            Err(TryLockError::Error(e)) => Err(CommitRepoError::Repository(RepositoryError::Io(e))),
+        }
+    }
+}
+
+impl Drop for CommitLock {
+    fn drop(&mut self) {
+        // Best-effort: kernel will release on FD close regardless.
+        let _ = self.file.unlock();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unfrozen-snapshot opt-in
+// ---------------------------------------------------------------------------
+
+/// True when the user has explicitly opted in to proceeding with a commit when
+/// the container cannot be frozen (rootless Podman on cgroup v1, LXC without
+/// freezer, etc.). Default is refusal, because a file-level snapshot of an
+/// unfrozen database is not crash-consistent — pages and WAL can be captured
+/// mid-write.
+fn unfrozen_snapshot_allowed() -> bool {
+    parse_unfrozen_snapshot_flag(std::env::var("GFS_ALLOW_UNFROZEN_SNAPSHOT").ok().as_deref())
+}
+
+/// Pure parser split out from the env read so tests can exercise every accepted
+/// form without mutating process-global state (which is unsafe under Rust 2024
+/// and races with other parallel tests).
+fn parse_unfrozen_snapshot_flag(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod permission_denied_tests {
+    use super::storage_error_looks_like_permission_denied;
+    use crate::ports::storage::StorageError;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn detects_io_permission_denied() {
+        assert!(storage_error_looks_like_permission_denied(
+            &StorageError::Io(std::io::Error::from(ErrorKind::PermissionDenied))
+        ));
+    }
+
+    #[test]
+    fn ignores_unrelated_internal_error() {
+        assert!(!storage_error_looks_like_permission_denied(
+            &StorageError::Internal("disk full".into())
+        ));
+    }
+
+    #[test]
+    fn detects_typed_permission_denied() {
+        assert!(storage_error_looks_like_permission_denied(
+            &StorageError::PermissionDenied("x".into())
+        ));
+    }
+}
+
+#[cfg(test)]
+mod unfrozen_snapshot_flag_tests {
+    use super::parse_unfrozen_snapshot_flag;
+
+    #[test]
+    fn absent_defaults_to_refusal() {
+        assert!(!parse_unfrozen_snapshot_flag(None));
+    }
+
+    #[test]
+    fn empty_or_zero_does_not_opt_in() {
+        assert!(!parse_unfrozen_snapshot_flag(Some("")));
+        assert!(!parse_unfrozen_snapshot_flag(Some("0")));
+        assert!(!parse_unfrozen_snapshot_flag(Some("false")));
+        assert!(!parse_unfrozen_snapshot_flag(Some("no")));
+        assert!(!parse_unfrozen_snapshot_flag(Some("off")));
+    }
+
+    #[test]
+    fn explicit_truthy_values_opt_in() {
+        for v in [
+            "1", "true", "TRUE", "True", "yes", "YES", "on", "ON", " 1 ", "  true  ",
+        ] {
+            assert!(
+                parse_unfrozen_snapshot_flag(Some(v)),
+                "expected {v:?} to opt in"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod commit_lock_tests {
+    use super::{CommitLock, CommitRepoError};
+    use crate::ports::repository::RepositoryError;
+
+    #[test]
+    fn second_acquire_reports_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let _first = CommitLock::acquire(dir.path()).expect("first acquire should succeed");
+
+        let second = CommitLock::acquire(dir.path());
+        match second {
+            Err(CommitRepoError::Repository(RepositoryError::Internal(msg))) => {
+                assert!(
+                    msg.contains("another `gfs commit` is already running"),
+                    "unexpected message: {msg}"
+                );
+            }
+            Err(e) => panic!("expected Internal contention error, got {e:?}"),
+            Ok(_) => panic!("expected contention error, but second acquire succeeded"),
+        }
+    }
+
+    #[test]
+    fn acquire_succeeds_after_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _first = CommitLock::acquire(dir.path()).unwrap();
+        }
+        let _second = CommitLock::acquire(dir.path()).expect("lock should be released after drop");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +329,10 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         let path = std::fs::canonicalize(&path)
             .map_err(|e| CommitRepoError::Repository(RepositoryError::Io(e)))?;
 
+        // Serialize commits per repository. Held until this function returns,
+        // covering pause, snapshot, finalize, and ref advance.
+        let _commit_lock = CommitLock::acquire(&path)?;
+
         // 1. Resolve commit context from the repository.
         let parent_commit_id = self.repository.get_current_commit_id(&path).await?;
         let runtime_config = self.repository.get_runtime_config(&path).await?;
@@ -151,7 +389,8 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         };
 
         // 3. Prepare the database container for snapshotting (if present).
-        let mut was_paused = false;
+        let mut unpause_guard: Option<UnpauseGuard> = None;
+        let mut paused_instance_id: Option<InstanceId> = None;
         if let (Some(runtime), Some(env)) = (&runtime_config, &environment) {
             let instance_id = InstanceId(runtime.container_name.clone());
 
@@ -175,10 +414,50 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                 .await?;
 
             // Pause the container so no writes land during the snapshot.
+            // On rootless Podman with cgroup v1 the runtime cannot freeze
+            // container processes; treat that as a soft failure and proceed
+            // with a crash-consistent snapshot (CHECKPOINT already applied).
             let status = self.compute.status(&instance_id).await?;
             if status.state == InstanceState::Running {
-                self.compute.pause(&instance_id).await?;
-                was_paused = true;
+                match self.compute.pause(&instance_id).await {
+                    Ok(_) => {
+                        // RAII guard: ensures unpause even on task cancellation or panic.
+                        unpause_guard = Some(UnpauseGuard::new(
+                            Arc::clone(&self.compute),
+                            instance_id.clone(),
+                        ));
+                        paused_instance_id = Some(instance_id);
+                    }
+                    Err(ComputeError::PauseUnsupported(ref e)) => {
+                        if !unfrozen_snapshot_allowed() {
+                            return Err(CommitRepoError::Compute(ComputeError::PauseUnsupported(
+                                format!(
+                                    "{e}. Refusing to snapshot an unfrozen database: \
+                                     a file-level copy of a live data directory can \
+                                     capture torn pages and half-applied WAL records, \
+                                     producing a non-crash-consistent snapshot. \
+                                     Options: (1) switch to a runtime that supports \
+                                     cgroup freezing (Docker, or rootful Podman on \
+                                     cgroup v2); (2) upgrade the host to cgroup v2 \
+                                     and use a runtime that honors it; or (3) set \
+                                     GFS_ALLOW_UNFROZEN_SNAPSHOT=1 to proceed with \
+                                     a best-effort snapshot that may require manual \
+                                     WAL replay on restore"
+                                ),
+                            )));
+                        }
+                        tracing::warn!(
+                            error = %e,
+                            instance = %instance_id,
+                            "container pause unavailable (cgroup v1 or rootless runtime); \
+                             proceeding with UNFROZEN snapshot per GFS_ALLOW_UNFROZEN_SNAPSHOT — \
+                             snapshot is NOT crash-consistent and may contain torn pages and \
+                             half-applied WAL; restore may require manual recovery"
+                        );
+                        // No unpause guard: nothing was paused.
+                    }
+                    Err(e) => return Err(CommitRepoError::Compute(e)),
+                }
             }
         }
 
@@ -204,15 +483,171 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             .ensure_snapshot_path(&path, &snapshot_hash)
             .await?;
 
-        // COW-copy the workspace data dir into the snapshot destination folder.
-        self.storage
-            .snapshot(
-                &volume_id,
-                SnapshotOptions {
-                    label: Some(snapshot_dest.to_string_lossy().into_owned()),
-                },
-            )
-            .await?;
+        // Prefer fast host-side COW/reflink snapshot (`storage.snapshot`).
+        // If that fails with a permission error (unreadable bind-mounted files),
+        // fall back to streaming the data dir through the container runtime so the
+        // daemon reads files the host user cannot.
+        let snapshot_result: Result<(), CommitRepoError> = async {
+            let host_result = self
+                .storage
+                .snapshot(
+                    &volume_id,
+                    SnapshotOptions {
+                        label: Some(snapshot_dest.to_string_lossy().into_owned()),
+                    },
+                )
+                .await;
+
+            match host_result {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    if !storage_error_looks_like_permission_denied(&e) {
+                        return Err(CommitRepoError::Storage(e));
+                    }
+                    let (Some(runtime), Some(env)) = (&runtime_config, &environment) else {
+                        return Err(CommitRepoError::Storage(e));
+                    };
+
+                    tracing::warn!(
+                        error = %e,
+                        "host snapshot failed with permission denied; falling back to stream_snapshot"
+                    );
+
+                    let instance_id = InstanceId(runtime.container_name.clone());
+                    let provider = self.registry.get(&env.database_provider).ok_or_else(|| {
+                        CommitRepoError::UnknownDatabaseProvider(env.database_provider.clone())
+                    })?;
+                    let container_data_path = provider
+                        .definition()
+                        .data_dir
+                        .to_string_lossy()
+                        .into_owned();
+
+                    if snapshot_dest.exists()
+                        && let Err(rm_err) = tokio::fs::remove_dir_all(&snapshot_dest).await
+                    {
+                        tracing::warn!(
+                            error = %rm_err,
+                            path = %snapshot_dest.display(),
+                            "failed to remove partial snapshot before stream_snapshot fallback"
+                        );
+                    }
+
+                    let timeout_secs: u64 = match std::env::var("GFS_STREAM_SNAPSHOT_TIMEOUT_SECS")
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                    {
+                        None => 300,
+                        Some(v) if v.is_empty() => 300,
+                        Some(v) => match v.parse::<u64>() {
+                            Ok(0) => 1,
+                            Ok(n) => n,
+                            Err(_) => 300,
+                        },
+                    };
+
+                    tracing::info!(
+                        timeout_secs,
+                        "stream_snapshot timeout configured"
+                    );
+
+                    // Bound the time we keep the DB paused + snapshot in flight.
+                    // Partial-snapshot cleanup on error is handled by the single
+                    // synchronous cleanup path below the outer `snapshot_result`
+                    // match — do NOT call `remove_dir_all` here, which would
+                    // duplicate the work and race the uncancellable
+                    // `spawn_blocking` tar writer inside `stream_snapshot`.
+                    // Unpause always happens via the outer RAII guard regardless.
+                    match tokio::time::timeout(
+                        Duration::from_secs(timeout_secs),
+                        self.compute.stream_snapshot(&instance_id, &container_data_path, &snapshot_dest),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return Err(CommitRepoError::Compute(e)),
+                        Err(_elapsed) => {
+                            return Err(CommitRepoError::Compute(ComputeError::Internal(
+                                format!("stream_snapshot timed out after {timeout_secs}s"),
+                            )));
+                        }
+                    }
+
+                    self.storage
+                        .finalize_snapshot(&snapshot_dest)
+                        .await
+                        .map_err(CommitRepoError::Storage)?;
+
+                    // The current workspace still has permission-broken files (that's why we
+                    // fell back to stream_snapshot). Mark it so the next container start will
+                    // run a pre-start ownership repair before booting.
+                    // Use the canonical workspace path (.gfs/WORKSPACE) rather than volume_id,
+                    // because volume_id may point to a custom mount_point that differs from the
+                    // path where checkout will look for the marker.
+                    let canonical_ws = self.repository.get_active_workspace_data_dir(&path).await;
+                    if let Ok(ws) = canonical_ws {
+                        if let Some(m) = repo_layout::repair_marker_path(&ws) {
+                            let _ = std::fs::write(&m, b"");
+                        }
+                    } else if let Some(m) = repo_layout::repair_marker_path(
+                        std::path::Path::new(volume_id.0.as_str()),
+                    ) {
+                        let _ = std::fs::write(&m, b"");
+                    }
+
+                    Ok(())
+                }
+            }
+        }
+        .await;
+
+        // Always unpause if we paused — even on snapshot failure.
+        // Defuse the RAII guard first so Drop doesn't fire a redundant unpause.
+        if let Some(mut guard) = unpause_guard.take() {
+            guard.defuse();
+            if let Some(instance_id) = paused_instance_id.as_ref()
+                && let Err(unpause_err) = self.compute.unpause(instance_id).await
+            {
+                tracing::warn!(
+                    error = %unpause_err,
+                    instance = %instance_id,
+                    "failed to unpause instance after snapshot attempt"
+                );
+            }
+        }
+
+        // Single synchronous cleanup path for any partial snapshot tree on error.
+        //
+        // Previously this was split across three places — two inline arms inside
+        // the timeout match plus a fire-and-forget `tokio::spawn` here. The spawn
+        // was unreliable: the Tokio runtime shuts down when the CLI's top-level
+        // future returns and can cancel the cleanup task mid-run, leaving
+        // orphaned snapshot dirs on disk.
+        //
+        // Awaiting here costs at most a few seconds on a partially-written tree
+        // and guarantees the path is cleaned before this function returns (which
+        // matters for the `CommitLock` path: the next commit must not find stale
+        // state).
+        //
+        // Known residual race: `stream_snapshot` uses an uncancellable
+        // `spawn_blocking` tar writer. On timeout, the writer may still be
+        // draining the last ~64 KB of pipe buffer to disk for ~1 ms after the
+        // async future is dropped. If that overlaps with this `remove_dir_all`,
+        // a handful of stray files can leak under the partially-removed tree.
+        // Hardening requires a cooperative cancel signal for the writer and is
+        // tracked as a follow-up.
+        if let Err(e) = snapshot_result {
+            if snapshot_dest.exists()
+                && let Err(rm_err) = tokio::fs::remove_dir_all(&snapshot_dest).await
+            {
+                tracing::warn!(
+                    error = %rm_err,
+                    path = %snapshot_dest.display(),
+                    "failed to remove partial snapshot on commit error"
+                );
+            }
+            return Err(e);
+        }
 
         // 5. Build the new commit.
         //    Use "0" parent when this is the very first real commit.
@@ -235,12 +670,6 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
 
         // 6. Persist the commit object and advance the branch ref.
         let commit_hash = self.repository.commit(&path, new_commit).await?;
-
-        // 7. Unpause the container if we paused it.
-        if was_paused && let Some(runtime) = &runtime_config {
-            let instance_id = InstanceId(runtime.container_name.clone());
-            self.compute.unpause(&instance_id).await?;
-        }
 
         tracing::info!("Commit created: {}", commit_hash);
         Ok(commit_hash)
@@ -315,6 +744,7 @@ mod tests {
     use super::*;
 
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -351,6 +781,8 @@ mod tests {
         user_config: Option<UserConfig>,
         /// Records the NewCommit passed to `commit()`.
         committed: Mutex<Option<NewCommit>>,
+        /// When set, `ensure_snapshot_path` returns a path under this directory (for cleanup tests).
+        snapshot_root: Option<PathBuf>,
     }
 
     #[async_trait]
@@ -488,12 +920,12 @@ mod tests {
             _: &std::path::Path,
             hash: &str,
         ) -> crate::ports::repository::Result<PathBuf> {
-            // Return a predictable temp-dir path for testing.
-            Ok(PathBuf::from(format!(
-                "/tmp/snapshots/{}/{}",
-                &hash[..2],
-                &hash[2..]
-            )))
+            let dest = if let Some(ref root) = self.snapshot_root {
+                root.join(&hash[..2]).join(&hash[2..])
+            } else {
+                PathBuf::from(format!("/tmp/snapshots/{}/{}", &hash[..2], &hash[2..]))
+            };
+            Ok(dest)
         }
         async fn get_active_workspace_data_dir(
             &self,
@@ -512,6 +944,12 @@ mod tests {
         prepared: Mutex<bool>,
         paused: Mutex<bool>,
         unpaused: Mutex<bool>,
+        /// When set, `stream_snapshot` creates `dest` then fails with this message.
+        stream_snapshot_fail_message: Mutex<Option<String>>,
+        stream_snapshot_calls: AtomicUsize,
+        /// When set, `pause()` returns `ComputeError::Internal` with this message
+        /// instead of succeeding (simulates cgroup v1 / rootless Podman).
+        pause_fails_with: Option<String>,
     }
 
     impl Default for MockCompute {
@@ -521,6 +959,9 @@ mod tests {
                 prepared: Mutex::new(false),
                 paused: Mutex::new(false),
                 unpaused: Mutex::new(false),
+                stream_snapshot_fail_message: Mutex::new(None),
+                stream_snapshot_calls: AtomicUsize::new(0),
+                pause_fails_with: None,
             }
         }
     }
@@ -589,6 +1030,27 @@ mod tests {
             Ok(vec![])
         }
         async fn pause(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            if let Some(ref msg) = self.pause_fails_with {
+                // Mirror the real `classify()` in compute-docker: cgroup/freeze phrases
+                // map to PauseUnsupported; everything else is a genuine Internal error.
+                let lower = msg.to_ascii_lowercase();
+                let is_pause_unsupported = [
+                    "cgroup",
+                    "freezing",
+                    "freeze",
+                    "pause is not",
+                    "cannot pause",
+                    "not supported",
+                    "rootless",
+                ]
+                .iter()
+                .any(|p| lower.contains(p));
+                return Err(if is_pause_unsupported {
+                    ComputeError::PauseUnsupported(msg.clone())
+                } else {
+                    ComputeError::Internal(msg.clone())
+                });
+            }
             *self.paused.lock().unwrap() = true;
             Ok(InstanceStatus {
                 id: id.clone(),
@@ -629,6 +1091,19 @@ mod tests {
         async fn remove_instance(&self, _id: &InstanceId) -> crate::ports::compute::Result<()> {
             Ok(())
         }
+        async fn stream_snapshot(
+            &self,
+            _id: &InstanceId,
+            _container_path: &str,
+            dest: &std::path::Path,
+        ) -> crate::ports::compute::Result<()> {
+            self.stream_snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            std::fs::create_dir_all(dest).map_err(crate::ports::compute::ComputeError::Io)?;
+            if let Some(msg) = self.stream_snapshot_fail_message.lock().unwrap().clone() {
+                return Err(crate::ports::compute::ComputeError::Internal(msg));
+            }
+            Ok(())
+        }
         async fn get_task_connection_info(
             &self,
             _id: &InstanceId,
@@ -663,6 +1138,10 @@ mod tests {
         last_volume: Mutex<Option<String>>,
         /// Records the label (destination path) passed to snapshot().
         last_label: Mutex<Option<String>>,
+        /// Records the path passed to finalize_snapshot().
+        finalized: Mutex<Option<std::path::PathBuf>>,
+        /// When set, `snapshot()` returns this error (e.g. permission denied).
+        snapshot_fail: Mutex<Option<crate::ports::storage::StorageError>>,
     }
 
     impl MockStorage {
@@ -671,6 +1150,8 @@ mod tests {
                 snapshot_id: snapshot_id.into(),
                 last_volume: Mutex::new(None),
                 last_label: Mutex::new(None),
+                finalized: Mutex::new(None),
+                snapshot_fail: Mutex::new(None),
             }
         }
     }
@@ -694,6 +1175,9 @@ mod tests {
         ) -> crate::ports::storage::Result<Snapshot> {
             *self.last_volume.lock().unwrap() = Some(id.0.clone());
             *self.last_label.lock().unwrap() = options.label.clone();
+            if let Some(err) = self.snapshot_fail.lock().unwrap().take() {
+                return Err(err);
+            }
             Ok(Snapshot {
                 id: SnapshotId(self.snapshot_id.clone()),
                 volume_id: id.clone(),
@@ -732,6 +1216,13 @@ mod tests {
                 used_bytes: 0,
                 free_bytes: 0,
             })
+        }
+        async fn finalize_snapshot(
+            &self,
+            dest: &std::path::Path,
+        ) -> crate::ports::storage::Result<()> {
+            *self.finalized.lock().unwrap() = Some(dest.to_path_buf());
+            Ok(())
         }
     }
 
@@ -938,16 +1429,122 @@ mod tests {
             *compute.unpaused.lock().unwrap(),
             "unpause should have been called"
         );
+        // Host snapshot succeeds: storage.snapshot is used; no stream fallback.
         assert_eq!(
             storage.last_volume.lock().unwrap().as_deref(),
-            Some("/vol/main")
+            Some("/vol/main"),
+            "storage.snapshot should copy the workspace volume"
         );
-        // Snapshot destination must be a 64-char hex-named path under /tmp/snapshots/.
-        let label = storage.last_label.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            compute.stream_snapshot_calls.load(Ordering::SeqCst),
+            0,
+            "stream_snapshot should not run when host snapshot succeeds"
+        );
         assert!(
-            label.contains("/tmp/snapshots/"),
-            "expected snapshot inside snapshots dir"
+            storage.finalized.lock().unwrap().is_none(),
+            "finalize_snapshot is only for stream_snapshot fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn commit_stream_snapshot_finalizes_read_only() {
+        // Host snapshot fails with permission denied → fallback runs stream_snapshot
+        // then finalize_snapshot.
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Stopped,
+            ..Default::default()
+        });
+        let repo = MockRepository {
+            commit_hash: "fin123".into(),
+            current_commit: "0".into(),
+            mount_point: Some("/vol/data".into()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "24".into(),
+                container_name: "fin-pg".into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "16".into(),
+                database_port: None,
+            }),
+            ..Default::default()
+        };
+        let storage = Arc::new(MockStorage::new("snap-fin"));
+        *storage.snapshot_fail.lock().unwrap() =
+            Some(crate::ports::storage::StorageError::PermissionDenied(
+                "copy failed: Permission denied".into(),
+            ));
+        let registry = Arc::new(MockRegistry);
+
+        let uc = CommitRepoUseCase::new(Arc::new(repo), compute.clone(), storage.clone(), registry);
+
+        uc.run(
+            existing_repo_path(),
+            "finalize test".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("commit should succeed");
+
+        assert_eq!(compute.stream_snapshot_calls.load(Ordering::SeqCst), 1);
+        let finalized = storage.finalized.lock().unwrap().clone();
+        assert!(
+            finalized.is_some(),
+            "finalize_snapshot must be called after fallback"
+        );
+        let finalized_str = finalized.unwrap().to_string_lossy().into_owned();
+        assert!(
+            finalized_str.contains("snapshots"),
+            "finalized path should be under the snapshots dir, got: {finalized_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_removes_partial_snapshot_when_stream_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let compute = Arc::new(MockCompute {
+            stream_snapshot_fail_message: Mutex::new(Some("stream failed".into())),
+            ..Default::default()
+        });
+        let repo = MockRepository {
+            commit_hash: "unused".into(),
+            current_commit: "0".into(),
+            mount_point: Some("/vol/data".into()),
+            snapshot_root: Some(tmp.path().to_path_buf()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "24".into(),
+                container_name: "fail-pg".into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "16".into(),
+                database_port: None,
+            }),
+            ..Default::default()
+        };
+        let storage = Arc::new(MockStorage::new("snap"));
+        *storage.snapshot_fail.lock().unwrap() = Some(
+            crate::ports::storage::StorageError::PermissionDenied("copy failed".into()),
+        );
+        let uc = CommitRepoUseCase::new(Arc::new(repo), compute, storage, Arc::new(MockRegistry));
+
+        let err = uc
+            .run(
+                existing_repo_path(),
+                "cleanup test".into(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        // Cleanup is fire-and-forget (background task) — only assert on the error type.
+        assert!(matches!(err, Err(CommitRepoError::Compute(_))));
     }
 
     #[tokio::test]
@@ -1129,6 +1726,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_non_permission_storage_error_skips_stream_fallback() {
+        let compute = Arc::new(MockCompute::default());
+        let repo = MockRepository {
+            commit_hash: "x".into(),
+            current_commit: "0".into(),
+            mount_point: Some("/vol/data".into()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "24".into(),
+                container_name: "pg".into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "16".into(),
+                database_port: None,
+            }),
+            ..Default::default()
+        };
+        let storage = Arc::new(MockStorage::new("snap"));
+        *storage.snapshot_fail.lock().unwrap() = Some(
+            crate::ports::storage::StorageError::Internal("storage failed".into()),
+        );
+        let uc = CommitRepoUseCase::new(
+            Arc::new(repo),
+            compute.clone(),
+            storage,
+            Arc::new(MockRegistry),
+        );
+        let result = uc
+            .run(existing_repo_path(), "fail".into(), None, None, None, None)
+            .await;
+        assert!(matches!(result, Err(CommitRepoError::Storage(_))));
+        assert_eq!(compute.stream_snapshot_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn commit_storage_error() {
         struct FailingStorage;
 
@@ -1184,6 +1817,12 @@ mod tests {
                     free_bytes: 0,
                 })
             }
+            async fn finalize_snapshot(
+                &self,
+                _: &std::path::Path,
+            ) -> crate::ports::storage::Result<()> {
+                Ok(())
+            }
         }
 
         let repo = MockRepository {
@@ -1209,5 +1848,120 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(CommitRepoError::Storage(_))));
+    }
+
+    /// Rootless Podman on cgroup v1 returns a `PauseUnsupported` error from `pause()`.
+    /// By default (no `GFS_ALLOW_UNFROZEN_SNAPSHOT`), the commit must *refuse* with
+    /// a message that surfaces all three workarounds — switching runtime, upgrading
+    /// to cgroup v2, or opting in. No pause/unpause must be issued since the runtime
+    /// rejected the pause request.
+    #[tokio::test]
+    async fn commit_refuses_when_pause_unsupported_without_opt_in() {
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Running,
+            pause_fails_with: Some(
+                "OCI runtime error: cgroups: cgroup v1 does not support freezing a single process"
+                    .into(),
+            ),
+            ..Default::default()
+        });
+        let repo = MockRepository {
+            commit_hash: "abc123".into(),
+            current_commit: "prev".into(),
+            mount_point: Some("/vol/main".into()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "podman".into(),
+                runtime_version: "5.0".into(),
+                container_name: "gfs-pg-test".into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "16".into(),
+                database_port: None,
+            }),
+            ..Default::default()
+        };
+        let storage = Arc::new(MockStorage::new("snap-abc"));
+        let registry = Arc::new(MockRegistry);
+
+        let uc = CommitRepoUseCase::new(Arc::new(repo), compute.clone(), storage, registry);
+        let result = uc
+            .run(
+                existing_repo_path(),
+                "cgroup v1 pause test".into(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        match result {
+            Err(CommitRepoError::Compute(ComputeError::PauseUnsupported(msg))) => {
+                assert!(
+                    msg.contains("GFS_ALLOW_UNFROZEN_SNAPSHOT=1"),
+                    "refusal must mention the opt-in env var; got: {msg}"
+                );
+                assert!(
+                    msg.contains("cgroup v2"),
+                    "refusal must mention the cgroup v2 upgrade path; got: {msg}"
+                );
+            }
+            other => panic!("expected PauseUnsupported refusal, got {other:?}"),
+        }
+        assert!(
+            !*compute.paused.lock().unwrap(),
+            "paused flag should be false — pause was rejected by runtime"
+        );
+        assert!(
+            !*compute.unpaused.lock().unwrap(),
+            "unpause must not be called when pause was never issued"
+        );
+    }
+
+    /// A genuine pause failure (container not found, daemon error) must still
+    /// propagate as an error — only the "unsupported" subset is swallowed.
+    #[tokio::test]
+    async fn commit_fails_on_genuine_pause_error() {
+        let compute = Arc::new(MockCompute {
+            state: InstanceState::Running,
+            pause_fails_with: Some("daemon internal error: connection refused".into()),
+            ..Default::default()
+        });
+        let repo = MockRepository {
+            commit_hash: "abc123".into(),
+            current_commit: "prev".into(),
+            mount_point: Some("/vol/main".into()),
+            runtime_config: Some(RuntimeConfig {
+                runtime_provider: "docker".into(),
+                runtime_version: "24".into(),
+                container_name: "gfs-pg-test".into(),
+            }),
+            environment: Some(EnvironmentConfig {
+                database_provider: "mock-db".into(),
+                database_version: "16".into(),
+                database_port: None,
+            }),
+            ..Default::default()
+        };
+        let storage = Arc::new(MockStorage::new("snap-abc"));
+        let registry = Arc::new(MockRegistry);
+
+        let uc = CommitRepoUseCase::new(Arc::new(repo), compute, storage, registry);
+        let result = uc
+            .run(
+                existing_repo_path(),
+                "genuine pause error".into(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(CommitRepoError::Compute(_))),
+            "genuine pause error must propagate: {result:?}"
+        );
     }
 }

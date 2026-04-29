@@ -216,6 +216,35 @@ pub trait DatabaseProvider: Send + Sync {
     /// The compute runtime runs these commands in the container before taking the snapshot.
     fn prepare_for_snapshot(&self, params: &ConnectionParams) -> Result<Vec<String>>;
 
+    /// Return the user/group that should own files under the provider's `definition().data_dir`
+    /// inside the container (for example `"postgres:postgres"`).
+    ///
+    /// This is used for best-effort permission repair after checkout when the workspace
+    /// was populated from a snapshot created via container streaming (which intentionally
+    /// does not preserve original ownership/mode bits).
+    ///
+    /// Default: `None` (provider does not declare a canonical owner).
+    fn data_dir_owner(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Startup probes executed **inside the running database container** after checkout.
+    ///
+    /// Goal: turn “container is running” into “database is actually usable on this workspace”.
+    /// Probes should be:
+    /// - fast
+    /// - deterministic
+    /// - safe (no mutations unless explicitly intended)
+    ///
+    /// The compute runtime should execute these probes with root privileges when available,
+    /// because permission repair may be needed before the container’s default user can read
+    /// the mounted data directory.
+    ///
+    /// Default: empty (no health gate).
+    fn container_startup_probes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     // -----------------------------------------------------------------------
     // Import / Export
     // -----------------------------------------------------------------------

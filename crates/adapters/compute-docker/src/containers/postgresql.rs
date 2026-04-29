@@ -238,6 +238,17 @@ impl DatabaseProvider for PostgresqlProvider {
         ])
     }
 
+    fn data_dir_owner(&self) -> Option<&'static str> {
+        Some("postgres:postgres")
+    }
+
+    fn container_startup_probes(&self) -> &'static [&'static str] {
+        &[
+            "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" >/dev/null",
+            "PGPASSWORD=\"$POSTGRES_PASSWORD\" psql -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c \"SELECT 1;\" >/dev/null",
+        ]
+    }
+
     // -----------------------------------------------------------------------
     // Import / Export
     // -----------------------------------------------------------------------

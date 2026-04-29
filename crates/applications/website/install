@@ -604,7 +604,7 @@ inject_ai_tools() {
 
     # GFS MCP config JSON fragment
     local gfs_mcp_json="\"gfs\": {\"command\": \"$INSTALL_DIR/gfs\", \"args\": [\"mcp\"]}"
-    local gfs_mcp_opencode_json="\"gfs\": {\"command\": \"$INSTALL_DIR/gfs\", \"args\": [\"mcp\"], \"enabled\": true}"
+    local gfs_mcp_opencode_json="\"gfs\": {\"type\": \"local\", \"command\": [\"$INSTALL_DIR/gfs\", \"mcp\"], \"enabled\": true}"
 
     for tool in "${detected[@]}"; do
         case "$tool" in
@@ -660,7 +660,7 @@ inject_ai_tools() {
                     if [[ ! -f "$opencode_config" ]]; then
                         echo "{\"mcp\": {$gfs_mcp_opencode_json}}" | jq . > "$opencode_config" 2>/dev/null || echo "{\"mcp\": {$gfs_mcp_opencode_json}}" > "$opencode_config"
                     else
-                        jq --arg cmd "$INSTALL_DIR/gfs" '.mcp.gfs = {"command": $cmd, "args": ["mcp"], "enabled": true}' "$opencode_config" > "$opencode_config.tmp" 2>/dev/null && mv "$opencode_config.tmp" "$opencode_config"
+                        jq --arg cmd "$INSTALL_DIR/gfs" '.mcp.gfs = {"type": "local", "command": [$cmd, "mcp"], "enabled": true}' "$opencode_config" > "$opencode_config.tmp" 2>/dev/null && mv "$opencode_config.tmp" "$opencode_config"
                     fi
                     mcp_configured+=("OpenCode")
                 else

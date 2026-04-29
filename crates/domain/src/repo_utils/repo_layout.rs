@@ -310,6 +310,26 @@ pub fn snapshot_path(repo_path: &Path, hash: &str) -> PathBuf {
         .join(rest)
 }
 
+/// Returns the canonical path for the `.needs-repair` marker file associated
+/// with the workspace whose data directory is at `workspace_data_dir`.
+///
+/// The marker is written after a `stream_snapshot` fallback commit (which does
+/// not preserve original file ownership) and is consumed by checkout to trigger
+/// a pre-start `chown` repair before the database container boots.
+///
+/// Returns `None` when `workspace_data_dir` has no parent (e.g. `/` or a bare
+/// component), so callers skip the marker write rather than placing `.needs-repair`
+/// inside the database data directory itself.
+///
+/// **Always use this function** — never compute `parent().join(".needs-repair")`
+/// inline, as the three write/read sites must agree on the exact path.
+pub fn repair_marker_path(workspace_data_dir: &Path) -> Option<PathBuf> {
+    workspace_data_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join(".needs-repair"))
+}
+
 /// Logical size of a directory tree (sum of file lengths in bytes).
 pub fn directory_logical_size_bytes(dir: &Path) -> Result<u64, RepoError> {
     let mut total = 0u64;
@@ -2054,5 +2074,27 @@ name = "test-repo"
             assert!(matches.contains(&hash1.to_string()));
             assert!(matches.contains(&hash2.to_string()));
         }
+    }
+
+    #[test]
+    fn repair_marker_path_normal_returns_sibling_dotfile() {
+        let data_dir = std::path::Path::new("/foo/bar/data");
+        let marker = repair_marker_path(data_dir);
+        assert_eq!(
+            marker,
+            Some(std::path::PathBuf::from("/foo/bar/.needs-repair"))
+        );
+    }
+
+    #[test]
+    fn repair_marker_path_root_returns_none() {
+        let marker = repair_marker_path(std::path::Path::new("/"));
+        assert_eq!(marker, None);
+    }
+
+    #[test]
+    fn repair_marker_path_bare_component_returns_none() {
+        let marker = repair_marker_path(std::path::Path::new("data"));
+        assert_eq!(marker, None);
     }
 }

@@ -30,6 +30,9 @@ pub enum StorageError {
         limit_bytes: u64,
     },
 
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -149,6 +152,14 @@ pub trait StoragePort: Send + Sync {
 
     /// Return disk-usage quota information for a volume.
     async fn quota(&self, id: &VolumeId) -> Result<Quota>;
+
+    /// Make the directory tree at `dest` read-only.
+    ///
+    /// Called after `Compute::stream_snapshot` to restore the same immutability
+    /// that `snapshot()` already provides internally.  Implementations should
+    /// apply the platform-appropriate mechanism (e.g. `chmod -R a-w` on Unix,
+    /// `attrib +R /S /D` on Windows).
+    async fn finalize_snapshot(&self, dest: &Path) -> Result<()>;
 }
 
 #[cfg(test)]

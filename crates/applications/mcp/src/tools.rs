@@ -18,10 +18,14 @@ use gfs_domain::ports::database_provider::{
 use gfs_domain::ports::repository::{LogOptions, Repository};
 use gfs_domain::repo_utils::repo_layout;
 use gfs_domain::usecases::repository::{
-    checkout_repo_usecase::CheckoutRepoUseCase, commit_repo_usecase::CommitRepoUseCase,
-    export_repo_usecase::ExportRepoUseCase, extract_schema_usecase::ExtractSchemaUseCase,
-    import_repo_usecase::ImportRepoUseCase, init_repo_usecase::InitRepositoryUseCase,
-    log_repo_usecase::LogRepoUseCase, status_repo_usecase::StatusRepoUseCase,
+    checkout_repo_usecase::CheckoutRepoUseCase,
+    commit_repo_usecase::CommitRepoUseCase,
+    export_repo_usecase::ExportRepoUseCase,
+    extract_schema_usecase::ExtractSchemaUseCase,
+    import_repo_usecase::ImportRepoUseCase,
+    init_repo_usecase::{DatabaseCredentials, InitRepositoryUseCase},
+    log_repo_usecase::LogRepoUseCase,
+    status_repo_usecase::StatusRepoUseCase,
 };
 #[cfg(unix)]
 use gfs_domain::utils::current_user;
@@ -810,6 +814,7 @@ async fn do_init(args: &serde_json::Value) -> Result<CallToolResult, McpError> {
             database_provider.clone(),
             database_version.clone(),
             None,
+            DatabaseCredentials::default(),
         )
         .await
         .map_err(|e| to_error_data(e.to_string()))?;
@@ -1043,7 +1048,13 @@ async fn start_or_restart(
         definition.host_data_dir = Some(std::path::PathBuf::from(&active));
         #[cfg(unix)]
         {
-            definition.user = current_user::current_user_uid_gid();
+            match current_user::current_user_uid_gid() {
+                Some(uid_gid) => definition.user = Some(uid_gid),
+                None => tracing::warn!(
+                    "could not determine host uid:gid; container will run as its default user — \
+                     workspace files may be unreadable by the host user during snapshot"
+                ),
+            }
         }
         let new_id = compute
             .provision(&definition)

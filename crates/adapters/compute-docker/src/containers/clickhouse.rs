@@ -198,6 +198,14 @@ impl DatabaseProvider for ClickhouseProvider {
         Ok(vec![])
     }
 
+    fn data_dir_owner(&self) -> Option<&'static str> {
+        Some("clickhouse:clickhouse")
+    }
+
+    fn container_startup_probes(&self) -> &'static [&'static str] {
+        &["clickhouse-client --host 127.0.0.1 --query \"SELECT 1\" >/dev/null"]
+    }
+
     fn supported_export_formats(&self) -> Vec<DataFormat> {
         vec![DataFormat {
             id: "schema".into(),

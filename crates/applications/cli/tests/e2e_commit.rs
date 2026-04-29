@@ -228,7 +228,8 @@ fn log_respects_max_count() {
     assert!(log_ok, "gfs log should succeed; stderr: {log_stderr}");
 
     if !log_stdout.is_empty() {
-        let commit_blocks = log_stdout.matches("commit ").count();
+        // The styled log format uses "● <hash>" per entry, not "commit <hash>".
+        let commit_blocks = log_stdout.matches('●').count();
         assert_eq!(
             commit_blocks, 1,
             "log -n 1 should show exactly one commit; got: {log_stdout}"
@@ -349,7 +350,7 @@ fn commit_with_missing_mount_point_source_fails_gracefully() {
 }
 
 #[test]
-fn commit_with_real_database_snapshots_workspace() {
+fn commit_with_real_postgres_database_snapshots_workspace() {
     let tmp = tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 

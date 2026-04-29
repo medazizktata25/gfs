@@ -40,6 +40,26 @@ use tracing::instrument;
 
 use crate::error::classify_diskutil_stderr;
 
+async fn make_tree_read_only(path: &Path) -> Result<()> {
+    let chmod_out = Command::new("chmod")
+        .arg("-R")
+        .arg("u+rX,u-w,go-rwx")
+        .arg(path)
+        .env("LANG", "C")
+        .output()
+        .await
+        .map_err(StorageError::Io)?;
+    if !chmod_out.status.success() {
+        let stderr = String::from_utf8_lossy(&chmod_out.stderr);
+        return Err(StorageError::Internal(format!(
+            "chmod -R u+rX,u-w,go-rwx '{}' failed: {}",
+            path.display(),
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ApfsStorage
 // ---------------------------------------------------------------------------
@@ -139,36 +159,27 @@ impl StoragePort for ApfsStorage {
 
         let output = Command::new("cp")
             .args(["-cRp", &id.0, dest.to_string_lossy().as_ref()])
+            .env("LANG", "C")
             .output()
             .await
             .map_err(StorageError::Io)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(StorageError::Internal(format!(
+            let msg = format!(
                 "cp -cRp '{}' '{}' failed: {}",
                 id,
                 dest.display(),
                 stderr.trim()
-            )));
+            );
+            let lower = stderr.to_ascii_lowercase();
+            if lower.contains("permission denied") || lower.contains("operation not permitted") {
+                return Err(StorageError::PermissionDenied(msg));
+            }
+            return Err(StorageError::Internal(msg));
         }
 
-        // Make the snapshot directory tree read-only so it cannot be modified.
-        let chmod_out = Command::new("chmod")
-            .arg("-R")
-            .arg("a-w")
-            .arg(&dest)
-            .output()
-            .await
-            .map_err(StorageError::Io)?;
-        if !chmod_out.status.success() {
-            let stderr = String::from_utf8_lossy(&chmod_out.stderr);
-            return Err(StorageError::Internal(format!(
-                "chmod -R a-w '{}' failed: {}",
-                dest.display(),
-                stderr.trim()
-            )));
-        }
+        make_tree_read_only(&dest).await?;
 
         Ok(Snapshot {
             id: SnapshotId(dest.to_string_lossy().into_owned()),
@@ -206,18 +217,24 @@ impl StoragePort for ApfsStorage {
 
         let output = Command::new("cp")
             .args(["-cRp", src, &target_id.0])
+            .env("LANG", "C")
             .output()
             .await
             .map_err(StorageError::Io)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(StorageError::Internal(format!(
+            let msg = format!(
                 "cp -cRp '{}' '{}' failed: {}",
                 src,
                 target_id,
                 stderr.trim()
-            )));
+            );
+            let lower = stderr.to_ascii_lowercase();
+            if lower.contains("permission denied") || lower.contains("operation not permitted") {
+                return Err(StorageError::PermissionDenied(msg));
+            }
+            return Err(StorageError::Internal(msg));
         }
 
         let target_path = PathBuf::from(&target_id.0);
@@ -260,6 +277,10 @@ impl StoragePort for ApfsStorage {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         parse_df_output(id, &stdout)
+    }
+
+    async fn finalize_snapshot(&self, dest: &Path) -> Result<()> {
+        make_tree_read_only(dest).await
     }
 }
 

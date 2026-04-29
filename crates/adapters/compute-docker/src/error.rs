@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use gfs_domain::ports::compute::ComputeError;
 
 fn is_connection_error(err: &bollard::errors::Error) -> bool {
@@ -20,14 +22,40 @@ fn is_connection_error(err: &bollard::errors::Error) -> bool {
 /// the message body to produce the most specific `ComputeError`.
 pub(crate) fn classify(container_id: &str, err: bollard::errors::Error) -> ComputeError {
     if is_connection_error(&err) {
-        return ComputeError::NotAvailable("Docker".to_string());
+        return ComputeError::NotAvailable(crate::DockerCompute::format_connection_error(&err));
     }
+    classify_with_mount_path(container_id, err, None)
+}
+
+/// Classify a bollard error with optional mount path context for better error messages.
+pub(crate) fn classify_with_mount_path(
+    container_id: &str,
+    err: bollard::errors::Error,
+    mount_path: Option<PathBuf>,
+) -> ComputeError {
     match &err {
         bollard::errors::Error::DockerResponseServerError {
             status_code,
             message,
         } => {
             let msg = message.to_ascii_lowercase();
+
+            // Check for mount-related errors
+            if msg.contains("invalid mount config")
+                || msg.contains("mount denied")
+                || msg.contains("cannot mount")
+                || msg.contains("invalid volume specification")
+                || msg.contains("invalid mode")
+                || msg.contains("invalid bind mount")
+                || msg.contains("invalid mount")
+            {
+                let path = mount_path.unwrap_or_else(|| {
+                    // Try to extract path from error message
+                    extract_path_from_error(message).unwrap_or_else(|| PathBuf::from("unknown"))
+                });
+                return ComputeError::docker_mount_failed(path, message.clone());
+            }
+
             match status_code {
                 404 => ComputeError::NotFound(if container_id.is_empty() {
                     message.clone()
@@ -50,12 +78,69 @@ pub(crate) fn classify(container_id: &str, err: bollard::errors::Error) -> Compu
                         ComputeError::Internal(message.clone())
                     }
                 }
-                _ => ComputeError::Internal(message.clone()),
+                _ => {
+                    // Rootless Podman / cgroup v1 hosts cannot freeze container
+                    // processes.  The daemon surfaces this as a 500 with a message
+                    // that is semantically about *pausing* being unsupported.
+                    //
+                    // We require the message to be explicitly about pause/freeze
+                    // to avoid false-positives from unrelated 500 errors that
+                    // happen to mention "cgroup" or "not supported" in other contexts
+                    // (e.g. "cgroup memory limit exceeded", "network feature not supported").
+                    let is_about_pause =
+                        msg.contains("pause") || msg.contains("freeze") || msg.contains("freezing");
+                    let is_unsupported_reason = msg.contains("cgroup v1")
+                        || msg.contains("rootless")
+                        || msg.contains("pause is not")
+                        || msg.contains("cannot pause")
+                        || (msg.contains("cgroup")
+                            && (msg.contains("freeze") || msg.contains("pause")))
+                        || (msg.contains("not supported") && is_about_pause);
+                    if is_about_pause && is_unsupported_reason {
+                        ComputeError::PauseUnsupported(message.clone())
+                    } else {
+                        ComputeError::Internal(message.clone())
+                    }
+                }
             }
         }
         bollard::errors::Error::IOError { err } => ComputeError::Internal(err.to_string()),
         other => ComputeError::Internal(other.to_string()),
     }
+}
+
+/// Try to extract a file path from a Docker error message.
+fn extract_path_from_error(message: &str) -> Option<PathBuf> {
+    // Common patterns in Docker mount error messages:
+    // - "invalid mount config for type 'bind': source path '/path/to/dir' must be a directory"
+    // - "mount denied: the path /path/to/dir is not shared"
+    // - "invalid volume specification: '/path/to/dir:/container/path'"
+
+    // Look for paths in quotes or after common keywords
+    let patterns = [
+        ("source path '", "'"),
+        ("source path \"", "\""),
+        ("the path ", " "),
+        ("path '", "'"),
+        ("path \"", "\""),
+        ("'", "'"),
+        ("\"", "\""),
+    ];
+
+    for (start, end) in patterns {
+        if let Some(start_idx) = message.find(start) {
+            let path_start = start_idx + start.len();
+            let remaining = &message[path_start..];
+            if let Some(end_idx) = remaining.find(end) {
+                let path_str = &remaining[..end_idx];
+                if !path_str.is_empty() && (path_str.starts_with('/') || path_str.contains(':')) {
+                    return Some(PathBuf::from(path_str));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -119,6 +204,42 @@ mod tests {
     }
 
     #[test]
+    fn classify_500_cgroup_v1_freeze_is_pause_unsupported() {
+        let err = classify(
+            "c1",
+            docker_err(
+                500,
+                "OCI: cgroup v1 does not support freezing a single process",
+            ),
+        );
+        assert!(matches!(err, ComputeError::PauseUnsupported(_)));
+    }
+
+    #[test]
+    fn classify_500_pause_not_supported_rootless_is_pause_unsupported() {
+        let err = classify("c1", docker_err(500, "pause is not supported on rootless"));
+        assert!(matches!(err, ComputeError::PauseUnsupported(_)));
+    }
+
+    #[test]
+    fn classify_500_unrelated_cgroup_error_is_internal() {
+        let err = classify("c1", docker_err(500, "cgroup memory limit exceeded"));
+        assert!(
+            matches!(err, ComputeError::Internal(_)),
+            "unrelated cgroup error must not be classified as PauseUnsupported"
+        );
+    }
+
+    #[test]
+    fn classify_500_unrelated_not_supported_is_internal() {
+        let err = classify("c1", docker_err(500, "network feature not supported"));
+        assert!(
+            matches!(err, ComputeError::Internal(_)),
+            "unrelated 'not supported' message must not be classified as PauseUnsupported"
+        );
+    }
+
+    #[test]
     fn classify_io_error_connection_refused_is_not_available() {
         let err = classify(
             "c1",
@@ -149,5 +270,89 @@ mod tests {
             },
         );
         assert!(matches!(err, ComputeError::Internal(_)));
+    }
+
+    #[test]
+    fn classify_mount_error_with_path() {
+        let path = PathBuf::from("/tmp/test");
+        let err = classify_with_mount_path(
+            "c1",
+            docker_err(
+                500,
+                "invalid mount config for type 'bind': source path '/tmp/test' must be a directory",
+            ),
+            Some(path.clone()),
+        );
+        match err {
+            ComputeError::DockerMountFailed {
+                path: err_path,
+                reason,
+                suggestion,
+            } => {
+                assert_eq!(err_path, path);
+                assert!(reason.contains("invalid mount config"));
+                assert!(suggestion.contains("Solutions:"));
+                assert!(suggestion.contains("--output-dir .gfs/exports"));
+            }
+            _ => panic!("Expected DockerMountFailed, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn classify_mount_error_extract_path() {
+        let err = classify(
+            "c1",
+            docker_err(
+                500,
+                "invalid mount config for type 'bind': source path '/tmp/test' must be a directory",
+            ),
+        );
+        match err {
+            ComputeError::DockerMountFailed {
+                path,
+                reason,
+                suggestion,
+            } => {
+                assert_eq!(path, PathBuf::from("/tmp/test"));
+                assert!(reason.contains("invalid mount config"));
+                assert!(suggestion.contains("Solutions:"));
+            }
+            _ => panic!("Expected DockerMountFailed, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn classify_mount_error_mount_denied() {
+        let err = classify(
+            "c1",
+            docker_err(500, "mount denied: the path /tmp/test is not shared"),
+        );
+        match err {
+            ComputeError::DockerMountFailed {
+                path,
+                reason,
+                suggestion,
+            } => {
+                assert_eq!(path, PathBuf::from("/tmp/test"));
+                assert!(reason.contains("mount denied"));
+                assert!(suggestion.contains("Solutions:"));
+            }
+            _ => panic!("Expected DockerMountFailed, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn classify_mount_error_invalid_volume() {
+        let err = classify(
+            "c1",
+            docker_err(
+                500,
+                "invalid volume specification: '/tmp/test:/container/path'",
+            ),
+        );
+        match err {
+            ComputeError::DockerMountFailed { .. } => {}
+            _ => panic!("Expected DockerMountFailed, got {:?}", err),
+        }
     }
 }

@@ -158,8 +158,11 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(target_os = "linux")]
 fn run_podman_unshare_sync(script: &str) -> std::io::Result<std::process::Output> {
+    // Force LANG=C so classify_stderr's substring matches (e.g. "permission
+    // denied") don't silently fail on localized hosts.
     StdCommand::new("podman")
         .args(["unshare", "sh", "-lc", script])
+        .env("LANG", "C")
         .output()
 }
 
@@ -167,6 +170,7 @@ fn run_podman_unshare_sync(script: &str) -> std::io::Result<std::process::Output
 async fn run_podman_unshare(script: &str) -> std::io::Result<std::process::Output> {
     Command::new("podman")
         .args(["unshare", "sh", "-lc", script])
+        .env("LANG", "C")
         .output()
         .await
 }
@@ -305,6 +309,7 @@ async fn run_btrfs(args: &[&str], path_for_errors: &Path) -> Result<()> {
 
     let output = Command::new("btrfs")
         .args(args)
+        .env("LANG", "C")
         .output()
         .await
         .map_err(StorageError::Io)?;
@@ -398,6 +403,7 @@ async fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
         .args(["--reflink=auto", "-a"])
         .arg(&source)
         .arg(dst)
+        .env("LANG", "C")
         .output()
         .await
         .map_err(StorageError::Io)?;
@@ -408,7 +414,7 @@ async fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(StorageError::Internal(format!(
+    let msg = format!(
         "copy '{}' -> '{}' failed: {}{}",
         src.display(),
         dst.display(),
@@ -418,7 +424,12 @@ async fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
         } else {
             String::new()
         }
-    )))
+    );
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("permission denied") || lower.contains("operation not permitted") {
+        return Err(StorageError::PermissionDenied(msg));
+    }
+    Err(StorageError::Internal(msg))
 }
 
 #[cfg(target_os = "linux")]
@@ -592,6 +603,13 @@ fn classify_stderr(volume_id: &str, stderr: &str) -> StorageError {
         StorageError::Busy(volume_id.to_owned())
     } else if lower.contains("already exists") || lower.contains("already exist") {
         StorageError::AlreadyExists(volume_id.to_owned())
+    } else if lower.contains("permission denied") || lower.contains("operation not permitted") {
+        // Surface as PermissionDenied so the commit use case can trigger the
+        // stream_snapshot fallback. Without this branch, rootful btrfs with
+        // UID-mismatched data dirs silently wraps the cp/subvolume failure as
+        // Internal, the `storage_error_looks_like_permission_denied` heuristic
+        // ignores it, and the commit fails hard instead of falling back.
+        StorageError::PermissionDenied(stderr.trim().to_owned())
     } else {
         StorageError::Internal(stderr.trim().to_owned())
     }
@@ -741,6 +759,34 @@ impl StoragePort for BtrfsStorage {
             Err(unsupported())
         }
     }
+
+    async fn finalize_snapshot(&self, dest: &Path) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let output = Command::new("chmod")
+                .args(["-R", "u+rX,u-w,go-rwx"])
+                .arg(dest)
+                .env("LANG", "C")
+                .output()
+                .await
+                .map_err(StorageError::Io)?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(StorageError::Internal(format!(
+                    "chmod -R u+rX,u-w,go-rwx '{}' failed: {}",
+                    dest.display(),
+                    stderr.trim()
+                )));
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = dest;
+            Err(unsupported())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -861,5 +907,50 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&source);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Permission-denied failures from `btrfs subvolume snapshot/create/delete`
+    /// must surface as [`StorageError::PermissionDenied`] so the commit use case
+    /// can trigger the `stream_snapshot` fallback. Regression test for a bug
+    /// where the classifier wrapped these as `Internal` and the fallback never
+    /// fired on rootful btrfs with UID-mismatched data dirs.
+    #[test]
+    fn classify_stderr_maps_permission_denied() {
+        // Real-world btrfs-progs stderr strings observed on Linux 6.x, plus
+        // the lower-case `operation not permitted` variant that surfaces via
+        // `podman unshare sh -lc` wrappers.
+        let samples = [
+            "ERROR: cannot snapshot '/data': Permission denied",
+            "ERROR: Could not create subvolume: Operation not permitted",
+            "ERROR: cannot delete '/data': Permission denied",
+            "cp: cannot open '/data/pg_control' for reading: Permission denied",
+        ];
+        for stderr in samples {
+            let err = classify_stderr("/vol/x", stderr);
+            assert!(
+                matches!(err, StorageError::PermissionDenied(_)),
+                "expected PermissionDenied for stderr {stderr:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// Non-permission errors must NOT get swallowed into PermissionDenied —
+    /// the fallback path is expensive (tar-streaming the whole data dir) and
+    /// must only trigger on the right failure class.
+    #[test]
+    fn classify_stderr_leaves_unrelated_errors_as_internal() {
+        let samples = [
+            "ERROR: no space left on device",
+            "ERROR: input/output error during snapshot",
+            "ERROR: quotacheck failed",
+        ];
+        for stderr in samples {
+            let err = classify_stderr("/vol/x", stderr);
+            assert!(
+                matches!(err, StorageError::Internal(_)),
+                "expected Internal for stderr {stderr:?}, got {err:?}"
+            );
+        }
+    }
     }
 }

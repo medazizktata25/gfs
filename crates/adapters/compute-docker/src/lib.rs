@@ -14,18 +14,47 @@
 pub mod containers;
 mod error;
 
-use std::path::Path;
+use std::io::ErrorKind;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
 use gfs_domain::ports::compute::{
-    Compute, ComputeDefinition, ComputeError, ExecOutput, InstanceConnectionInfo, InstanceId,
-    InstanceState, InstanceStatus, LogEntry, LogStream, LogsOptions, Result, RuntimeDescriptor,
-    StartOptions,
+    Compute, ComputeCapabilities, ComputeDefinition, ComputeError, ExecOutput,
+    InstanceConnectionInfo, InstanceId, InstanceState, InstanceStatus, LogEntry, LogStream,
+    LogsOptions, Result, RuntimeDescriptor, StartOptions,
 };
 use tracing::instrument;
 
-use crate::error::classify;
+use crate::error::{classify, classify_with_mount_path};
+
+/// Reject tar paths that could escape `dest` (`..`, absolute components, etc.).
+fn tar_stripped_path_is_safe(stripped: &Path) -> bool {
+    if stripped.as_os_str().is_empty() {
+        return false;
+    }
+    for c in stripped.components() {
+        match c {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return false,
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
+/// Validate a symlink target: must be non-empty, relative, and contain no `..` or root components.
+fn tar_link_target_is_safe(target: &Path) -> bool {
+    !target.as_os_str().is_empty()
+        && !target.is_absolute()
+        && target.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+}
 
 /// Host path string suitable for Docker bind mounts. Verbatim Windows paths
 /// (`\\?\...`) break Docker’s `host:container` parsing; map them to normal paths.
@@ -103,9 +132,80 @@ impl DockerCompute {
                 }
 
                 tracing::debug!("Docker connect error: {default_err}");
-                Err(ComputeError::NotAvailable("Docker".to_string()))
+                Err(ComputeError::NotAvailable(Self::format_connection_error(
+                    &default_err,
+                )))
             }
         }
+    }
+
+    /// Convert a bollard connection error into a user-friendly error message.
+    /// Detects common connection failure scenarios and provides actionable hints.
+    pub fn format_connection_error(err: &bollard::errors::Error) -> String {
+        let err_str = err.to_string();
+        let err_lower = err_str.to_ascii_lowercase();
+
+        let is_connection_error = err_lower.contains("connect")
+            || err_lower.contains("connection refused")
+            || err_lower.contains("connection reset")
+            || err_lower.contains("no such file")
+            || err_lower.contains("socket not found")
+            || err_lower.contains("permission denied")
+            || err_lower.contains("hyper legacy client");
+
+        if !is_connection_error {
+            return format!("Docker connection error: {}", err_str);
+        }
+
+        let is_permission_error =
+            err_lower.contains("permission denied") || err_lower.contains("access denied");
+
+        let is_socket_missing = err_lower.contains("no such file")
+            || err_lower.contains("socket not found")
+            || err_lower.contains("cannot connect");
+
+        #[cfg(unix)]
+        let hints = if is_permission_error {
+            vec![
+                "Docker/Podman daemon is running but current user lacks permissions",
+                "Add your user to the docker group: sudo usermod -aG docker $USER",
+                "Or run with sudo (not recommended for security)",
+                "For Podman rootless: ensure podman socket is accessible",
+            ]
+        } else if is_socket_missing {
+            vec![
+                "Docker/Podman daemon is not running",
+                "Start Docker: sudo systemctl start docker (or start Docker Desktop)",
+                "Start Podman: systemctl --user start podman.socket (for rootless)",
+                "Verify: docker ps or podman ps",
+            ]
+        } else {
+            vec![
+                "Docker/Podman daemon is not accessible",
+                "Check if Docker/Podman service is running",
+                "Verify socket permissions: ls -l /var/run/docker.sock",
+                "For Podman rootless: check XDG_RUNTIME_DIR/podman/podman.sock",
+            ]
+        };
+
+        #[cfg(windows)]
+        let hints = vec![
+            "Docker Desktop is not running",
+            "Start Docker Desktop from the Start menu",
+            "Verify Docker is running: docker ps",
+        ];
+
+        format!(
+            "GFS was not able to connect to Docker/Podman.\n\n\
+            Check the following:\n{}\n\n\
+            Original error: {}",
+            hints
+                .iter()
+                .map(|h| format!("- {}", h))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            err_str
+        )
     }
 
     #[cfg(unix)]
@@ -374,11 +474,12 @@ impl Compute for DockerCompute {
             .name(&name)
             .build();
 
+        let mount_path = definition.host_data_dir.clone();
         let _create = self
             .docker
             .create_container(Some(options), config)
             .await
-            .map_err(|e| classify(&name, e))?;
+            .map_err(|e| classify_with_mount_path(&name, e, mount_path))?;
 
         // Store the container name in config (not the ID) so that after restart/recreate
         // the same name can be used to look up the container; Docker assigns a new ID on recreate.
@@ -517,7 +618,15 @@ impl Compute for DockerCompute {
             if cmd.trim().is_empty() {
                 continue;
             }
-            self.run_exec_command(id, cmd).await?;
+            let out = self.run_exec_command(id, cmd, Some("0:0")).await?;
+            if out.exit_code != 0 {
+                return Err(ComputeError::Internal(format!(
+                    "prepare_for_snapshot command failed (exit {}): {}\nstderr: {}",
+                    out.exit_code,
+                    cmd,
+                    out.stderr.trim()
+                )));
+            }
         }
 
         if self.is_podman_engine().await
@@ -527,7 +636,15 @@ impl Compute for DockerCompute {
             // on the host. Ensure they are host-readable before filesystem snapshot.
             let escaped = data_mount.replace('\'', "'\"'\"'");
             let chmod_cmd = format!("chmod -R a+rX '{}'", escaped);
-            self.run_exec_command(id, &chmod_cmd).await?;
+            let out = self.run_exec_command(id, &chmod_cmd, Some("0:0")).await?;
+            if out.exit_code != 0 {
+                return Err(ComputeError::Internal(format!(
+                    "prepare_for_snapshot chmod failed (exit {}): {}\nstderr: {}",
+                    out.exit_code,
+                    chmod_cmd,
+                    out.stderr.trim()
+                )));
+            }
         }
 
         Ok(())
@@ -535,6 +652,17 @@ impl Compute for DockerCompute {
 
     async fn describe_runtime(&self) -> Result<RuntimeDescriptor> {
         self.describe_runtime_impl().await
+    }
+
+    async fn capabilities(&self) -> Result<ComputeCapabilities> {
+        Ok(ComputeCapabilities {
+            supports_stream_snapshot: true,
+            supports_exec_as_root: true,
+        })
+    }
+
+    async fn exec(&self, id: &InstanceId, command: &str, user: Option<&str>) -> Result<ExecOutput> {
+        self.run_exec_command(id, command, user).await
     }
 
     #[instrument(skip(self))]
@@ -792,6 +920,8 @@ impl Compute for DockerCompute {
             host_config: Some(host_config),
             entrypoint: Some(vec!["sh".into(), "-c".into()]),
             cmd: Some(vec![command.to_string()]),
+            // Honour the user override from the definition (e.g. "0:0" for root-level repair tasks).
+            user: definition.user.clone(),
             ..Default::default()
         };
 
@@ -799,10 +929,11 @@ impl Compute for DockerCompute {
             .name(&task_name)
             .build();
 
+        let mount_path = definition.host_data_dir.clone();
         self.docker
             .create_container(Some(create_opts), config)
             .await
-            .map_err(|e| classify(&task_name, e))?;
+            .map_err(|e| classify_with_mount_path(&task_name, e, mount_path))?;
 
         // 6. Connect to the linked instance's network if needed.
         if let Some(network) = &linked_network {
@@ -876,6 +1007,332 @@ impl Compute for DockerCompute {
 
         result
     }
+
+    /// Stream a container's data directory out through `docker cp` and extract
+    /// it into `dest`. Used as the permission-denied fallback when the host
+    /// user cannot read files inside a bind-mounted container data dir.
+    ///
+    /// # Equivalence vs host-path snapshots
+    ///
+    /// On restore, a snapshot produced by this function must be
+    /// indistinguishable from one produced by `storage.snapshot` (the host-path
+    /// `cp --reflink=auto -a`). Three properties are worth spelling out:
+    ///
+    /// * **Directory modes.** This function chmods created directories to `0755`
+    ///   during extraction; the host path preserves whatever mode cp `-a` copied.
+    ///   Both converge because `FileStorage::snapshot` / `finalize_snapshot`
+    ///   runs `chmod -R u+rX,u-w,go-rwx` on the final tree, normalizing every
+    ///   directory to `0500` regardless of the starting mode.
+    /// * **Ownership.** This function extracts files as the host user running
+    ///   gfs. The host path preserves the container UID (e.g. `postgres:999`).
+    ///   The two diverge on disk in the snapshot, but `pre_start_repair_data_dir`
+    ///   in the checkout use case chowns the restored workspace to the target
+    ///   UID on every container start, so restored DB state is equivalent.
+    /// * **Hard-link topology.** Both paths preserve hard links (`cp -a` honors
+    ///   them; tar archives encode hard-link entries, which we recreate via
+    ///   `std::fs::hard_link`). Divergence can only occur if the hard-link
+    ///   target hasn't been extracted yet (treated as a hard error — see the
+    ///   `InvalidData` branch below) or if `hard_link` fails with EXDEV — which
+    ///   is effectively unreachable because `src` and `dest_path` both live
+    ///   under `dest`. A `warn!` fires if the EXDEV branch ever runs.
+    ///
+    /// Mode/permission clamps on individual file entries are intentionally
+    /// suppressed via `set_preserve_permissions(false)` because tar headers
+    /// from Docker may contain UID-specific modes the host user cannot stat;
+    /// the final mode is established by `finalize_snapshot`.
+    #[instrument(skip(self))]
+    async fn stream_snapshot(
+        &self,
+        id: &InstanceId,
+        container_path: &str,
+        dest: &Path,
+    ) -> Result<()> {
+        let opts = bollard::query_parameters::DownloadFromContainerOptionsBuilder::default()
+            .path(container_path)
+            .build();
+
+        let dest = dest.to_path_buf();
+
+        // std::io::pipe() gives a synchronous (reader, writer) pair backed by
+        // an OS pipe — no heap allocation of the full archive.
+        // The writer end is fed from the async bollard stream; the reader end
+        // is consumed by `tar::Archive` inside a blocking thread.  Both sides
+        // run concurrently so back-pressure is handled by the OS pipe buffer.
+        let (pipe_reader, mut pipe_writer) = std::io::pipe().map_err(ComputeError::Io)?;
+
+        // Spawn the blocking unpack side first so the reader is already
+        // consuming when the writer starts filling the pipe.
+        let unpack = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
+            use std::io;
+            #[cfg(unix)]
+            use std::os::unix::fs::PermissionsExt;
+
+            fn chmod_best_effort(path: &std::path::Path, mode: u32) {
+                #[cfg(unix)]
+                {
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = mode;
+                    let _ = path;
+                }
+            }
+
+            fn repair_tree_for_removal(path: &std::path::Path) {
+                #[cfg(unix)]
+                {
+                    if let Ok(md) = std::fs::symlink_metadata(path) {
+                        if md.is_dir() {
+                            chmod_best_effort(path, 0o700);
+                            if let Ok(rd) = std::fs::read_dir(path) {
+                                for e in rd.flatten() {
+                                    repair_tree_for_removal(&e.path());
+                                }
+                            }
+                        } else {
+                            chmod_best_effort(path, 0o600);
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                }
+            }
+
+            // If a partial snapshot dir exists (from a failed host-side `cp` or a prior
+            // interrupted stream_snapshot run), repair any 000-mode dirs that would block
+            // traversal, then remove the whole tree so the fresh tar stream unpacks cleanly.
+            if dest.exists() {
+                repair_tree_for_removal(&dest);
+                let _ = std::fs::remove_dir_all(&dest);
+            }
+            std::fs::create_dir_all(&dest)?;
+            chmod_best_effort(&dest, 0o755);
+
+            let mut archive = tar::Archive::new(pipe_reader);
+            archive.set_preserve_permissions(false);
+            let mut files = 0usize;
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let ty = entry.header().entry_type();
+
+                // Compute path components for all entry types.
+                let raw_path = entry.path()?.into_owned();
+                // Strip the leading directory component Docker always adds.
+                let stripped: PathBuf = raw_path.components().skip(1).collect();
+                if stripped.as_os_str().is_empty() {
+                    continue;
+                }
+                if !tar_stripped_path_is_safe(&stripped) {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("refusing unsafe tar path: {}", stripped.display()),
+                    ));
+                }
+                let dest_path = dest.join(&stripped);
+
+                if ty.is_symlink() {
+                    let raw_target = entry
+                        .header()
+                        .link_name()?
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                ErrorKind::InvalidData,
+                                format!(
+                                    "stream_snapshot: symlink '{}' has no link target",
+                                    stripped.display()
+                                ),
+                            )
+                        })?
+                        .into_owned();
+
+                    if !tar_link_target_is_safe(&raw_target) {
+                        // Absolute or parent-escaping targets are legitimate in some DB setups
+                        // (e.g. PostgreSQL external tablespaces: pg_tblspc/<oid> → /mnt/...).
+                        // Capture the symlink as-is so the directory structure is preserved,
+                        // but warn that the target itself is not included in this snapshot.
+                        tracing::warn!(
+                            symlink = %stripped.display(),
+                            target = %raw_target.display(),
+                            "stream_snapshot: symlink points outside container data dir; \
+                             capturing dangling link (target is not snapshotted)"
+                        );
+                    }
+                    if let Some(parent) = dest_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                        chmod_best_effort(parent, 0o755);
+                    }
+                    #[cfg(unix)]
+                    {
+                        std::os::unix::fs::symlink(&raw_target, &dest_path)?;
+                        continue;
+                    }
+                    #[cfg(not(unix))]
+                    return Err(io::Error::new(
+                        ErrorKind::Unsupported,
+                        "stream_snapshot: symlinks not supported on this platform",
+                    ));
+                }
+
+                if ty.is_hard_link() {
+                    let raw_link = entry
+                        .header()
+                        .link_name()?
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                ErrorKind::InvalidData,
+                                format!(
+                                    "stream_snapshot: hard link '{}' has no source",
+                                    stripped.display()
+                                ),
+                            )
+                        })?
+                        .into_owned();
+                    let link_stripped: PathBuf = raw_link.components().skip(1).collect();
+                    if !tar_stripped_path_is_safe(&link_stripped) {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "stream_snapshot: hard link '{}' points to unsafe path",
+                                stripped.display()
+                            ),
+                        ));
+                    }
+                    let src = dest.join(&link_stripped);
+                    if !src.exists() {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "stream_snapshot: hard link '{}' references '{}' which has \
+                                 not yet been extracted — tar stream is out of order or the \
+                                 archive is incomplete. This can happen with certain Docker \
+                                 versions that emit links before their source; retrying the \
+                                 commit or upgrading Docker typically resolves it",
+                                stripped.display(),
+                                link_stripped.display()
+                            ),
+                        ));
+                    }
+                    if let Some(parent) = dest_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                        chmod_best_effort(parent, 0o755);
+                    }
+                    match std::fs::hard_link(&src, &dest_path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() != ErrorKind::PermissionDenied => {
+                            // Cross-device link (EXDEV), unsupported filesystem, etc.:
+                            // fall back to a regular copy so the snapshot still succeeds.
+                            //
+                            // This branch should be effectively unreachable: `src` and
+                            // `dest_path` are both below `dest` (the snapshot root), so
+                            // they share a filesystem. If this fires, the operator has
+                            // pointed `.gfs/snapshots/` at a path that crosses a mount
+                            // boundary — which breaks the hard-link topology guarantee
+                            // vs the host-snapshot path. Surfacing at `warn!` makes the
+                            // rare event observable in production logs.
+                            tracing::warn!(
+                                source = %src.display(),
+                                dest = %dest_path.display(),
+                                error = %e,
+                                "stream_snapshot: hard_link failed — falling back to copy; \
+                                 snapshot's hard-link topology will differ from the source \
+                                 (possible if .gfs/snapshots/ spans a mount boundary)"
+                            );
+                            std::fs::copy(&src, &dest_path)?;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    files += 1;
+                    continue;
+                }
+
+                // Positive allow-list: at this point we've already handled symlinks and
+                // hard links. Anything remaining must be a directory or a regular file
+                // (`is_file()` covers both `Regular` and `Continuous`). Block, char, fifo,
+                // and any future exotic type would otherwise fall through to
+                // `entry.unpack()` and could create device nodes on the host — a container
+                // compromise vector. Reject them explicitly.
+                if !ty.is_dir() && !ty.is_file() {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "stream_snapshot: refusing to extract unexpected tar entry \
+                             type {:?} for '{}'; database workspaces must contain only \
+                             regular files, directories, symlinks, and hard links",
+                            ty,
+                            stripped.display()
+                        ),
+                    ));
+                }
+
+                if ty.is_dir() {
+                    std::fs::create_dir_all(&dest_path)?;
+                    chmod_best_effort(&dest_path, 0o755);
+                } else {
+                    if let Some(parent) = dest_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                        chmod_best_effort(parent, 0o755);
+                    }
+                    entry.unpack(&dest_path)?;
+                    files += 1;
+                }
+            }
+            Ok(files)
+        });
+
+        // Drive the bollard stream into the pipe writer on the async side.
+        let container_name = id.0.clone();
+        let mut stream = self.docker.download_from_container(&id.0, Some(opts));
+        let write_result: Result<()> = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| classify(&container_name, e))?;
+                pipe_writer.write_all(&chunk).map_err(ComputeError::Io)?;
+            }
+            Ok(())
+        }
+        .await;
+
+        // Drop writer so the reader sees EOF and the unpack task can finish.
+        drop(pipe_writer);
+
+        let files = unpack
+            .await
+            .map_err(|e| ComputeError::Internal(format!("tar unpack task panicked: {e}")))?
+            .map_err(ComputeError::Io)?;
+
+        // Surface any stream error after the unpack has drained.
+        // Also guard against an empty archive — zero files means Docker returned
+        // an empty (or header-only) tar, which would commit an empty snapshot and
+        // cause the database to reinitialize on the next checkout (data loss).
+        if files == 0 {
+            return Err(ComputeError::Internal(format!(
+                "stream_snapshot: container '{container_path}' produced an empty archive \
+                 (0 regular files extracted); refusing to commit empty snapshot",
+                container_path = container_path,
+            )));
+        }
+        //
+        // When `tar::Archive` reaches the end-of-archive markers it may stop reading
+        // even if the Docker stream still has trailing padding bytes. That closes the
+        // read end of the pipe and can produce a BrokenPipe on the writer.
+        // This is harmless as long as extraction completed successfully.
+        if let Err(e) = write_result {
+            match &e {
+                ComputeError::Io(ioe) if ioe.kind() == std::io::ErrorKind::BrokenPipe => {}
+                _ => return Err(e),
+            }
+        }
+
+        tracing::info!(
+            container = %id.0,
+            container_path,
+            files,
+            "stream_snapshot: unpacked tar archive from container"
+        );
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -883,11 +1340,19 @@ impl Compute for DockerCompute {
 // ---------------------------------------------------------------------------
 
 impl DockerCompute {
-    async fn run_exec_command(&self, id: &InstanceId, cmd: &str) -> Result<()> {
+    async fn run_exec_command(
+        &self,
+        id: &InstanceId,
+        cmd: &str,
+        user: Option<&str>,
+    ) -> Result<ExecOutput> {
+        const MAX_CAPTURE_BYTES: usize = 256 * 1024; // per-stream cap
+
         let opts = bollard::exec::CreateExecOptions {
             cmd: Some(vec!["sh".into(), "-c".into(), cmd.to_string()]),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
+            user: user.map(|u| u.to_string()),
             ..Default::default()
         };
         let exec = self
@@ -896,6 +1361,10 @@ impl DockerCompute {
             .await
             .map_err(|e| classify(&id.0, e))?;
 
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut stdout_truncated = false;
+        let mut stderr_truncated = false;
         match self
             .docker
             .start_exec(&exec.id, None::<bollard::exec::StartExecOptions>)
@@ -903,10 +1372,30 @@ impl DockerCompute {
             .map_err(|e| classify(&id.0, e))?
         {
             bollard::exec::StartExecResults::Attached { output, .. } => {
-                output
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .map_err(|e| classify(&id.0, e))?;
+                let mut output = output;
+                while let Some(item) = output.next().await {
+                    let f = item.map_err(|e| classify(&id.0, e))?;
+                    match f {
+                        bollard::container::LogOutput::StdOut { message }
+                        | bollard::container::LogOutput::Console { message } => {
+                            if stdout.len() < MAX_CAPTURE_BYTES {
+                                let remaining = MAX_CAPTURE_BYTES - stdout.len();
+                                stdout.extend_from_slice(&message[..message.len().min(remaining)]);
+                            } else {
+                                stdout_truncated = true;
+                            }
+                        }
+                        bollard::container::LogOutput::StdErr { message } => {
+                            if stderr.len() < MAX_CAPTURE_BYTES {
+                                let remaining = MAX_CAPTURE_BYTES - stderr.len();
+                                stderr.extend_from_slice(&message[..message.len().min(remaining)]);
+                            } else {
+                                stderr_truncated = true;
+                            }
+                        }
+                        bollard::container::LogOutput::StdIn { .. } => {}
+                    }
+                }
             }
             bollard::exec::StartExecResults::Detached => {}
         }
@@ -917,14 +1406,23 @@ impl DockerCompute {
             .await
             .map_err(|e| classify(&id.0, e))?;
 
-        if inspect.exit_code != Some(0) {
-            return Err(gfs_domain::ports::compute::ComputeError::Internal(format!(
-                "prepare_for_snapshot command failed (exit {:?}): {}",
-                inspect.exit_code, cmd
-            )));
+        let mut stdout_s = String::from_utf8_lossy(&stdout).into_owned();
+        let mut stderr_s = String::from_utf8_lossy(&stderr).into_owned();
+        if stdout_truncated {
+            stdout_s.push_str("\n<stdout truncated>\n");
+        }
+        if stderr_truncated {
+            stderr_s.push_str("\n<stderr truncated>\n");
         }
 
-        Ok(())
+        Ok(ExecOutput {
+            exit_code: inspect
+                .exit_code
+                .and_then(|c| i32::try_from(c).ok())
+                .unwrap_or(-1),
+            stdout: stdout_s,
+            stderr: stderr_s,
+        })
     }
 
     async fn get_instance_data_mount_container_path(
@@ -978,8 +1476,36 @@ impl DockerCompute {
 }
 
 #[cfg(test)]
+mod tar_safety_tests {
+    use super::tar_link_target_is_safe;
+    use std::path::Path;
+
+    #[test]
+    fn relative_target_is_safe() {
+        assert!(tar_link_target_is_safe(Path::new("pg_wal")));
+        assert!(tar_link_target_is_safe(Path::new("./sub/dir")));
+    }
+
+    #[test]
+    fn empty_target_is_unsafe() {
+        assert!(!tar_link_target_is_safe(Path::new("")));
+    }
+
+    #[test]
+    fn absolute_target_is_unsafe() {
+        assert!(!tar_link_target_is_safe(Path::new("/tmp/external-wal")));
+    }
+
+    #[test]
+    fn parent_dir_component_is_unsafe() {
+        assert!(!tar_link_target_is_safe(Path::new("../escape")));
+        assert!(!tar_link_target_is_safe(Path::new("a/../../b")));
+    }
+}
+
+#[cfg(test)]
 mod host_path_tests {
-    use super::{host_path_for_docker_bind, resolve_host_bind_path};
+    use super::{DockerCompute, host_path_for_docker_bind, resolve_host_bind_path};
     use std::path::Path;
 
     #[test]
@@ -1015,5 +1541,95 @@ mod host_path_tests {
         let current = std::env::current_dir().expect("current dir");
         let resolved = resolve_host_bind_path(Path::new("target")).expect("resolve relative path");
         assert_eq!(resolved, current.join("target"));
+    }
+
+    #[test]
+    fn format_connection_error_connection_refused() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "connection refused".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("GFS was not able to connect to Docker/Podman"));
+        assert!(formatted.contains("Check the following"));
+        assert!(formatted.contains("connection refused"));
+    }
+
+    #[test]
+    fn format_connection_error_permission_denied() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 403,
+            message: "permission denied".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("GFS was not able to connect to Docker/Podman"));
+        #[cfg(unix)]
+        {
+            assert!(formatted.contains("permission denied"));
+            assert!(formatted.contains("docker group"));
+        }
+    }
+
+    #[test]
+    fn format_connection_error_socket_missing() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "no such file or directory".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("GFS was not able to connect to Docker/Podman"));
+        #[cfg(unix)]
+        {
+            assert!(formatted.contains("not running"));
+            assert!(formatted.contains("systemctl"));
+        }
+    }
+
+    #[test]
+    fn format_connection_error_bollard_socket_not_found() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "Socket not found: /var/run/docker.sock".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("GFS was not able to connect to Docker/Podman"));
+        #[cfg(unix)]
+        {
+            assert!(formatted.contains("not running"));
+            assert!(formatted.contains("systemctl"));
+        }
+    }
+
+    #[test]
+    fn format_connection_error_hyper_legacy_client() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "Error in the hyper legacy client: client error (Connect)".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("GFS was not able to connect to Docker/Podman"));
+        assert!(formatted.contains("hyper legacy client"));
+    }
+
+    #[test]
+    fn format_connection_error_generic_error() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "some other error".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("Docker connection error"));
+        assert!(formatted.contains("some other error"));
+    }
+
+    #[test]
+    fn format_connection_error_includes_original_error() {
+        let err = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "connection refused".to_string(),
+        };
+        let formatted = DockerCompute::format_connection_error(&err);
+        assert!(formatted.contains("Original error"));
+        assert!(formatted.contains("connection refused"));
     }
 }

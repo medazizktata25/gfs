@@ -7,7 +7,7 @@ use gfs_domain::repo_utils::repo_layout;
 use tempfile::tempdir;
 
 #[test]
-fn schema_diff_agentic_format_default() {
+fn postgres_schema_diff_agentic_format_default() {
     let tmp = tempdir().unwrap();
     let repo_path = tmp.path();
 
@@ -102,7 +102,7 @@ fn schema_diff_agentic_format_default() {
 }
 
 #[test]
-fn schema_diff_pretty_format() {
+fn postgres_schema_diff_pretty_format() {
     let tmp = tempdir().unwrap();
     let repo_path = tmp.path();
 
@@ -192,7 +192,7 @@ fn schema_diff_pretty_format() {
 }
 
 #[test]
-fn schema_diff_no_changes_exit_code() {
+fn postgres_schema_diff_no_changes_exit_code() {
     let tmp = tempdir().unwrap();
     let repo_path = tmp.path();
 
@@ -252,7 +252,7 @@ fn schema_diff_no_changes_exit_code() {
 }
 
 #[test]
-fn schema_diff_no_color_flag() {
+fn postgres_schema_diff_no_color_flag() {
     let tmp = tempdir().unwrap();
     let repo_path = tmp.path();
 
@@ -335,7 +335,7 @@ fn schema_diff_no_color_flag() {
 }
 
 #[test]
-fn schema_diff_json_format() {
+fn postgres_schema_diff_json_format() {
     let tmp = tempdir().unwrap();
     let repo_path = tmp.path();
 
@@ -465,7 +465,7 @@ fn schema_diff_json_format() {
 }
 
 #[test]
-fn schema_diff_json_no_changes() {
+fn postgres_schema_diff_json_no_changes() {
     let tmp = tempdir().unwrap();
     let repo_path = tmp.path();
 
@@ -535,7 +535,7 @@ fn schema_diff_json_no_changes() {
 }
 
 #[test]
-fn schema_diff_json_pretty_mutually_exclusive() {
+fn postgres_schema_diff_json_pretty_mutually_exclusive() {
     let tmp = tempdir().unwrap();
     let repo_path = tmp.path();
 

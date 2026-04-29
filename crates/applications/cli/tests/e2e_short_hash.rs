@@ -79,7 +79,7 @@ fn gfs_init_with_database(path: &Path, provider: &str, version: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn log_shows_short_hash_by_default() {
+fn postgres_log_shows_short_hash_by_default() {
     let tmp = tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
@@ -124,7 +124,7 @@ fn log_shows_short_hash_by_default() {
 }
 
 #[test]
-fn log_shows_full_hash_with_flag() {
+fn postgres_log_shows_full_hash_with_flag() {
     let tmp = tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
@@ -167,7 +167,7 @@ fn log_shows_full_hash_with_flag() {
 }
 
 #[test]
-fn checkout_accepts_short_hash() {
+fn postgres_checkout_accepts_short_hash() {
     let tmp = tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
@@ -206,7 +206,7 @@ fn checkout_accepts_short_hash() {
 }
 
 #[test]
-fn short_hash_works_with_tilde_notation() {
+fn postgres_short_hash_works_with_tilde_notation() {
     let tmp = tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 
@@ -263,7 +263,7 @@ fn short_hash_error_on_not_found() {
 }
 
 #[test]
-fn short_hash_minimum_length() {
+fn postgres_short_hash_minimum_length() {
     let tmp = tempdir().expect("create temp dir");
     let repo_path = tmp.path();
 

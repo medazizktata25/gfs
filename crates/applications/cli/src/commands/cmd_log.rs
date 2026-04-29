@@ -12,6 +12,7 @@ use serde_json::json;
 
 use crate::cli_utils::{get_repo_dir, list_branch_tips};
 use crate::output::{dimmed, gold, green};
+use crate::println_safe;
 
 // ---------------------------------------------------------------------------
 // Entry point called from main
@@ -96,7 +97,7 @@ async fn run_linear(
     for cwr in &commits {
         let dot_prefix = format!("  {}", gold("●"));
         let pipe_prefix = format!("  {}", dimmed("│"));
-        print_commit_block(cwr, full_hash, &dot_prefix, &pipe_prefix);
+        print_commit_block(cwr, full_hash, &dot_prefix, &pipe_prefix)?;
     }
 
     Ok(())
@@ -186,7 +187,7 @@ fn collect_dag(
 /// The algorithm tracks "active lanes" — each lane holds the hash of the next
 /// expected commit in that column. When a commit appears, it occupies its lane;
 /// its parents replace it in the active set.
-fn render_graph(commits: &[GraphCommit], full_hash: bool) {
+fn render_graph(commits: &[GraphCommit], full_hash: bool) -> std::io::Result<()> {
     // Active lanes: each slot holds a commit hash that we expect to see next.
     let mut lanes: Vec<String> = Vec::new();
 
@@ -259,12 +260,12 @@ fn render_graph(commits: &[GraphCommit], full_hash: bool) {
             commit: gc.commit.clone(),
             refs: gc.refs.clone(),
         };
-        print_commit_block(&cwr, full_hash, &commit_prefix, &continuation_prefix);
+        print_commit_block(&cwr, full_hash, &commit_prefix, &continuation_prefix)?;
 
         // Print convergence/merge line after the commit block.
         if !converge_cols.is_empty() {
             let merge_line = build_merge_line(&lanes, my_col, &converge_cols, num_lanes);
-            println!("{}", merge_line);
+            println_safe!("{}", merge_line)?;
         }
 
         // Trim trailing empty lanes.
@@ -272,6 +273,8 @@ fn render_graph(commits: &[GraphCommit], full_hash: bool) {
             lanes.pop();
         }
     }
+
+    Ok(())
 }
 
 /// Build the graph prefix for a commit line: ● in `col`, │ in other active lanes.
@@ -417,7 +420,7 @@ fn run_graph(
         return Ok(());
     }
 
-    render_graph(&commits, full_hash);
+    render_graph(&commits, full_hash)?;
 
     Ok(())
 }
@@ -451,7 +454,7 @@ fn print_commit_block(
     full_hash: bool,
     commit_prefix: &str,
     continuation_prefix: &str,
-) {
+) -> std::io::Result<()> {
     let hash_full = cwr
         .commit
         .hash
@@ -466,42 +469,38 @@ fn print_commit_block(
         format!("  ({})", cwr.refs.join(", "))
     };
 
-    // Commit line (● already in prefix for graph mode)
-    println!(
+    println_safe!(
         "{} {}{}",
         commit_prefix,
         dimmed(hash_display),
         green(refs_str)
-    );
+    )?;
 
-    // Author line
     let author = &cwr.commit.author;
     let author_email = cwr.commit.author_email.as_deref().unwrap_or("");
     if author_email.is_empty() {
-        println!("{} {} {}", continuation_prefix, dimmed("Author:"), author);
+        println_safe!("{} {} {}", continuation_prefix, dimmed("Author:"), author)?;
     } else {
-        println!(
+        println_safe!(
             "{} {} {} <{}>",
             continuation_prefix,
             dimmed("Author:"),
             author,
             dimmed(author_email)
-        );
+        )?;
     }
 
-    // Date line
     let date_str = cwr.commit.author_date.format("%a %b %e %H:%M:%S %Y %z");
-    println!("{} {}   {}", continuation_prefix, dimmed("Date:"), date_str);
+    println_safe!("{} {}   {}", continuation_prefix, dimmed("Date:"), date_str)?;
+    println_safe!("{}", continuation_prefix)?;
 
-    // Blank separator
-    println!("{}", continuation_prefix);
-
-    // Message body (indented)
     for line in cwr.commit.message.lines() {
-        println!("{}     {}", continuation_prefix, line);
+        println_safe!("{}     {}", continuation_prefix, line)?;
     }
     if !cwr.commit.message.ends_with('\n') && !cwr.commit.message.is_empty() {
-        println!("{}", continuation_prefix);
+        println_safe!("{}", continuation_prefix)?;
     }
-    println!("{}", continuation_prefix);
+    println_safe!("{}", continuation_prefix)?;
+
+    Ok(())
 }

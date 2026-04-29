@@ -373,7 +373,7 @@ fn count_commits_from_main(repo_path: &Path) -> usize {
 
 #[test]
 #[serial]
-fn test_01_init_config_validate_commit_log() {
+fn postgres_test_01_init_config_validate_commit_log() {
     install_panic_cleanup_hook();
     let repo_path = shared_repo_path();
 
@@ -433,7 +433,7 @@ fn test_01_init_config_validate_commit_log() {
 
 #[test]
 #[serial]
-fn test_02_pgbench_commit_compute_status() {
+fn postgres_test_02_pgbench_commit_compute_status() {
     let repo_path = shared_repo_path();
     let container_id = get_container_id(repo_path).expect("container should exist from test_01");
 
@@ -458,7 +458,7 @@ fn test_02_pgbench_commit_compute_status() {
     let (log_ok, log_stdout, log_stderr) = cli_runner::gfs_log(repo_path, Some(2));
     assert!(log_ok, "gfs log -n 2 should succeed; stderr: {log_stderr}");
     if !log_stdout.is_empty() {
-        let commit_count = log_stdout.matches("commit ").count();
+        let commit_count = log_stdout.matches('●').count();
         assert_eq!(
             commit_count, 2,
             "log should show 2 commits; got: {log_stdout}"
@@ -486,7 +486,7 @@ fn test_02_pgbench_commit_compute_status() {
 
 #[test]
 #[serial]
-fn test_03_checkout_previous_no_pgbench() {
+fn postgres_test_03_checkout_previous_no_pgbench() {
     let repo_path = shared_repo_path();
     let hash1 = get_first_commit_hash(repo_path);
 
@@ -530,7 +530,7 @@ fn test_03_checkout_previous_no_pgbench() {
 
 #[test]
 #[serial]
-fn test_04_checkout_head_has_pgbench() {
+fn postgres_test_04_checkout_head_has_pgbench() {
     let repo_path = shared_repo_path();
 
     let start = Instant::now();
@@ -584,7 +584,7 @@ fn test_04_checkout_head_has_pgbench() {
 
 #[test]
 #[serial]
-fn test_05_checkout_b_new_branch_has_pgbench() {
+fn postgres_test_05_checkout_b_new_branch_has_pgbench() {
     let repo_path = shared_repo_path();
     // We are on main at tip (with pgbench). Create a new branch from current HEAD.
     let (ok, stdout, stderr) = cli_runner::gfs_checkout_b(repo_path, "pgbench-branch", None);
@@ -639,7 +639,7 @@ fn test_05_checkout_b_new_branch_has_pgbench() {
 
 #[test]
 #[serial]
-fn test_06_checkout_back_to_main() {
+fn postgres_test_06_checkout_back_to_main() {
     let repo_path = shared_repo_path();
 
     let (ok, stdout, stderr) = cli_runner::gfs_checkout(repo_path, "main");
@@ -691,6 +691,6 @@ fn test_06_checkout_back_to_main() {
 /// Must run last (use `--test-threads=1`). One-off containers are removed by their guard on drop.
 #[test]
 #[serial]
-fn test_99_cleanup_main_container() {
+fn postgres_test_99_cleanup_main_container() {
     cleanup_main_container(shared_repo_path());
 }

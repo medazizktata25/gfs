@@ -6,13 +6,17 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 
 use crate::model::config::RuntimeConfig;
-use crate::ports::compute::{Compute, ComputeError, InstanceId, RuntimeDescriptor};
+use crate::ports::compute::{
+    Compute, ComputeCapabilities, ComputeDefinition, ComputeError, InstanceId, RuntimeDescriptor,
+};
 use crate::ports::database_provider::DatabaseProviderRegistry;
 use crate::ports::repository::{Repository, RepositoryError};
+use crate::repo_utils::repo_layout;
 use crate::utils::{current_user, data_dir};
 
 // ---------------------------------------------------------------------------
@@ -184,9 +188,20 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         definition.host_data_dir = Some(active.clone());
         #[cfg(unix)]
         {
-            definition.user = current_user::current_user_uid_gid();
+            match current_user::current_user_uid_gid() {
+                Some(uid_gid) => definition.user = Some(uid_gid),
+                None => tracing::warn!(
+                    "could not determine host uid:gid; container will run as its default user — \
+                     workspace files may be unreadable by the host user during snapshot"
+                ),
+            }
         }
         let compute_data_path = definition.data_dir.to_string_lossy().into_owned();
+        let repair_target = definition
+            .user
+            .clone()
+            .or_else(|| provider.data_dir_owner().map(str::to_string));
+        let startup_probes = provider.container_startup_probes();
 
         let current_bind = self
             .compute
@@ -202,12 +217,33 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             paths_differ(&active_str, current_bind.as_deref().unwrap_or(""))
         );
 
+        let repair_marker = repo_layout::repair_marker_path(std::path::Path::new(&active_str));
+        let repair_needed = repair_marker.as_ref().map(|m| m.exists()).unwrap_or(false);
+
         if !paths_differ(&active_str, current_bind.as_deref().unwrap_or("")) {
             tracing::info!("ensure_compute_started_after_checkout: starting existing container");
+            if repair_needed {
+                self.pre_start_repair_data_dir(
+                    &definition,
+                    &compute_data_path,
+                    repair_target.as_deref(),
+                    repair_marker.as_deref(),
+                )
+                .await;
+            }
             match self.compute.start(instance_id, Default::default()).await {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.repair_data_dir_permissions_in_container(
+                        instance_id,
+                        &compute_data_path,
+                        repair_target.as_deref(),
+                    )
+                    .await;
+                    self.assert_container_healthy(instance_id, startup_probes)
+                        .await?;
+                    return Ok(());
+                }
                 Err(ComputeError::NotFound(_)) => {
-                    // Container was removed externally; fall through to recreate it.
                     tracing::info!(
                         "ensure_compute_started_after_checkout: container not found, recreating"
                     );
@@ -224,7 +260,25 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             Err(e) => return Err(CheckoutRepoError::Compute(e)),
         }
         let new_id = self.compute.provision(&definition).await?;
+        // Always repair before first start of a new container — the workspace was just
+        // populated from snapshot and ownership may not match the DB process user.
+        self.pre_start_repair_data_dir(
+            &definition,
+            &compute_data_path,
+            repair_target.as_deref(),
+            repair_marker.as_deref(),
+        )
+        .await;
         let _ = self.compute.start(&new_id, Default::default()).await?;
+        // Belt-and-suspenders: also repair inside the running container.
+        self.repair_data_dir_permissions_in_container(
+            &new_id,
+            &compute_data_path,
+            repair_target.as_deref(),
+        )
+        .await;
+        self.assert_container_healthy(&new_id, startup_probes)
+            .await?;
         let runtime = self
             .compute
             .describe_runtime()
@@ -244,6 +298,159 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             )
             .await?;
         Ok(())
+    }
+
+    async fn assert_container_healthy(
+        &self,
+        instance_id: &InstanceId,
+        startup_probes: &[&'static str],
+    ) -> std::result::Result<(), CheckoutRepoError> {
+        if startup_probes.is_empty() {
+            return Ok(());
+        }
+
+        let caps = self
+            .compute
+            .capabilities()
+            .await
+            .unwrap_or(ComputeCapabilities {
+                supports_stream_snapshot: false,
+                supports_exec_as_root: false,
+            });
+        // Startup probes are connectivity checks (pg_isready, mysqladmin ping) that do
+        // not require root. When exec-as-root is unavailable, run as the container's
+        // default user so health is still verified — do not skip entirely.
+        let exec_user = if caps.supports_exec_as_root {
+            Some("0:0")
+        } else {
+            tracing::warn!(
+                instance = %instance_id,
+                "compute runtime cannot exec as root; running startup probes as default container user"
+            );
+            None
+        };
+
+        const PROBE_ATTEMPTS: u32 = 15;
+        const PROBE_SLEEP_MS: u64 = 200;
+
+        for probe in startup_probes {
+            let cmd = probe.trim();
+            if cmd.is_empty() {
+                continue;
+            }
+            let mut last_out = None;
+            let mut ok = false;
+            for attempt in 0..PROBE_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(PROBE_SLEEP_MS)).await;
+                }
+                let out = self
+                    .compute
+                    .exec(instance_id, cmd, exec_user)
+                    .await
+                    .map_err(CheckoutRepoError::Compute)?;
+                if out.exit_code == 0 {
+                    ok = true;
+                    break;
+                }
+                last_out = Some(out);
+            }
+            if !ok {
+                let out = last_out.unwrap();
+                return Err(CheckoutRepoError::Compute(ComputeError::Internal(format!(
+                    "database startup probe failed after {} attempts (exit {}): {}\nstdout: {}\nstderr: {}",
+                    PROBE_ATTEMPTS,
+                    out.exit_code,
+                    cmd,
+                    out.stdout.trim(),
+                    out.stderr.trim()
+                ))));
+            }
+        }
+        Ok(())
+    }
+
+    /// Best-effort pre-start permission repair via an ephemeral container.
+    ///
+    /// Spins up a throwaway container (same image + data-dir bind, running as root)
+    /// to `chown` + `chmod` the data directory _before_ the real container starts.
+    /// This is necessary when a prior `stream_snapshot` commit left files owned by the
+    /// host user rather than the database process user (e.g. `postgres:postgres`).
+    ///
+    /// Runs as root (`0:0`) so the operation succeeds regardless of current ownership.
+    /// Best-effort: logs and continues on failure so checkout is not blocked.
+    async fn pre_start_repair_data_dir(
+        &self,
+        definition: &ComputeDefinition,
+        container_data_path: &str,
+        chown_target: Option<&str>,
+        marker: Option<&std::path::Path>,
+    ) {
+        let Some(target) = chown_target.filter(|s| !s.trim().is_empty()) else {
+            return;
+        };
+        let escaped = container_data_path.replace('\'', "'\"'\"'");
+        let cmd = format!("chown -R {target} '{escaped}' && chmod -R 0700 '{escaped}'");
+
+        let mut repair_def = definition.clone();
+        repair_def.user = Some("0:0".to_string());
+
+        tracing::info!(
+            data_dir = container_data_path,
+            chown_target = target,
+            "pre_start_repair_data_dir: running pre-start chown via ephemeral container"
+        );
+
+        match self.compute.run_task(&repair_def, &cmd, None).await {
+            Ok(_) => {
+                if let Some(m) = marker {
+                    let _ = std::fs::remove_file(m);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    data_dir = container_data_path,
+                    "pre_start_repair_data_dir: repair task failed; container may fail to start"
+                );
+            }
+        }
+    }
+
+    /// Best-effort: ensure the DB process user can read/write its data dir.
+    ///
+    /// This is critical when snapshots were created via `stream_snapshot` because tar extraction
+    /// intentionally does not preserve container ownership/mode bits.
+    async fn repair_data_dir_permissions_in_container(
+        &self,
+        instance_id: &InstanceId,
+        container_data_path: &str,
+        chown_target: Option<&str>,
+    ) {
+        let Some(target) = chown_target.filter(|s| !s.trim().is_empty()) else {
+            return;
+        };
+        let escaped = container_data_path.replace('\'', "'\"'\"'");
+        let cmd = format!("chown -R {target} '{escaped}' && chmod -R 0700 '{escaped}'");
+        let caps = self.compute.capabilities().await.ok();
+        let can_root = caps.map(|c| c.supports_exec_as_root).unwrap_or(false);
+        if !can_root {
+            tracing::warn!(
+                instance = %instance_id,
+                data_dir = container_data_path,
+                "compute runtime cannot exec as root; cannot repair workspace permissions inside container"
+            );
+            return;
+        }
+
+        if let Err(e) = self.compute.exec(instance_id, &cmd, Some("0:0")).await {
+            tracing::warn!(
+                error = %e,
+                instance = %instance_id,
+                data_dir = container_data_path,
+                "failed to repair workspace permissions inside container; continuing"
+            );
+        }
     }
 }
 
@@ -1039,6 +1246,637 @@ mod tests {
         assert!(
             result.is_ok(),
             "checkout should recreate compute when container was removed: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Probe retry tests
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Compute mock whose `exec` fails `exec_fail_count` times before succeeding.
+    struct MockComputeWithProbeFailures {
+        exec_fail_remaining: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Compute for MockComputeWithProbeFailures {
+        async fn capabilities(&self) -> crate::ports::compute::Result<ComputeCapabilities> {
+            Ok(ComputeCapabilities {
+                supports_stream_snapshot: false,
+                supports_exec_as_root: true,
+            })
+        }
+        async fn exec(
+            &self,
+            _id: &InstanceId,
+            _command: &str,
+            _user: Option<&str>,
+        ) -> crate::ports::compute::Result<crate::ports::compute::ExecOutput> {
+            let remaining = self.exec_fail_remaining.load(Ordering::SeqCst);
+            if remaining > 0 {
+                self.exec_fail_remaining.fetch_sub(1, Ordering::SeqCst);
+                return Ok(crate::ports::compute::ExecOutput {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "not ready yet".into(),
+                });
+            }
+            Ok(crate::ports::compute::ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+        async fn provision(
+            &self,
+            _: &ComputeDefinition,
+        ) -> crate::ports::compute::Result<InstanceId> {
+            Ok(InstanceId("mock-probe".into()))
+        }
+        async fn start(
+            &self,
+            id: &InstanceId,
+            _: StartOptions,
+        ) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn stop(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Stopped,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn restart(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn status(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn prepare_for_snapshot(
+            &self,
+            _: &InstanceId,
+            _: &[String],
+        ) -> crate::ports::compute::Result<()> {
+            Ok(())
+        }
+        async fn logs(
+            &self,
+            _: &InstanceId,
+            _: crate::ports::compute::LogsOptions,
+        ) -> crate::ports::compute::Result<Vec<crate::ports::compute::LogEntry>> {
+            Ok(vec![])
+        }
+        async fn pause(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Paused,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn unpause(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn get_connection_info(
+            &self,
+            _id: &InstanceId,
+            port: u16,
+        ) -> crate::ports::compute::Result<crate::ports::compute::InstanceConnectionInfo> {
+            Ok(crate::ports::compute::InstanceConnectionInfo {
+                host: "127.0.0.1".into(),
+                port,
+                env: vec![],
+            })
+        }
+        async fn get_instance_data_mount_host_path(
+            &self,
+            _id: &InstanceId,
+            _: &str,
+        ) -> crate::ports::compute::Result<Option<PathBuf>> {
+            Ok(None)
+        }
+        async fn remove_instance(&self, _id: &InstanceId) -> crate::ports::compute::Result<()> {
+            Ok(())
+        }
+        async fn get_task_connection_info(
+            &self,
+            _id: &InstanceId,
+            port: u16,
+        ) -> crate::ports::compute::Result<crate::ports::compute::InstanceConnectionInfo> {
+            Ok(crate::ports::compute::InstanceConnectionInfo {
+                host: "172.17.0.2".into(),
+                port,
+                env: vec![],
+            })
+        }
+        async fn run_task(
+            &self,
+            _: &ComputeDefinition,
+            _: &str,
+            _: Option<&InstanceId>,
+        ) -> crate::ports::compute::Result<crate::ports::compute::ExecOutput> {
+            Ok(crate::ports::compute::ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Provider that exposes one startup probe so `assert_container_healthy` is exercised.
+    struct MockProviderWithProbe;
+
+    impl DatabaseProvider for MockProviderWithProbe {
+        fn name(&self) -> &str {
+            "postgres"
+        }
+        fn definition(&self) -> ComputeDefinition {
+            ComputeDefinition {
+                image: "postgres:17".into(),
+                env: vec![],
+                ports: vec![],
+                data_dir: PathBuf::from("/data"),
+                host_data_dir: None,
+                user: None,
+                logs_dir: None,
+                conf_dir: None,
+                args: vec![],
+            }
+        }
+        fn default_port(&self) -> u16 {
+            5432
+        }
+        fn default_args(&self) -> Vec<DatabaseProviderArg> {
+            vec![]
+        }
+        fn default_signal(&self) -> u32 {
+            SIGTERM
+        }
+        fn connection_string(
+            &self,
+            _: &ConnectionParams,
+        ) -> std::result::Result<String, ProviderError> {
+            Ok("postgres://localhost:5432".into())
+        }
+        fn supported_versions(&self) -> Vec<String> {
+            vec!["17".into()]
+        }
+        fn supported_features(&self) -> Vec<SupportedFeature> {
+            vec![]
+        }
+        fn prepare_for_snapshot(&self, _: &ConnectionParams) -> RegistryResult<Vec<String>> {
+            Ok(vec![])
+        }
+        fn query_client_command(
+            &self,
+            _: &ConnectionParams,
+            _: Option<&str>,
+        ) -> std::result::Result<std::process::Command, ProviderError> {
+            Ok(std::process::Command::new("true"))
+        }
+        fn container_startup_probes(&self) -> &'static [&'static str] {
+            &["pg_isready -U postgres"]
+        }
+    }
+
+    struct MockRegistryWithProbeProvider;
+
+    impl DatabaseProviderRegistry for MockRegistryWithProbeProvider {
+        fn register(&self, _: Arc<dyn DatabaseProvider>) -> RegistryResult<()> {
+            Ok(())
+        }
+        fn get(&self, name: &str) -> Option<Arc<dyn DatabaseProvider>> {
+            if name.eq_ignore_ascii_case("postgres") {
+                Some(Arc::new(MockProviderWithProbe))
+            } else {
+                None
+            }
+        }
+        fn list(&self) -> Vec<String> {
+            vec!["postgres".into()]
+        }
+        fn unregister(&self, _: &str) -> Option<Arc<dyn DatabaseProvider>> {
+            None
+        }
+    }
+
+    /// Probe fails 3 times then succeeds on the 4th attempt — checkout must return Ok.
+    #[tokio::test]
+    async fn checkout_probe_succeeds_after_retries() {
+        let repo = MockRepositoryWithEnv {
+            current_commit: "abc123".into(),
+        };
+        let compute = MockComputeWithProbeFailures {
+            exec_fail_remaining: AtomicUsize::new(3),
+        };
+        let usecase = CheckoutRepoUseCase::new(
+            Arc::new(repo),
+            Arc::new(compute),
+            Arc::new(MockRegistryWithProbeProvider),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let result = usecase
+            .run(dir.path().to_path_buf(), "main".into(), None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "probe should succeed after 3 retries: {result:?}"
+        );
+    }
+
+    /// Probe fails more times than the retry budget (20 > 15) — checkout must return Err.
+    #[tokio::test]
+    async fn checkout_probe_fails_after_exhausting_retries() {
+        let repo = MockRepositoryWithEnv {
+            current_commit: "abc123".into(),
+        };
+        let compute = MockComputeWithProbeFailures {
+            exec_fail_remaining: AtomicUsize::new(20),
+        };
+        let usecase = CheckoutRepoUseCase::new(
+            Arc::new(repo),
+            Arc::new(compute),
+            Arc::new(MockRegistryWithProbeProvider),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let result = usecase
+            .run(dir.path().to_path_buf(), "main".into(), None)
+            .await;
+        assert!(
+            matches!(result, Err(CheckoutRepoError::Compute(_))),
+            "probe should fail after exhausting retries: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Probes as default container user when exec-as-root unavailable
+    // -----------------------------------------------------------------------
+
+    /// A compute mock with `supports_exec_as_root = false` that succeeds immediately.
+    struct MockComputeNoRootSuccess;
+
+    #[async_trait]
+    impl Compute for MockComputeNoRootSuccess {
+        async fn capabilities(&self) -> crate::ports::compute::Result<ComputeCapabilities> {
+            Ok(ComputeCapabilities {
+                supports_stream_snapshot: false,
+                supports_exec_as_root: false,
+            })
+        }
+        async fn exec(
+            &self,
+            _id: &InstanceId,
+            _command: &str,
+            _user: Option<&str>,
+        ) -> crate::ports::compute::Result<crate::ports::compute::ExecOutput> {
+            Ok(crate::ports::compute::ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+        async fn provision(
+            &self,
+            _: &ComputeDefinition,
+        ) -> crate::ports::compute::Result<InstanceId> {
+            Ok(InstanceId("mock-no-root".into()))
+        }
+        async fn start(
+            &self,
+            id: &InstanceId,
+            _: StartOptions,
+        ) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn stop(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Stopped,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn restart(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn status(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn prepare_for_snapshot(
+            &self,
+            _: &InstanceId,
+            _: &[String],
+        ) -> crate::ports::compute::Result<()> {
+            Ok(())
+        }
+        async fn logs(
+            &self,
+            _: &InstanceId,
+            _: crate::ports::compute::LogsOptions,
+        ) -> crate::ports::compute::Result<Vec<crate::ports::compute::LogEntry>> {
+            Ok(vec![])
+        }
+        async fn pause(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Paused,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn unpause(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn get_connection_info(
+            &self,
+            _id: &InstanceId,
+            port: u16,
+        ) -> crate::ports::compute::Result<crate::ports::compute::InstanceConnectionInfo> {
+            Ok(crate::ports::compute::InstanceConnectionInfo {
+                host: "127.0.0.1".into(),
+                port,
+                env: vec![],
+            })
+        }
+        async fn get_instance_data_mount_host_path(
+            &self,
+            _id: &InstanceId,
+            _: &str,
+        ) -> crate::ports::compute::Result<Option<PathBuf>> {
+            Ok(None)
+        }
+        async fn remove_instance(&self, _id: &InstanceId) -> crate::ports::compute::Result<()> {
+            Ok(())
+        }
+        async fn get_task_connection_info(
+            &self,
+            _id: &InstanceId,
+            port: u16,
+        ) -> crate::ports::compute::Result<crate::ports::compute::InstanceConnectionInfo> {
+            Ok(crate::ports::compute::InstanceConnectionInfo {
+                host: "172.17.0.2".into(),
+                port,
+                env: vec![],
+            })
+        }
+        async fn run_task(
+            &self,
+            _: &ComputeDefinition,
+            _: &str,
+            _: Option<&InstanceId>,
+        ) -> crate::ports::compute::Result<crate::ports::compute::ExecOutput> {
+            Ok(crate::ports::compute::ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// A compute mock with `supports_exec_as_root = false` that always fails exec.
+    struct MockComputeNoRootFail;
+
+    #[async_trait]
+    impl Compute for MockComputeNoRootFail {
+        async fn capabilities(&self) -> crate::ports::compute::Result<ComputeCapabilities> {
+            Ok(ComputeCapabilities {
+                supports_stream_snapshot: false,
+                supports_exec_as_root: false,
+            })
+        }
+        async fn exec(
+            &self,
+            _id: &InstanceId,
+            _command: &str,
+            _user: Option<&str>,
+        ) -> crate::ports::compute::Result<crate::ports::compute::ExecOutput> {
+            Ok(crate::ports::compute::ExecOutput {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "db not ready".into(),
+            })
+        }
+        async fn provision(
+            &self,
+            _: &ComputeDefinition,
+        ) -> crate::ports::compute::Result<InstanceId> {
+            Ok(InstanceId("mock-no-root-fail".into()))
+        }
+        async fn start(
+            &self,
+            id: &InstanceId,
+            _: StartOptions,
+        ) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn stop(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Stopped,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn restart(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn status(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn prepare_for_snapshot(
+            &self,
+            _: &InstanceId,
+            _: &[String],
+        ) -> crate::ports::compute::Result<()> {
+            Ok(())
+        }
+        async fn logs(
+            &self,
+            _: &InstanceId,
+            _: crate::ports::compute::LogsOptions,
+        ) -> crate::ports::compute::Result<Vec<crate::ports::compute::LogEntry>> {
+            Ok(vec![])
+        }
+        async fn pause(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Paused,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn unpause(&self, id: &InstanceId) -> crate::ports::compute::Result<InstanceStatus> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: InstanceState::Running,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            })
+        }
+        async fn get_connection_info(
+            &self,
+            _id: &InstanceId,
+            port: u16,
+        ) -> crate::ports::compute::Result<crate::ports::compute::InstanceConnectionInfo> {
+            Ok(crate::ports::compute::InstanceConnectionInfo {
+                host: "127.0.0.1".into(),
+                port,
+                env: vec![],
+            })
+        }
+        async fn get_instance_data_mount_host_path(
+            &self,
+            _id: &InstanceId,
+            _: &str,
+        ) -> crate::ports::compute::Result<Option<PathBuf>> {
+            Ok(None)
+        }
+        async fn remove_instance(&self, _id: &InstanceId) -> crate::ports::compute::Result<()> {
+            Ok(())
+        }
+        async fn get_task_connection_info(
+            &self,
+            _id: &InstanceId,
+            port: u16,
+        ) -> crate::ports::compute::Result<crate::ports::compute::InstanceConnectionInfo> {
+            Ok(crate::ports::compute::InstanceConnectionInfo {
+                host: "172.17.0.2".into(),
+                port,
+                env: vec![],
+            })
+        }
+        async fn run_task(
+            &self,
+            _: &ComputeDefinition,
+            _: &str,
+            _: Option<&InstanceId>,
+        ) -> crate::ports::compute::Result<crate::ports::compute::ExecOutput> {
+            Ok(crate::ports::compute::ExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// When `supports_exec_as_root = false`, probes still run (as default container
+    /// user) and checkout succeeds when the probe returns exit_code 0.
+    #[tokio::test]
+    async fn checkout_probe_runs_as_default_user_when_no_root_exec() {
+        let repo = MockRepositoryWithEnv {
+            current_commit: "abc123".into(),
+        };
+        let usecase = CheckoutRepoUseCase::new(
+            Arc::new(repo),
+            Arc::new(MockComputeNoRootSuccess),
+            Arc::new(MockRegistryWithProbeProvider),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let result = usecase
+            .run(dir.path().to_path_buf(), "main".into(), None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "probes should succeed as default user when exec-as-root is unavailable: {result:?}"
+        );
+    }
+
+    /// When `supports_exec_as_root = false`, a failing probe must still cause
+    /// checkout to return `Err` — health is not silently skipped.
+    #[tokio::test]
+    async fn checkout_probe_fails_as_default_user() {
+        let repo = MockRepositoryWithEnv {
+            current_commit: "abc123".into(),
+        };
+        let usecase = CheckoutRepoUseCase::new(
+            Arc::new(repo),
+            Arc::new(MockComputeNoRootFail),
+            Arc::new(MockRegistryWithProbeProvider),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let result = usecase
+            .run(dir.path().to_path_buf(), "main".into(), None)
+            .await;
+        assert!(
+            matches!(result, Err(CheckoutRepoError::Compute(_))),
+            "failing probe as default user should surface an error: {result:?}"
         );
     }
 }

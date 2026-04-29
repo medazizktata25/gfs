@@ -4,8 +4,8 @@
 //!
 //! | Platform | `snapshot` / `clone` | Read-only lock | `status` / `quota` |
 //! |---|---|---|---|
-//! | macOS | `cp -cRp` (APFS clonefile COW) | `chmod -R a-w` | `diskutil info` / `df -k` |
-//! | Linux | `cp --reflink=auto -a` (Btrfs/XFS COW or deep copy) | `chmod -R a-w` | `df --block-size=1` |
+//! | macOS | `cp -cRp` (APFS clonefile COW) | `chmod -R u+rX,u-w,go-rwx` | `diskutil info` / `df -k` |
+//! | Linux | `cp --reflink=auto -a` (Btrfs/XFS COW or deep copy) | `chmod -R u+rX,u-w,go-rwx` | `df --block-size=1` |
 //! | Windows | `robocopy /E /COPY:DAT` | `attrib +R /S /D` | PowerShell `Get-PSDrive` |
 //!
 //! # mount / unmount
@@ -49,6 +49,14 @@ use tokio::process::Command;
 use tracing::instrument;
 
 use crate::error::classify_stderr;
+
+fn map_copy_error(stderr: &str, msg: String) -> StorageError {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("permission denied") || lower.contains("operation not permitted") {
+        return StorageError::PermissionDenied(msg);
+    }
+    StorageError::Internal(msg)
+}
 
 // ---------------------------------------------------------------------------
 // FileStorage (public struct, cross-platform)
@@ -102,18 +110,21 @@ impl FileStorage {
 async fn make_read_only(path: &Path) -> Result<()> {
     let out = Command::new("chmod")
         .arg("-R")
-        .arg("a-w")
+        .arg("u+rX,u-w,go-rwx")
         .arg(path)
         .output()
         .await
         .map_err(StorageError::Io)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(StorageError::Internal(format!(
-            "chmod -R a-w '{}' failed: {}",
-            path.display(),
-            stderr.trim()
-        )));
+        return Err(map_copy_error(
+            &stderr,
+            format!(
+                "chmod -R u+rX,u-w,go-rwx '{}' failed: {}",
+                path.display(),
+                stderr.trim()
+            ),
+        ));
     }
     Ok(())
 }
@@ -205,6 +216,8 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
 
     let output = Command::new(prog)
         .args(&args)
+        // Avoid locale-dependent stderr parsing (permission denied classification).
+        .env("LANG", "C")
         .output()
         .await
         .map_err(StorageError::Io)?;
@@ -218,7 +231,7 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
     if !success {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(StorageError::Internal(format!(
+        let msg = format!(
             "copy '{}' -> '{}' failed: {}{}",
             src,
             dst,
@@ -228,7 +241,8 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
             } else {
                 String::new()
             }
-        )));
+        );
+        return Err(map_copy_error(&stderr, msg));
     }
     Ok(())
 }
@@ -469,6 +483,10 @@ impl StoragePort for FileStorage {
                 free_bytes: 0,
             })
         }
+    }
+
+    async fn finalize_snapshot(&self, dest: &Path) -> Result<()> {
+        make_read_only(dest).await
     }
 }
 
