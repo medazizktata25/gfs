@@ -12,9 +12,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::model::config::GfsConfig;
-use crate::model::datasource::{Column, DatasourceMetadata, Schema, Table};
+use crate::model::datasource::{Column, DatasourceMetadata, Schema, Table, TablePrimaryKey};
 use crate::ports::compute::{Compute, ComputeError, InstanceId};
-use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
+use crate::ports::database_provider::{ConnectionParams, DatabaseProvider, DatabaseProviderRegistry};
+use crate::repo_utils::repo_layout;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -101,6 +102,17 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
             })?
             .to_string();
 
+        // 2. Resolve provider.
+        let provider = self
+            .registry
+            .get(&provider_name)
+            .ok_or_else(|| ExtractSchemaError::ProviderNotFound(provider_name.clone()))?;
+
+        // 3. For file-based providers (e.g. SQLite) skip the container path entirely.
+        if !provider.requires_compute() {
+            return self.run_file_based(path, &*provider).await;
+        }
+
         let container_name = config
             .runtime
             .as_ref()
@@ -112,12 +124,6 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
                 )
             })?
             .to_string();
-
-        // 2. Resolve provider.
-        let provider = self
-            .registry
-            .get(&provider_name)
-            .ok_or_else(|| ExtractSchemaError::ProviderNotFound(provider_name.clone()))?;
 
         let instance_id = InstanceId(container_name);
 
@@ -162,6 +168,221 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
             parse_schema_output(&output.stdout).map_err(ExtractSchemaError::ExtractionFailed)?;
 
         // 7. Build metadata.
+        let metadata = DatasourceMetadata {
+            version,
+            driver: provider_name,
+            schemas,
+            tables,
+            columns,
+            views: None,
+            functions: None,
+            indexes: None,
+            triggers: None,
+            materialized_views: None,
+            types: None,
+            foreign_tables: None,
+            policies: None,
+            table_privileges: None,
+            column_privileges: None,
+            config: None,
+            publications: None,
+            roles: None,
+            extensions: None,
+        };
+
+        Ok(SchemaOutput { metadata })
+    }
+
+    /// Extract schema for file-based providers (e.g. SQLite) without a compute container.
+    ///
+    /// Runs `schema_extraction_queries()` via the host `sqlite3` CLI and assembles
+    /// `Table`/`Column`/`Schema` structs from the JSON output.
+    async fn run_file_based(
+        &self,
+        repo_path: &Path,
+        provider: &dyn DatabaseProvider,
+    ) -> Result<SchemaOutput, ExtractSchemaError> {
+        let provider_name = provider.name().to_string();
+
+        let workspace_data_dir = repo_layout::get_active_workspace_data_dir(repo_path)
+            .map_err(|e| ExtractSchemaError::NotConfigured(e.to_string()))?;
+
+        let db_path = workspace_data_dir.join("db.sqlite");
+
+        let queries = provider.schema_extraction_queries();
+        if queries.is_empty() {
+            return Err(ExtractSchemaError::ExtractionFailed(format!(
+                "provider '{}' does not support schema extraction",
+                provider_name
+            )));
+        }
+
+        let run_query = |sql: &str| -> Result<String, ExtractSchemaError> {
+            let output = std::process::Command::new("sqlite3")
+                .arg(&db_path)
+                .arg(sql)
+                .output()
+                .map_err(|e| {
+                    ExtractSchemaError::QueryFailed(format!("sqlite3 not found: {}", e))
+                })?;
+            if !output.status.success() {
+                return Err(ExtractSchemaError::QueryFailed(
+                    String::from_utf8_lossy(&output.stderr).to_string(),
+                ));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        };
+
+        // Version
+        let version_json = queries
+            .get("version")
+            .map(|q| run_query(q))
+            .transpose()?
+            .unwrap_or_default();
+        let version = if version_json.is_empty() {
+            "3".to_string()
+        } else {
+            let v: serde_json::Value = serde_json::from_str(&version_json)
+                .map_err(|e| ExtractSchemaError::JsonParsing(e.to_string()))?;
+            v.get("version")
+                .and_then(|s| s.as_str())
+                .unwrap_or("3")
+                .to_string()
+        };
+
+        // Tables: [{name, type}]
+        let tables_json = queries
+            .get("tables")
+            .map(|q| run_query(q))
+            .transpose()?
+            .unwrap_or_else(|| "[]".to_string());
+        let raw_tables: Vec<serde_json::Value> = if tables_json.is_empty() {
+            vec![]
+        } else {
+            serde_json::from_str(&tables_json)
+                .map_err(|e| ExtractSchemaError::JsonParsing(e.to_string()))?
+        };
+
+        // Columns: [{table, cid, name, type, notnull, dflt_value, pk}]
+        let columns_json = queries
+            .get("columns")
+            .map(|q| run_query(q))
+            .transpose()?
+            .unwrap_or_else(|| "[]".to_string());
+        let raw_columns: Vec<serde_json::Value> = if columns_json.is_empty() {
+            vec![]
+        } else {
+            serde_json::from_str(&columns_json)
+                .map_err(|e| ExtractSchemaError::JsonParsing(e.to_string()))?
+        };
+
+        // Build Tables with stable numeric IDs (position in list).
+        let mut tables: Vec<Table> = raw_tables
+            .iter()
+            .enumerate()
+            .map(|(idx, t)| {
+                let name = t
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Table {
+                    id: idx as i64 + 1,
+                    schema: "main".to_string(),
+                    name,
+                    rls_enabled: false,
+                    rls_forced: false,
+                    bytes: 0,
+                    size: "0 bytes".to_string(),
+                    live_rows_estimate: 0,
+                    dead_rows_estimate: 0,
+                    comment: None,
+                    primary_keys: vec![],
+                    relationships: vec![],
+                    columns: None,
+                }
+            })
+            .collect();
+
+        // Build Columns, also collecting primary key info per table.
+        let mut columns: Vec<Column> = Vec::new();
+        for raw_col in &raw_columns {
+            let table_name = raw_col
+                .get("table")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let table_id = tables
+                .iter()
+                .find(|t| t.name == table_name)
+                .map(|t| t.id)
+                .unwrap_or(0);
+            let cid = raw_col
+                .get("cid")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let col_name = raw_col
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let data_type = raw_col
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let notnull = raw_col
+                .get("notnull")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let dflt_value = raw_col.get("dflt_value").cloned().and_then(|v| {
+                if v.is_null() { None } else { Some(v) }
+            });
+            let pk = raw_col
+                .get("pk")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+
+            // Register primary key on the table struct.
+            if pk > 0 {
+                if let Some(tbl) = tables.iter_mut().find(|t| t.id == table_id) {
+                    tbl.primary_keys.push(TablePrimaryKey {
+                        table_id,
+                        name: col_name.clone(),
+                        schema: "main".to_string(),
+                        table_name: table_name.clone(),
+                    });
+                }
+            }
+
+            columns.push(Column {
+                id: format!("{}.{}", table_id, cid),
+                table_id,
+                schema: "main".to_string(),
+                table: table_name,
+                name: col_name,
+                ordinal_position: cid as i32,
+                data_type: data_type.clone(),
+                format: data_type.to_lowercase(),
+                is_identity: false,
+                identity_generation: None,
+                is_generated: false,
+                is_nullable: notnull == 0,
+                is_updatable: true,
+                is_unique: pk > 0,
+                check: None,
+                default_value: dflt_value,
+                enums: vec![],
+                comment: None,
+            });
+        }
+
+        let schemas = vec![Schema {
+            id: 1,
+            name: "main".to_string(),
+            owner: "main".to_string(),
+        }];
+
         let metadata = DatasourceMetadata {
             version,
             driver: provider_name,

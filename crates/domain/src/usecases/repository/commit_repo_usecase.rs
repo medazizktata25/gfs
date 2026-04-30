@@ -386,7 +386,7 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
 
         // 2. Extract and store schema (best-effort) while the container is still running.
         //    Must run before pausing, since schema extraction requires a live database connection.
-        let schema_hash = if runtime_config.is_some() && environment.is_some() {
+        let schema_hash = if environment.is_some() {
             self.extract_and_store_schema(&path).await.ok()
         } else {
             None
@@ -696,32 +696,54 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
             e
         })?;
 
-        // 2. Export schema DDL using ExportRepoUseCase with "schema" format.
-        let export_use_case = ExportRepoUseCase::new(self.compute.clone(), self.registry.clone());
-        let temp_dir = repo_path.join(".gfs").join("tmp").join(format!(
-            "gfs-schema-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(temp_dir.parent().unwrap()).map_err(|e| {
-            tracing::warn!("Failed to create temp directory: {}", e);
-            Box::new(std::io::Error::other(format!(
-                "cannot create temp directory: {}",
-                e
-            ))) as Box<dyn std::error::Error>
-        })?;
-        let export_output = export_use_case
-            .run(repo_path, Some(temp_dir.clone()), "schema")
-            .await
-            .map_err(|e| {
-                tracing::warn!("Schema DDL export failed: {}", e);
+        // 2. Get schema DDL: for file-based providers (no container) use sqlite3 .schema;
+        //    for container providers use ExportRepoUseCase as before.
+        let config = crate::model::config::GfsConfig::load(repo_path)
+            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error>)?;
+
+        let schema_sql = if config.runtime.is_none() {
+            // File-based provider (SQLite): dump DDL with sqlite3 .schema
+            let workspace_data_dir = repo_layout::get_active_workspace_data_dir(repo_path)
+                .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error>)?;
+            let db_path = workspace_data_dir.join("db.sqlite");
+            let out = std::process::Command::new("sqlite3")
+                .arg(&db_path)
+                .arg(".schema")
+                .output()
+                .map_err(|e| {
+                    tracing::warn!("sqlite3 .schema failed: {}", e);
+                    Box::new(e) as Box<dyn std::error::Error>
+                })?;
+            String::from_utf8_lossy(&out.stdout).to_string()
+        } else {
+            // Container provider: run export sidecar.
+            let export_use_case = ExportRepoUseCase::new(self.compute.clone(), self.registry.clone());
+            let temp_dir = repo_path.join(".gfs").join("tmp").join(format!(
+                "gfs-schema-{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ));
+            std::fs::create_dir_all(temp_dir.parent().unwrap()).map_err(|e| {
+                tracing::warn!("Failed to create temp directory: {}", e);
+                Box::new(std::io::Error::other(format!(
+                    "cannot create temp directory: {}",
+                    e
+                ))) as Box<dyn std::error::Error>
+            })?;
+            let export_output = export_use_case
+                .run(repo_path, Some(temp_dir.clone()), "schema")
+                .await
+                .map_err(|e| {
+                    tracing::warn!("Schema DDL export failed: {}", e);
+                    e
+                })?;
+            let sql = std::fs::read_to_string(&export_output.file_path).map_err(|e| {
+                tracing::warn!("Failed to read exported schema DDL: {}", e);
                 e
             })?;
-
-        let schema_sql = std::fs::read_to_string(&export_output.file_path).map_err(|e| {
-            tracing::warn!("Failed to read exported schema DDL: {}", e);
-            e
-        })?;
+            let _ = std::fs::remove_dir_all(temp_dir);
+            sql
+        };
 
         // 3. Store schema object in repo.
         let schema_hash =
@@ -730,9 +752,6 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     tracing::warn!("Failed to write schema object: {}", e);
                     e
                 })?;
-
-        // 4. Cleanup temp directory.
-        let _ = std::fs::remove_dir_all(temp_dir);
 
         tracing::info!("Schema stored with hash: {}", schema_hash);
         Ok(schema_hash)
