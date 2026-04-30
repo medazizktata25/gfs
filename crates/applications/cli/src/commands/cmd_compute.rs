@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use gfs_compute_docker::DockerCompute;
 use gfs_domain::model::config::{GfsConfig, RuntimeConfig};
 use gfs_domain::ports::compute::{
-    Compute, InstanceId, InstanceState, InstanceStatus, LogsOptions, RuntimeDescriptor,
+    Compute, ComputeCapabilities, ExecOutput, InstanceId, InstanceState, InstanceStatus,
+    LogsOptions, RuntimeDescriptor,
 };
 use gfs_domain::ports::database_provider::{
     DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
@@ -409,16 +411,16 @@ async fn start_restart_or_recreate(
 ) -> Result<(InstanceId, InstanceStatus)> {
     let active = match repo_layout::get_active_workspace_data_dir(repo_path) {
         Ok(p) => p.to_string_lossy().into_owned(),
-        Err(_) => return just_start_or_restart(compute, instance_id, restart_if_same).await,
+        Err(_) => return just_start_or_restart(compute, instance_id, restart_if_same, &[]).await,
     };
 
     let config = match GfsConfig::load(repo_path) {
         Ok(c) => c,
-        Err(_) => return just_start_or_restart(compute, instance_id, restart_if_same).await,
+        Err(_) => return just_start_or_restart(compute, instance_id, restart_if_same, &[]).await,
     };
     let provider_name = match &config.environment {
         Some(e) if !e.database_provider.is_empty() => e.database_provider.as_str(),
-        _ => return just_start_or_restart(compute, instance_id, restart_if_same).await,
+        _ => return just_start_or_restart(compute, instance_id, restart_if_same, &[]).await,
     };
 
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
@@ -438,11 +440,25 @@ async fn start_restart_or_recreate(
         .await
     {
         Ok(Some(p)) => p.to_string_lossy().into_owned(),
-        _ => return just_start_or_restart(compute, instance_id, restart_if_same).await,
+        _ => {
+            return just_start_or_restart(
+                compute,
+                instance_id,
+                restart_if_same,
+                provider.container_startup_probes(),
+            )
+            .await;
+        }
     };
 
     if !paths_differ(&active, &current_bind) {
-        return just_start_or_restart(compute, instance_id, restart_if_same).await;
+        return just_start_or_restart(
+            compute,
+            instance_id,
+            restart_if_same,
+            provider.container_startup_probes(),
+        )
+        .await;
     }
 
     compute.stop(instance_id).await?;
@@ -474,6 +490,7 @@ async fn start_restart_or_recreate(
     }
     let new_id = compute.provision(&definition).await?;
     let status = compute.start(&new_id, Default::default()).await?;
+    assert_compute_healthy(compute, &new_id, provider.container_startup_probes()).await?;
     let runtime = compute
         .describe_runtime()
         .await
@@ -499,13 +516,75 @@ async fn just_start_or_restart(
     compute: &DockerCompute,
     instance_id: &InstanceId,
     restart: bool,
+    startup_probes: &[&'static str],
 ) -> Result<(InstanceId, InstanceStatus)> {
     let status = if restart {
         compute.restart(instance_id).await?
     } else {
         compute.start(instance_id, Default::default()).await?
     };
+    assert_compute_healthy(compute, instance_id, startup_probes).await?;
     Ok((instance_id.clone(), status))
+}
+
+async fn assert_compute_healthy(
+    compute: &dyn Compute,
+    instance_id: &InstanceId,
+    startup_probes: &[&'static str],
+) -> Result<()> {
+    if startup_probes.is_empty() {
+        return Ok(());
+    }
+    let caps = compute.capabilities().await.unwrap_or(ComputeCapabilities {
+        supports_stream_snapshot: false,
+        supports_exec_as_root: false,
+    });
+    let exec_user = if caps.supports_exec_as_root {
+        Some("0:0")
+    } else {
+        tracing::warn!(
+            instance = %instance_id,
+            "compute runtime cannot exec as root; running startup probes as default container user"
+        );
+        None
+    };
+
+    const PROBE_ATTEMPTS: u32 = 15;
+    const PROBE_SLEEP_MS: u64 = 200;
+
+    for probe in startup_probes {
+        let cmd = probe.trim();
+        if cmd.is_empty() {
+            continue;
+        }
+        let mut last_out: Option<ExecOutput> = None;
+        let mut ok = false;
+        for attempt in 0..PROBE_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(PROBE_SLEEP_MS)).await;
+            }
+            match compute.exec(instance_id, cmd, exec_user).await {
+                Ok(out) if out.exit_code == 0 => {
+                    ok = true;
+                    break;
+                }
+                Ok(out) => last_out = Some(out),
+                Err(_) => {}
+            }
+        }
+        if !ok {
+            let out = last_out.unwrap();
+            return Err(anyhow::anyhow!(
+                "database startup probe failed after {} attempts (exit {}): {}\nstdout: {}\nstderr: {}",
+                PROBE_ATTEMPTS,
+                out.exit_code,
+                cmd,
+                out.stdout.trim(),
+                out.stderr.trim()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn paths_differ(a: &str, b: &str) -> bool {
