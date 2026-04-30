@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gfs_compute_docker::DockerCompute;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
 use gfs_domain::model::status::StatusResponse;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
@@ -12,6 +11,7 @@ use gfs_domain::ports::repository::Repository;
 use gfs_domain::usecases::repository::status_repo_usecase::StatusRepoUseCase;
 
 use crate::cli_utils::{get_repo_dir, relativize_to_repo};
+use crate::commands::compute_support::compute_for_repo;
 use crate::output::{
     BOX_V, bold, box_bottom, box_row, box_top, cyan, dimmed, fmt_box_row, fmt_box_row_colored,
     green, red, yellow,
@@ -26,7 +26,7 @@ pub async fn run(path: Option<PathBuf>, output: String) -> Result<i32> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
 
     let repository: Arc<dyn Repository> = Arc::new(GfsRepository::new());
-    let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
+    let compute = compute_for_repo(&repository, &repo_path).await?;
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     gfs_compute_docker::containers::register_all(registry.as_ref())
         .context("failed to register database providers")?;

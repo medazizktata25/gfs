@@ -874,7 +874,7 @@ mod tests {
                 .as_nanos()
         ));
 
-        if !is_btrfs(&base.parent().unwrap_or_else(|| Path::new("."))) {
+        if !is_btrfs(base.parent().unwrap_or_else(|| Path::new("."))) {
             return;
         }
 
@@ -950,6 +950,6 @@ mod tests {
                 matches!(err, StorageError::Internal(_)),
                 "expected Internal for stderr {stderr:?}, got {err:?}"
             );
+        }
     }
-}
 }
