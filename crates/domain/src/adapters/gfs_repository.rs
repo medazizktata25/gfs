@@ -593,14 +593,20 @@ impl Repository for GfsRepository {
             .join(&workspace_segment)
             .join(WORKSPACE_DATA_DIR);
 
-        // Only populate from snapshot when the workspace does not exist (preserve live DB state in branch workspace).
-        let workspace_exists = workspace_path.exists();
+        // Always restore workspace from snapshot — discard any uncommitted changes.
+        // This ensures deterministic checkout behavior regardless of prior workspace state.
         tracing::info!(
             "Checkout: workspace_path={:?}, exists={}",
             workspace_path,
-            workspace_exists
+            workspace_path.exists()
         );
-        if !workspace_exists {
+        if workspace_path.exists() {
+            // Make files writable before removal (snapshot files may be mode 0400).
+            let _ = set_workspace_dir_permissions(&workspace_path);
+            fs::remove_dir_all(&workspace_path).map_err(RepositoryError::Io)?;
+            tracing::info!("Checkout: removed existing workspace for fresh restore");
+        }
+        {
             let commit = repo_layout::get_commit_from_hash(&repo, &commit_hash).map_err(map_err)?;
             let snapshot_hash = commit.snapshot_hash;
             let snapshot_dir = repo

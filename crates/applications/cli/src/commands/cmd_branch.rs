@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use gfs_compute_docker::DockerCompute;
 use gfs_domain::adapters::gfs_repository::GfsRepository;
-use gfs_domain::model::layout::{GFS_DIR, HEADS_DIR, REFS_DIR};
+use gfs_domain::model::layout::{GFS_DIR, HEADS_DIR, REFS_DIR, WORKSPACES_DIR};
 use gfs_domain::ports::compute::Compute;
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::ports::repository::Repository;
@@ -258,6 +258,12 @@ fn delete_branch(repo_path: &std::path::Path, name: &str, json_output: bool) -> 
 
     std::fs::remove_file(&ref_path)
         .with_context(|| format!("failed to delete branch ref '{}'", name))?;
+
+    // Remove workspace directory so a future branch with the same name starts from a clean snapshot.
+    let workspace_dir = repo_path.join(GFS_DIR).join(WORKSPACES_DIR).join(name);
+    if workspace_dir.exists() {
+        let _ = std::fs::remove_dir_all(&workspace_dir);
+    }
 
     // Clean up empty parent directories (for nested branches like feature/foo).
     let mut parent = ref_path.parent();
