@@ -344,15 +344,15 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
                 .unwrap_or(0);
 
             // Register primary key on the table struct.
-            if pk > 0 {
-                if let Some(tbl) = tables.iter_mut().find(|t| t.id == table_id) {
-                    tbl.primary_keys.push(TablePrimaryKey {
-                        table_id,
-                        name: col_name.clone(),
-                        schema: "main".to_string(),
-                        table_name: table_name.clone(),
-                    });
-                }
+            if pk > 0
+                && let Some(tbl) = tables.iter_mut().find(|t| t.id == table_id)
+            {
+                tbl.primary_keys.push(TablePrimaryKey {
+                    table_id,
+                    name: col_name.clone(),
+                    schema: "main".to_string(),
+                    table_name: table_name.clone(),
+                });
             }
 
             columns.push(Column {
