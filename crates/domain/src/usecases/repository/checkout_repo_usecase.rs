@@ -330,8 +330,12 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             None
         };
 
-        const PROBE_ATTEMPTS: u32 = 15;
-        const PROBE_SLEEP_MS: u64 = 200;
+        // Postgres cold-start on Windows Docker Desktop / WSL2 routinely
+        // exceeds 3 s — bind-mount + initdb on the 9P layer is slow. Probe
+        // for up to ~60 s so first-time checkouts after a snapshot land
+        // before failing.
+        const PROBE_ATTEMPTS: u32 = 120;
+        const PROBE_SLEEP_MS: u64 = 500;
 
         for probe in startup_probes {
             let cmd = probe.trim();

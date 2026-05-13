@@ -23,12 +23,18 @@ fn wants_json(args: &[String]) -> bool {
 
 #[tokio::main]
 async fn main() {
+    // Tracing goes to stderr by default. CLI consumers that scrape stderr for
+    // error messages can override the level via RUST_LOG to silence INFO logs,
+    // or via GFS_LOG to a stricter default. WARN+ERROR always pass through so
+    // genuine failures are visible. ANSI is suppressed when stderr is not a tty
+    let default_filter = std::env::var("GFS_LOG").unwrap_or_else(|_| "warn".to_string());
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
         )
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 
     let args: Vec<String> = std::env::args().collect();

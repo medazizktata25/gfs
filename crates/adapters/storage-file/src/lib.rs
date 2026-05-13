@@ -187,6 +187,17 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
             .map_err(StorageError::Io)?;
     }
 
+    // Windows: strip the `\\?\` extended-length-path prefix that
+    // `std::fs::canonicalize` injects. Robocopy treats `\\?\C:\...` as a UNC
+    // network path and fails with ERROR_BAD_NETPATH (53) when creating the
+    // destination directory.
+    #[cfg(target_os = "windows")]
+    fn strip_ext_prefix(s: &str) -> &str {
+        s.strip_prefix(r"\\?\").unwrap_or(s)
+    }
+    #[cfg(target_os = "windows")]
+    let (src, dst) = (strip_ext_prefix(src), strip_ext_prefix(dst));
+
     #[cfg(target_os = "macos")]
     let (prog, args): (&str, Vec<&str>) = ("cp", vec!["-cRp", src, dst]);
 
@@ -195,6 +206,11 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     let (prog, args): (&str, Vec<&str>) = {
+        // /R and /W cap robocopy's default retry behavior (1,000,000 retries
+        // × 30s wait) which otherwise hangs indefinitely on any file that is
+        // still locked at copy time — e.g. PGDATA files held by the database
+        // container if pause did not fully freeze writers under Docker
+        // Desktop / WSL2. Three quick retries surface real failures fast.
         (
             "robocopy",
             vec![
@@ -202,6 +218,8 @@ async fn copy_dir(src: &str, dst: &str) -> Result<()> {
                 dst,
                 "/E",
                 "/COPY:DAT",
+                "/R:3",
+                "/W:1",
                 "/NFL",
                 "/NDL",
                 "/NJH",
