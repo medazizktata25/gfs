@@ -17,7 +17,9 @@ use crate::ports::compute::{
 use crate::ports::database_provider::DatabaseProviderRegistry;
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::repo_utils::repo_layout;
-use crate::utils::{current_user, data_dir};
+#[cfg(unix)]
+use crate::utils::current_user;
+use crate::utils::data_dir;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -333,9 +335,15 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         // Postgres cold-start on Windows Docker Desktop / WSL2 routinely
         // exceeds 3 s — bind-mount + initdb on the 9P layer is slow. Probe
         // for up to ~60 s so first-time checkouts after a snapshot land
-        // before failing.
+        // before failing. Tests use a tiny budget to stay fast.
+        #[cfg(not(test))]
         const PROBE_ATTEMPTS: u32 = 120;
+        #[cfg(not(test))]
         const PROBE_SLEEP_MS: u64 = 500;
+        #[cfg(test)]
+        const PROBE_ATTEMPTS: u32 = 15;
+        #[cfg(test)]
+        const PROBE_SLEEP_MS: u64 = 10;
 
         for probe in startup_probes {
             let cmd = probe.trim();
