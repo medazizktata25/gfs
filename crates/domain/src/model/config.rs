@@ -170,7 +170,19 @@ impl RepoCredentials {
     pub fn save(&self, repo_path: &Path) -> Result<(), RepoError> {
         let content =
             toml::to_string_pretty(self).map_err(|e| RepoError::InvalidConfig(e.to_string()))?;
-        std::fs::write(Self::path(repo_path), content)?;
+        let path = Self::path(repo_path);
+        std::fs::write(&path, content)?;
+        // This sidecar holds the management role's password in cleartext, so
+        // restrict it to the owner (0600) instead of the default-umask 0644 an
+        // ordinary write would leave. Re-pinned on every write, because an
+        // overwrite does not reset an existing file's mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms)?;
+        }
         Ok(())
     }
 
@@ -442,5 +454,44 @@ mod tests {
         assert!(s.contains("docker"));
         assert!(s.contains("24"));
         assert!(s.contains("abc123"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_credentials_saved_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
+        let creds = RepoCredentials {
+            user: Some("guepard-admin".into()),
+            password: Some("s3cr3t".into()),
+            name: Some("postgres".into()),
+        };
+        creds.save(dir.path()).unwrap();
+        let path = dir.path().join(GFS_DIR).join("credentials.toml");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "credentials.toml must be 0600, got {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_credentials_save_repins_0600_on_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(GFS_DIR)).unwrap();
+        let creds = RepoCredentials {
+            user: Some("guepard-admin".into()),
+            password: Some("first".into()),
+            name: None,
+        };
+        creds.save(dir.path()).unwrap();
+        let path = dir.path().join(GFS_DIR).join("credentials.toml");
+        // Loosen the mode behind save's back, then an overwrite must re-pin 0600.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        creds.save(dir.path()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "overwrite must re-pin 0600, got {mode:o}");
     }
 }
