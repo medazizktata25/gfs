@@ -43,6 +43,17 @@ const DEFAULT_DB: &str = "postgres";
 /// The rewrite truncates the file in place to preserve its owner and `0600` mode,
 /// is guarded by a marker line for idempotency, and leaves the reload to the
 /// caller (a following `SELECT pg_reload_conf()`).
+///
+/// GUARDRAIL — the loopback allow rules use `trust` (passwordless). That is safe
+/// only while a client role cannot itself open a loopback connection as the
+/// management super: client roles are `NOSUPERUSER`, so they cannot install a
+/// connection-capable extension (`dblink`, `postgres_fdw`), create an untrusted
+/// PL, or `COPY ... PROGRAM`. If any of those ever becomes reachable by a client
+/// (e.g. the platform pre-installs `dblink`/`postgres_fdw` and grants usage),
+/// passwordless loopback `trust` becomes a superuser-escalation path and these
+/// rules MUST switch to `scram-sha-256`. That change is drop-in: the exec seam
+/// always connects with `PGPASSWORD` set (see `query_in_instance_command`), so it
+/// keeps working once the management role has a non-empty password.
 const RESTRICT_MGMT_ROLE_TO_LOOPBACK: &str = concat!(
     r#"HBA="${PGDATA:-/var/lib/postgresql/data}/pg_hba.conf"; "#,
     r#"ADMIN="${POSTGRES_USER:-postgres}"; "#,
@@ -233,6 +244,15 @@ impl PostgresqlProvider {
         Ok(format!(
             r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -v ON_ERROR_STOP=1 -c "{escaped}""#
         ))
+    }
+
+    /// Wrap a built management command so its `psql` session runs with `search_path`
+    /// pinned to `pg_catalog, pg_temp`. A client role holds `CREATE` on `public`, so
+    /// an unqualified name a privileged statement resolves could otherwise be
+    /// shadowed by a client-created object in `public` (CVE-2018-1058). Customer
+    /// `/query` never goes through this — it keeps the default `search_path`.
+    fn pin_mgmt_search_path(command: String) -> String {
+        format!(r#"PGOPTIONS="-c search_path=pg_catalog,pg_temp" {command}"#)
     }
 }
 
@@ -668,7 +688,9 @@ impl DatabaseProvider for PostgresqlProvider {
             ));
         }
         // Wrap in a transaction so create+grants are atomic (fixes v2 partial-state).
-        self.query_in_instance_command(&format!("BEGIN;\n{sql}\nCOMMIT;"), None)
+        Ok(Self::pin_mgmt_search_path(
+            self.query_in_instance_command(&format!("BEGIN;\n{sql}\nCOMMIT;"), None)?,
+        ))
     }
 
     fn alter_password_command(
@@ -677,10 +699,10 @@ impl DatabaseProvider for PostgresqlProvider {
         password: &str,
     ) -> std::result::Result<String, ProviderError> {
         let ident = pg_quote_ident(username)?;
-        self.query_in_instance_command(
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
             &format!("ALTER ROLE {ident} WITH PASSWORD '{}';", sql_lit(password)),
             None,
-        )
+        )?))
     }
 
     fn drop_role_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
@@ -693,12 +715,12 @@ impl DatabaseProvider for PostgresqlProvider {
         // created (it now owns no objects, so nothing is destroyed). `DROP ROLE`
         // then succeeds instead of failing with "objects depend on it".
         // Transactional so a partial drop can't leave a half-removed role.
-        self.query_in_instance_command(
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
             &format!(
                 "BEGIN;\nREASSIGN OWNED BY {ident} TO CURRENT_USER;\nDROP OWNED BY {ident};\nDROP ROLE {ident};\nCOMMIT;"
             ),
             None,
-        )
+        )?))
     }
 
     fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {
@@ -735,14 +757,14 @@ impl DatabaseProvider for PostgresqlProvider {
         // in one transaction. `create_role` does not need this (a fresh role has
         // nothing to reset).
         let reset = pg_preset_reset_sql(&ident, owner.as_deref());
-        self.query_in_instance_command(
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
             &format!(
                 "BEGIN;\n{reset}\n{}\nCOMMENT ON ROLE {ident} IS 'gfs-preset:{}';\nCOMMIT;",
                 pg_preset_sql(&ident, preset, owner.as_deref()),
                 preset.as_str()
             ),
             None,
-        )
+        )?))
     }
 
     fn bootstrap_deploy_env_command(
@@ -772,7 +794,7 @@ impl DatabaseProvider for PostgresqlProvider {
              COMMIT;",
             pw = sql_lit(&spec.owner_password),
         );
-        let bootstrap = self.query_in_instance_command(&sql, None)?;
+        let bootstrap = Self::pin_mgmt_search_path(self.query_in_instance_command(&sql, None)?);
         // Confine the management superuser (`${POSTGRES_USER}`) to the container's
         // loopback exec seam. It is the platform's management root and is never
         // handed to a client, so even a leaked credential must not reach the
@@ -801,7 +823,9 @@ impl DatabaseProvider for PostgresqlProvider {
         )?;
         // Transactional so a multi-statement grant (+ optional default-privileges
         // line) is atomic — no partial grant on failure (fixes v2 gap).
-        self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"), None)
+        Ok(Self::pin_mgmt_search_path(
+            self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"), None)?,
+        ))
     }
 
     fn revoke_command(&self, spec: &RevokeSpec) -> std::result::Result<String, ProviderError> {
@@ -814,7 +838,9 @@ impl DatabaseProvider for PostgresqlProvider {
             spec.cascade,
             None,
         )?;
-        self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"), None)
+        Ok(Self::pin_mgmt_search_path(
+            self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"), None)?,
+        ))
     }
 
     fn list_privileges_command(&self, role: &str) -> std::result::Result<String, ProviderError> {
@@ -1576,6 +1602,62 @@ mod tests {
         assert!(cmd_db.contains("-d 'myapp'"));
         assert!(!cmd_db.contains("${POSTGRES_DB"));
         assert!(!cmd.starts_with("psql postgresql://"));
+
+        // Customer `/query` must keep the default search_path (it relies on
+        // resolving unqualified names in `public`) — no management pin.
+        assert!(
+            !cmd.contains("PGOPTIONS"),
+            "customer query path must not pin search_path"
+        );
+    }
+
+    #[test]
+    fn management_ddl_pins_search_path_off_public() {
+        use gfs_domain::model::db_user::{
+            GrantSpec, GrantableObject, Privilege, RolePreset, RoleSpec,
+        };
+        let provider = PostgresqlProvider::new();
+        const PIN: &str = r#"PGOPTIONS="-c search_path=pg_catalog,pg_temp""#;
+
+        // Every privileged DDL builder runs its psql session with search_path
+        // pinned to pg_catalog so a client-created object in `public` cannot
+        // shadow an unqualified name the statement resolves (CVE-2018-1058).
+        let create = provider
+            .create_role_command(&RoleSpec {
+                username: "app_rw".into(),
+                password: "pw".into(),
+                preset: Some(RolePreset::Readwrite),
+                default_privileges_owner: None,
+            })
+            .expect("create");
+        assert!(create.contains(PIN), "create_role pins search_path");
+
+        let alter = provider
+            .alter_password_command("app_rw", "new")
+            .expect("alter");
+        assert!(alter.contains(PIN), "alter_password pins search_path");
+
+        let drop = provider.drop_role_command("app_rw").expect("drop");
+        assert!(drop.contains(PIN), "drop_role pins search_path");
+
+        let preset = provider
+            .apply_preset_command("app_rw", RolePreset::Readonly, Some("owner"))
+            .expect("preset");
+        assert!(preset.contains(PIN), "apply_preset pins search_path");
+
+        let grant = provider
+            .grant_command(&GrantSpec {
+                role: "app_rw".into(),
+                object: GrantableObject::Table {
+                    schema: "public".into(),
+                    name: "t".into(),
+                },
+                privileges: vec![Privilege::Select],
+                with_grant_option: false,
+                apply_to_future: None,
+            })
+            .expect("grant");
+        assert!(grant.contains(PIN), "grant pins search_path");
     }
 
     #[test]
