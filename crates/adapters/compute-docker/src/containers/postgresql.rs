@@ -2523,4 +2523,122 @@ mod tests {
             "SELECT must be gone after the emitted REVOKE"
         );
     }
+
+    #[test]
+    fn mgmt_pin_blinds_privileged_session_to_public_shadow_on_live_pg() {
+        // CVE-2018-1058 defense, end-to-end on a real server. A privileged
+        // (management) psql session must resolve unqualified names off
+        // `pg_catalog`, so a client-planted object in `public` cannot shadow a
+        // name a privileged statement resolves. The customer `/query` path keeps
+        // `public` (it needs it), so the same planted object stays visible there
+        // — proving the pin is scoped to privileged DDL, not a blanket change.
+        if !docker_available() {
+            eprintln!(
+                "SKIP mgmt_pin_blinds_privileged_session_to_public_shadow_on_live_pg: docker unavailable"
+            );
+            return;
+        }
+        let provider = PostgresqlProvider::new();
+        let cn = format!("gfs-searchpath-live-{}", std::process::id());
+        let docker = |args: &[&str]| {
+            std::process::Command::new("docker")
+                .args(args)
+                .output()
+                .expect("docker")
+        };
+        let exec_sql = |cn: &str, sql: &str| {
+            std::process::Command::new("docker")
+                .args(["exec", cn, "psql", "-U", "postgres", "-tAc", sql])
+                .output()
+                .expect("docker exec psql")
+        };
+        let exec_shell = |cn: &str, cmd: &str| {
+            std::process::Command::new("docker")
+                .args(["exec", cn, "sh", "-c", cmd])
+                .output()
+                .expect("docker exec sh")
+        };
+
+        let _ = docker(&["rm", "-f", &cn]);
+        let run = docker(&[
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &cn,
+            "-e",
+            "POSTGRES_PASSWORD=postgres",
+            "postgres:17",
+        ]);
+        assert!(
+            run.status.success(),
+            "docker run: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        let mut ready = false;
+        for _ in 0..30 {
+            if docker(&["exec", &cn, "pg_isready", "-U", "postgres"])
+                .status
+                .success()
+            {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
+        // An attacker with CREATE on `public` plants a function whose unqualified
+        // name a naive privileged statement might resolve.
+        exec_sql(
+            &cn,
+            "CREATE FUNCTION public.evil() RETURNS text LANGUAGE sql AS $$ SELECT 'PWNED'::text $$;",
+        );
+
+        // A management-pinned session reports its locked-down search_path.
+        let show_pinned = PostgresqlProvider::pin_mgmt_search_path(
+            provider
+                .query_in_instance_command("SHOW search_path;", None)
+                .unwrap(),
+        );
+        let show_pinned_out = exec_shell(&cn, &show_pinned);
+
+        // Unqualified resolution of the planted object across both paths.
+        let sel = "SELECT evil();";
+        let customer = provider.query_in_instance_command(sel, None).unwrap();
+        let mgmt = PostgresqlProvider::pin_mgmt_search_path(
+            provider.query_in_instance_command(sel, None).unwrap(),
+        );
+        let customer_out = exec_shell(&cn, &customer);
+        let mgmt_out = exec_shell(&cn, &mgmt);
+
+        // Clean up BEFORE asserting so a failed assert never leaks the container.
+        let _ = docker(&["rm", "-f", &cn]);
+
+        assert!(ready, "postgres never became ready");
+
+        let show = String::from_utf8_lossy(&show_pinned_out.stdout);
+        assert!(
+            show.contains("pg_catalog") && !show.contains("public"),
+            "management session must run with search_path pinned off public, got: {show}"
+        );
+        assert!(
+            customer_out.status.success()
+                && String::from_utf8_lossy(&customer_out.stdout).contains("PWNED"),
+            "customer path keeps `public` and resolves the planted object (stdout={}, stderr={})",
+            String::from_utf8_lossy(&customer_out.stdout),
+            String::from_utf8_lossy(&customer_out.stderr),
+        );
+        assert!(
+            !mgmt_out.status.success(),
+            "management pin must make the planted public.evil() unresolvable (stdout={}, stderr={})",
+            String::from_utf8_lossy(&mgmt_out.stdout),
+            String::from_utf8_lossy(&mgmt_out.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&mgmt_out.stderr).contains("does not exist"),
+            "the pinned session must fail with a name-resolution error, got stderr: {}",
+            String::from_utf8_lossy(&mgmt_out.stderr),
+        );
+    }
 }
