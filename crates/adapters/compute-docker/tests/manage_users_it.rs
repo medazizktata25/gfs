@@ -506,3 +506,62 @@ async fn rekey_from_vault_restores_current_password_over_a_stale_one_on_live_pg(
         "the stale snapshot password must no longer authenticate after re-key"
     );
 }
+
+/// Re-key must be best-effort per user: a role whose vault key the (lowercase-only)
+/// vault rejects — e.g. an uppercase-named user, which the platform's username
+/// charset allows — must be skipped, NOT fail-close the whole checkout. Regression
+/// guard for the "one out-of-charset user bricks every version swap" bug.
+#[tokio::test]
+async fn rekey_skips_out_of_charset_username_without_bricking_on_live_pg() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    let pg = Postgres::start();
+    // An uppercase-named login role (its `userpw_App_RW` key is rejected by the
+    // lowercase-only vault) beside a normal lowercase user that has a vault entry.
+    pg.psql(
+        "CREATE ROLE \"App_RW\" LOGIN PASSWORD 'upper_stays_1234'; \
+         CREATE ROLE app_ro LOGIN PASSWORD 'ro_old_1234';",
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repositories_dir = tmp.path().join("repositories");
+    let (org, project, db) = ("acme", "proj", "db-mixedcase");
+    let repo = repositories_dir.join(org).join(project).join(db);
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    write_repo(&repo, pg.name());
+    gfs_domain::utils::credential_vault::RepoCredentialVault::put(
+        &repositories_dir,
+        org,
+        project,
+        db,
+        "userpw_app_ro",
+        b"ro_new_1234",
+    )
+    .expect("seed vault for the lowercase user");
+
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+    let uc = ReconcileManagedUsersUseCase::new(compute, registry);
+
+    // Must NOT fail-close despite the uppercase role's unusable vault key.
+    let rekeyed = uc
+        .rekey_from_vault(&repo, &repositories_dir, org, project, db)
+        .await
+        .expect("re-key must not fail-close on an out-of-charset username");
+
+    // The container is removed by `pg`'s Drop even on a failed assertion below.
+    assert_eq!(
+        rekeyed,
+        vec!["app_ro".to_string()],
+        "the valid lowercase user is re-keyed; the uppercase one is skipped, not fatal"
+    );
+    assert!(login(pg.name(), "app_ro", "ro_new_1234"), "app_ro re-keyed to its vaulted password");
+    assert!(
+        login(pg.name(), "App_RW", "upper_stays_1234"),
+        "the skipped uppercase role is untouched — keeps its snapshot password"
+    );
+}

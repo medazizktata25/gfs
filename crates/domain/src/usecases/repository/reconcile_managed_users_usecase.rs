@@ -106,11 +106,13 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
     /// with no vault entry (pre-A2 or clone-inherited) is left on its snapshot
     /// password — no regression over pre-A2 behaviour.
     ///
-    /// Fail-closed: a vault read or password-apply error propagates — a stale-live
-    /// credential must surface, not be silently left. Returns the roles re-keyed.
+    /// Best-effort per user: a single unreadable entry or failed apply is warned
+    /// and skipped (the role keeps its snapshot password — the documented degrade),
+    /// never fail-closing the checkout — one bad entry must not brick every version
+    /// swap. Only a failure to *enumerate* roles propagates. Returns roles re-keyed.
     ///
     /// # Errors
-    /// Propagates a failure to list roles, read the vault, or apply a password.
+    /// Propagates a failure to list the cluster's roles.
     pub async fn rekey_from_vault(
         &self,
         repo_path: &Path,
@@ -123,13 +125,33 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
         let mut rekeyed = Vec::new();
         for username in rekeyable_login_roles(&roles) {
             let key = format!("userpw_{username}");
-            let entry = RepoCredentialVault::get(repositories_dir, org, project, db, &key)
-                .map_err(|e| ManageUsersError::Config(format!("read vault {key}: {e}")))?;
+            // Best-effort PER USER: a single bad/unreadable entry (e.g. an
+            // out-of-charset username whose key the vault rejects, or a transient
+            // I/O error) must NOT fail-close the whole checkout — that would brick
+            // every version swap of the database. Warn and leave that role on its
+            // snapshot password (the documented degrade), and keep re-keying the
+            // rest. A listing failure still propagates (we cannot enumerate).
+            let entry = match RepoCredentialVault::get(repositories_dir, org, project, db, &key) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(
+                        user = %username,
+                        error = %e,
+                        "re-key: unreadable durability-vault entry; leaving this role on its snapshot password"
+                    );
+                    continue;
+                }
+            };
             let Some(bytes) = entry else { continue }; // pre-A2 / inherited → keep snapshot pw
             let password = String::from_utf8_lossy(&bytes);
-            self.manage
-                .set_password(repo_path, &username, &password)
-                .await?;
+            if let Err(e) = self.manage.set_password(repo_path, &username, &password).await {
+                tracing::warn!(
+                    user = %username,
+                    error = %e,
+                    "re-key: failed to apply the vaulted password; leaving this role on its snapshot password"
+                );
+                continue;
+            }
             rekeyed.push(username);
         }
         if !rekeyed.is_empty() {
