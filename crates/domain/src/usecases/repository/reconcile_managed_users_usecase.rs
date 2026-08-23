@@ -182,10 +182,18 @@ fn rekeyable_login_roles(roles: &[RoleInfo]) -> Vec<String> {
 /// unit-tested here directly, while the exec orchestration (list → drop) +
 /// fail-closed behaviour are covered by the integration tests against a real
 /// cluster. Phase 1 targets login roles only; a surplus NOLOGIN group is left.
+///
+/// Reserved platform roles are never surplus (defence-in-depth): `owner`/
+/// `developers` are always in the intended set anyway, and `list_roles` filters
+/// out the superusers — but guarding here too means a reserved login role can
+/// never be selected for a `drop_role` that would be rejected and fail-close
+/// (brick) the whole checkout, symmetric with the re-key path.
 fn surplus_login_roles(roles: &[RoleInfo], intended: &BTreeSet<String>) -> Vec<String> {
     roles
         .iter()
-        .filter(|r| r.can_login && !intended.contains(&r.username))
+        .filter(|r| {
+            r.can_login && !intended.contains(&r.username) && !is_reserved_role(&r.username)
+        })
         .map(|r| r.username.clone())
         .collect()
 }
@@ -260,6 +268,19 @@ mod tests {
             rekeyable_login_roles(&roles),
             vec!["app_rw".to_string(), "app_ro".to_string()],
             "only non-reserved LOGIN roles are re-keyed"
+        );
+    }
+
+    #[test]
+    fn reserved_login_roles_are_never_surplus_even_when_absent_from_the_set() {
+        // Defence-in-depth: a reserved login role (owner) must never be selected for
+        // drop even with an EMPTY intended set — drop_role would reject it and
+        // fail-close the whole checkout.
+        let roles = vec![role("owner", true), role("app_x", true)];
+        assert_eq!(
+            surplus_login_roles(&roles, &BTreeSet::new()),
+            vec!["app_x".to_string()],
+            "a reserved login role is never surplus; only the non-reserved one is dropped"
         );
     }
 }
