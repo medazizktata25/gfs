@@ -360,11 +360,17 @@ fn reject_superuser_role(username: &str) -> Result<(), ManageUsersError> {
     }
 }
 
+/// Whether `username` is a reserved platform role (`owner`/`developers` + the
+/// management superusers). Public so the reconcile re-key can skip them — a
+/// reserved role must not be re-keyed as a normal managed user. Case-insensitive:
+/// a look-alike like `POSTGRES` is a *distinct* Postgres role, but treating every
+/// case variant as reserved avoids confusion with the real one.
+pub fn is_reserved_role(username: &str) -> bool {
+    RESERVED_ROLES.contains(&username.to_ascii_lowercase().as_str())
+}
+
 fn reject_reserved_role(username: &str) -> Result<(), ManageUsersError> {
-    // Case-insensitive: a look-alike like `POSTGRES` is a *distinct* Postgres role
-    // (quoted identifiers are case-sensitive), but creating one invites confusion
-    // with the real reserved role, so refuse every case variant too.
-    if RESERVED_ROLES.contains(&username.to_ascii_lowercase().as_str()) {
+    if is_reserved_role(username) {
         Err(ManageUsersError::InvalidInput(format!(
             "'{username}' is a reserved platform role and cannot be modified via user management"
         )))

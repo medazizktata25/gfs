@@ -432,3 +432,77 @@ async fn reconcile_drops_surplus_login_roles_keeps_intended_on_live_pg() {
         again.dropped
     );
 }
+
+/// Attempt a password login as `user`, returning whether it authenticated.
+/// Connects via the container's **non-loopback** address on purpose: the postgres
+/// image's `pg_hba.conf` has `host all all 127.0.0.1/32 trust` (loopback ignores
+/// the password), so a loopback probe cannot tell a right password from a wrong
+/// one — the customer-facing `host all all all scram-sha-256` rule (which enforces
+/// the password) matches the eth0 address instead.
+fn login(container: &str, user: &str, password: &str) -> bool {
+    let cmd = format!(
+        "PGPASSWORD='{password}' psql -h \"$(hostname -i)\" -U '{user}' -d postgres -tAc 'SELECT 1'"
+    );
+    let out = Command::new("docker")
+        .args(["exec", container, "sh", "-c", &cmd])
+        .output()
+        .expect("docker exec psql login");
+    out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1"
+}
+
+/// RFC 012 phase 2 / RFC 008 A2: a checkout restores a role's *snapshot* password.
+/// `rekey_from_vault` re-applies the role's *current* password from the durability
+/// vault, so a rotated-away password stops authenticating and the current one works.
+#[tokio::test]
+async fn rekey_from_vault_restores_current_password_over_a_stale_one_on_live_pg() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    let pg = Postgres::start();
+    // The role as a restored snapshot leaves it: LOGIN with the STALE password.
+    pg.psql("CREATE ROLE app_rw LOGIN PASSWORD 'p_old_stale_1234';");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repositories_dir = tmp.path().join("repositories");
+    let (org, project, db) = ("acme", "proj", "db-rekey");
+    let repo = repositories_dir.join(org).join(project).join(db);
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    write_repo(&repo, pg.name());
+
+    // The durability vault holds the CURRENT password (as create/set_password wrote it).
+    gfs_domain::utils::credential_vault::RepoCredentialVault::put(
+        &repositories_dir,
+        org,
+        project,
+        db,
+        "userpw_app_rw",
+        b"p_new_current_1234",
+    )
+    .expect("seed durability vault");
+
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+    let uc = ReconcileManagedUsersUseCase::new(compute, registry);
+
+    // Baseline: the stale password authenticates, the current one does not (yet).
+    assert!(login(pg.name(), "app_rw", "p_old_stale_1234"), "baseline: stale pw authenticates pre-rekey");
+
+    let rekeyed = uc
+        .rekey_from_vault(&repo, &repositories_dir, org, project, db)
+        .await
+        .expect("rekey");
+
+    // The container is removed by `pg`'s Drop even on a failed assertion below.
+    assert_eq!(rekeyed, vec!["app_rw".to_string()], "the non-reserved login role is re-keyed");
+    assert!(
+        login(pg.name(), "app_rw", "p_new_current_1234"),
+        "current (vaulted) password must authenticate after re-key"
+    );
+    assert!(
+        !login(pg.name(), "app_rw", "p_old_stale_1234"),
+        "the stale snapshot password must no longer authenticate after re-key"
+    );
+}

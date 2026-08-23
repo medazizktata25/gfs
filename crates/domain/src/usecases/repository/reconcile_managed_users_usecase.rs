@@ -16,7 +16,10 @@ use std::sync::Arc;
 use crate::model::db_user::RoleInfo;
 use crate::ports::compute::Compute;
 use crate::ports::database_provider::DatabaseProviderRegistry;
-use crate::usecases::repository::manage_users_usecase::{ManageUsersError, ManageUsersUseCase};
+use crate::usecases::repository::manage_users_usecase::{
+    ManageUsersError, ManageUsersUseCase, is_reserved_role,
+};
+use crate::utils::credential_vault::RepoCredentialVault;
 use crate::utils::intended_users::IntendedUserSet;
 
 /// What a reconcile did, returned so the caller (the DP daemon) can audit it.
@@ -93,6 +96,63 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
         }
         Ok(outcome)
     }
+
+    /// Re-key each present managed **login** role to its current password from the
+    /// node-local durability vault (`userpw_<username>`, RFC 008 A2). After a
+    /// version swap the restored catalog holds each role's *snapshot* password, so
+    /// a password rotated away since that commit would otherwise reappear. Reserved
+    /// roles are skipped: `owner` has no rotation path (its vault value always
+    /// equals the snapshot — a no-op) and the rest are not user-managed. A role
+    /// with no vault entry (pre-A2 or clone-inherited) is left on its snapshot
+    /// password — no regression over pre-A2 behaviour.
+    ///
+    /// Fail-closed: a vault read or password-apply error propagates — a stale-live
+    /// credential must surface, not be silently left. Returns the roles re-keyed.
+    ///
+    /// # Errors
+    /// Propagates a failure to list roles, read the vault, or apply a password.
+    pub async fn rekey_from_vault(
+        &self,
+        repo_path: &Path,
+        repositories_dir: &Path,
+        org: &str,
+        project: &str,
+        db: &str,
+    ) -> Result<Vec<String>, ManageUsersError> {
+        let roles = self.manage.list_roles(repo_path).await?;
+        let mut rekeyed = Vec::new();
+        for username in rekeyable_login_roles(&roles) {
+            let key = format!("userpw_{username}");
+            let entry = RepoCredentialVault::get(repositories_dir, org, project, db, &key)
+                .map_err(|e| ManageUsersError::Config(format!("read vault {key}: {e}")))?;
+            let Some(bytes) = entry else { continue }; // pre-A2 / inherited → keep snapshot pw
+            let password = String::from_utf8_lossy(&bytes);
+            self.manage
+                .set_password(repo_path, &username, &password)
+                .await?;
+            rekeyed.push(username);
+        }
+        if !rekeyed.is_empty() {
+            tracing::warn!(
+                rekeyed = ?rekeyed,
+                "re-keyed managed login roles to their current vaulted passwords (a rotated-away password cannot reappear across the version swap)"
+            );
+        }
+        Ok(rekeyed)
+    }
+}
+
+/// The managed **login** roles eligible for re-key: non-reserved login roles.
+/// Reserved roles (owner/developers/superusers) are excluded — see
+/// [`ReconcileManagedUsersUseCase::rekey_from_vault`]. Pure, so the selection
+/// policy is unit-tested directly while the vault-read + apply orchestration is
+/// covered by the integration tests.
+fn rekeyable_login_roles(roles: &[RoleInfo]) -> Vec<String> {
+    roles
+        .iter()
+        .filter(|r| r.can_login && !is_reserved_role(&r.username))
+        .map(|r| r.username.clone())
+        .collect()
 }
 
 /// Compute the managed **login** roles on the cluster that are not in the intended
@@ -162,6 +222,22 @@ mod tests {
         assert_eq!(
             surplus_login_roles(&roles, &BTreeSet::new()),
             vec!["x".to_string()]
+        );
+    }
+
+    #[test]
+    fn rekeyable_is_nonreserved_login_roles_only() {
+        let roles = vec![
+            role("owner", true),       // reserved → skip (no rotation path; no-op)
+            role("developers", false), // reserved + nologin → skip
+            role("app_rw", true),      // re-key
+            role("app_ro", true),      // re-key
+            role("grp", false),        // nologin → skip
+        ];
+        assert_eq!(
+            rekeyable_login_roles(&roles),
+            vec!["app_rw".to_string(), "app_ro".to_string()],
+            "only non-reserved LOGIN roles are re-keyed"
         );
     }
 }
