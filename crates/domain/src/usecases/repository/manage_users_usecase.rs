@@ -129,6 +129,27 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         expect_success(self.run(&container, &command).await?)
     }
 
+    /// Reset the deploy `owner`'s password as a **platform** operation (clone
+    /// fresh-reset): a clone inherits the parent's `owner` from the seeded
+    /// snapshot, so the platform rotates it to a fresh, child-owned credential.
+    /// Unlike [`Self::set_password`], this permits the reserved `owner` role (the
+    /// caller is the platform, not a customer) but still refuses the management
+    /// superuser. Not exposed on any customer-facing route.
+    pub async fn reset_deploy_owner_password(
+        &self,
+        path: &Path,
+        owner: &str,
+        password: &str,
+    ) -> Result<(), ManageUsersError> {
+        require_password(password)?;
+        reject_superuser_role(owner)?;
+        let (provider, container) = self.resolve(path)?;
+        let command = provider
+            .alter_password_command(owner, password)
+            .map_err(map_provider_err)?;
+        expect_success(self.run(&container, &command).await?)
+    }
+
     /// Drop a role.
     pub async fn drop_role(&self, path: &Path, username: &str) -> Result<(), ManageUsersError> {
         reject_reserved_role(username)?;
@@ -304,6 +325,24 @@ fn require_password(password: &str) -> Result<(), ManageUsersError> {
 /// fast with a clear message instead.
 const RESERVED_ROLES: [&str; 4] = ["guepard-admin", "postgres", "owner", "developers"];
 
+/// The management superusers, whose passwords the platform never rotates through
+/// any user-facing or fresh-reset path — they live in `credentials.toml`, not the
+/// revealable vault.
+const SUPERUSER_ROLES: [&str; 2] = ["guepard-admin", "postgres"];
+
+/// Refuse the management superuser (a subset of [`reject_reserved_role`]) while
+/// permitting the platform-provisioned `owner`/`developers`. Used by the
+/// platform-only owner-password reset (clone fresh-reset).
+fn reject_superuser_role(username: &str) -> Result<(), ManageUsersError> {
+    if SUPERUSER_ROLES.contains(&username.to_ascii_lowercase().as_str()) {
+        Err(ManageUsersError::InvalidInput(format!(
+            "'{username}' is a management superuser and cannot be rotated"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn reject_reserved_role(username: &str) -> Result<(), ManageUsersError> {
     // Case-insensitive: a look-alike like `POSTGRES` is a *distinct* Postgres role
     // (quoted identifiers are case-sensitive), but creating one invites confusion
@@ -346,6 +385,18 @@ mod tests {
         assert!(reject_reserved_role("POSTGRES").is_err());
         assert!(reject_reserved_role("Owner").is_err());
         assert!(reject_reserved_role("app_rw").is_ok());
+    }
+
+    #[test]
+    fn superuser_guard_permits_owner_but_refuses_the_management_super() {
+        use super::reject_superuser_role;
+        // The platform owner-reset (clone fresh-reset) rotates `owner` — allowed.
+        assert!(reject_superuser_role("owner").is_ok());
+        assert!(reject_superuser_role("developers").is_ok());
+        // ...but never the management superuser, in any case.
+        assert!(reject_superuser_role("guepard-admin").is_err());
+        assert!(reject_superuser_role("postgres").is_err());
+        assert!(reject_superuser_role("POSTGRES").is_err());
     }
     use tempfile::TempDir;
 
