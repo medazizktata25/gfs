@@ -145,7 +145,7 @@ impl RepoCredentialVault {
 /// The out-of-tree secrets directory for a database: `{base}/{org}/{project}/{db}`,
 /// keyed by the explicit triple. `base` is `$GUEPARD_SECRETS_DIR`, else the
 /// `secrets` sibling of `repositories_dir`.
-fn out_of_tree_dir(
+pub(crate) fn out_of_tree_dir(
     repositories_dir: &Path,
     org: &str,
     project: &str,
@@ -185,7 +185,7 @@ fn triple(org: &str, project: &str, db: &str) -> io::Result<PathBuf> {
 
 /// An identity segment must be a single, non-empty path component — no separators,
 /// `.`/`..`, or NUL — so a triple can never escape the store root.
-fn validate_segment<'a>(label: &str, value: &'a str) -> io::Result<&'a str> {
+pub(crate) fn validate_segment<'a>(label: &str, value: &'a str) -> io::Result<&'a str> {
     let ok = !value.is_empty()
         && value != "."
         && value != ".."
@@ -226,7 +226,7 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn write_secret_file(path: &Path, value: &[u8]) -> io::Result<()> {
+pub(crate) fn write_secret_file(path: &Path, value: &[u8]) -> io::Result<()> {
     use std::io::Write;
     // `mode(0o600)` applies only when this call creates the file; on an overwrite
     // it is ignored, so re-pin the mode explicitly afterwards.
@@ -241,19 +241,19 @@ fn write_secret_file(path: &Path, value: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_secret_file(path: &Path, value: &[u8]) -> io::Result<()> {
+pub(crate) fn write_secret_file(path: &Path, value: &[u8]) -> io::Result<()> {
     std::fs::write(path, value)
 }
 
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_mode(mode);
     std::fs::set_permissions(path, perms)
 }
 
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+pub(crate) fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 

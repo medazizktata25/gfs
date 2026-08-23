@@ -1,4 +1,5 @@
 pub mod credential_vault;
+pub mod intended_users;
 pub mod current_user;
 pub mod data_dir;
 pub mod hash;
