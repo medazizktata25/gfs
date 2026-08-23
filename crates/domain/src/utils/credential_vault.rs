@@ -226,18 +226,47 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+static TMP_WRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(unix)]
 pub(crate) fn write_secret_file(path: &Path, value: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    // `mode(0o600)` applies only when this call creates the file; on an overwrite
-    // it is ignored, so re-pin the mode explicitly afterwards.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(value)?;
-    set_mode(path, 0o600)
+    use std::sync::atomic::Ordering;
+    // Atomic replace: write a sibling temp file at 0600, fsync it, then rename over
+    // the target. A crash mid-write leaves the OLD file intact — never a truncated or
+    // empty record, which reconcile would misread as "drop all managed users" — and a
+    // concurrent reader never sees a partial file. `mode(0o600)` pins the temp file;
+    // rename preserves it.
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "secret path has no parent"))?;
+    let fname = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "secret path has no filename"))?;
+    let tmp = dir.join(format!(
+        ".{fname}.tmp.{}.{}",
+        std::process::id(),
+        TMP_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write = || -> io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(value)?;
+        file.sync_all()
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    set_mode(&tmp, 0o600)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 #[cfg(not(unix))]

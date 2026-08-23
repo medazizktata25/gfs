@@ -619,7 +619,7 @@ async fn reapply_presets_enforces_the_recorded_preset_over_snapshot_privileges_o
     )
     .expect("record readonly preset");
 
-    let reapplied = ReconcileManagedUsersUseCase::new(compute, registry)
+    let outcome = ReconcileManagedUsersUseCase::new(compute, registry)
         .reapply_presets_from_record(&repo, &repositories_dir, org, project, db, "owner")
         .await
         .expect("reapply presets");
@@ -628,7 +628,8 @@ async fn reapply_presets_enforces_the_recorded_preset_over_snapshot_privileges_o
     let select_after = pg.psql("SELECT has_table_privilege('app','public.t','SELECT')");
 
     // The container is removed by `pg`'s Drop even on a failed assertion below.
-    assert_eq!(reapplied, vec!["app".to_string()], "app's preset is re-applied");
+    assert_eq!(outcome.reapplied, vec!["app".to_string()], "app's preset is re-applied");
+    assert!(outcome.failed.is_empty(), "no re-apply failures");
     assert_eq!(insert_before, "t", "readwrite grants INSERT (snapshot state)");
     assert_eq!(
         insert_after, "f",

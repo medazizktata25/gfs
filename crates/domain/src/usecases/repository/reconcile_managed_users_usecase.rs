@@ -37,6 +37,17 @@ impl ReconcileOutcome {
     }
 }
 
+/// What a preset re-apply did (RFC 012 phase 3). `failed` is returned so the caller
+/// surfaces it — a failed re-apply leaves that role on its restored-snapshot
+/// privileges (a revoked privilege may be live), which must be visible, not silent.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PresetReapplyOutcome {
+    /// Roles whose current preset was re-applied.
+    pub reapplied: Vec<String>,
+    /// Roles whose preset re-apply failed (left on snapshot privileges).
+    pub failed: Vec<String>,
+}
+
 /// Reconcile the cluster's managed login roles to the repository's intended set.
 pub struct ReconcileManagedUsersUseCase<R: DatabaseProviderRegistry> {
     manage: ManageUsersUseCase<R>,
@@ -173,8 +184,9 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
     /// skipped (its privileges revert to the snapshot — no regression vs pre-phase-3).
     ///
     /// Best-effort per user (a failed apply is warned + skipped, never bricking the
-    /// checkout); only a failure to enumerate roles propagates. Returns roles
-    /// re-applied.
+    /// checkout); only a failure to enumerate roles propagates. Returns the outcome
+    /// (roles re-applied + roles whose re-apply failed) so the caller surfaces the
+    /// failures — a skipped role keeps its restored-snapshot privileges.
     ///
     /// # Errors
     /// Propagates a failure to read the record or to list the cluster's roles.
@@ -186,11 +198,11 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
         project: &str,
         db: &str,
         owner: &str,
-    ) -> Result<Vec<String>, ManageUsersError> {
+    ) -> Result<PresetReapplyOutcome, ManageUsersError> {
         let presets = IntendedUserSet::load_presets(repositories_dir, org, project, db)
             .map_err(|e| ManageUsersError::Config(format!("read intended presets: {e}")))?;
         if presets.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PresetReapplyOutcome::default());
         }
         // Only re-apply to roles that survive reconcile (present + can login). A
         // recorded user absent from this snapshot (created after the checked-out
@@ -204,7 +216,7 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
             .map(|r| r.username)
             .collect();
 
-        let mut reapplied = Vec::new();
+        let mut outcome = PresetReapplyOutcome::default();
         for (name, preset) in presets {
             if is_reserved_role(&name) || !present.contains(&name) {
                 continue;
@@ -219,17 +231,24 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
                     error = %e,
                     "re-apply preset: failed to enforce the recorded preset; leaving this role on its snapshot privileges"
                 );
+                outcome.failed.push(name);
                 continue;
             }
-            reapplied.push(name);
+            outcome.reapplied.push(name);
         }
-        if !reapplied.is_empty() {
+        if !outcome.reapplied.is_empty() {
             tracing::warn!(
-                reapplied = ?reapplied,
+                reapplied = ?outcome.reapplied,
                 "re-applied managed-user presets after the version swap (revoked privileges made durable)"
             );
         }
-        Ok(reapplied)
+        if !outcome.failed.is_empty() {
+            tracing::warn!(
+                failed = ?outcome.failed,
+                "re-apply preset FAILED for some users — they retain restored-snapshot privileges (a revoked privilege may be live); retry the checkout or re-apply the preset"
+            );
+        }
+        Ok(outcome)
     }
 }
 
