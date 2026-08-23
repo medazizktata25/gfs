@@ -215,12 +215,29 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
     /// conventional `owner` role exists, scope preset defaults to it; otherwise
     /// `None` (single-node — defaults stay connecting-role-scoped).
     pub async fn detect_deploy_owner(&self, path: &Path) -> Option<String> {
+        self.detect_deploy_owner_checked(path).await.ok().flatten()
+    }
+
+    /// Like [`Self::detect_deploy_owner`] but distinguishes a detection *failure*
+    /// (listing roles errored) from a database that genuinely has no `owner` role.
+    /// The clone fresh-reset needs this: a detection error must fail **closed** —
+    /// never silently skip rotating the inherited `owner` password,
+    /// which would leave the parent's credential live on the child. A legitimate
+    /// absence (`Ok(None)`, a legacy/pre-RFC-009 parent) safely takes the
+    /// parent-credential path.
+    ///
+    /// # Errors
+    /// Propagates a `list_roles` failure (exec/parse/non-zero exit).
+    pub async fn detect_deploy_owner_checked(
+        &self,
+        path: &Path,
+    ) -> Result<Option<String>, ManageUsersError> {
         const DEPLOY_OWNER_ROLE: &str = "owner";
-        let roles = self.list_roles(path).await.ok()?;
-        roles
+        let roles = self.list_roles(path).await?;
+        Ok(roles
             .iter()
             .any(|r| r.username == DEPLOY_OWNER_ROLE)
-            .then(|| DEPLOY_OWNER_ROLE.to_string())
+            .then(|| DEPLOY_OWNER_ROLE.to_string()))
     }
 
     /// Grant object-level privileges on `spec.object` to `spec.role`.
@@ -770,6 +787,56 @@ mod tests {
         assert_eq!(roles.len(), 1);
         assert_eq!(roles[0].username, "alice");
         assert!(roles[0].can_login && !roles[0].is_superuser);
+    }
+
+    #[tokio::test]
+    async fn detect_deploy_owner_checked_distinguishes_absence_from_failure() {
+        // Present -> Ok(Some("owner")).
+        let (_t1, repo1) = repo_with_config("pg-c1");
+        let uc1 = use_case(
+            MockCompute {
+                stdout: r#"[{"username":"owner","can_login":true,"is_superuser":false}]"#.into(),
+                ..Default::default()
+            },
+            true,
+        )
+        .0;
+        assert_eq!(
+            uc1.detect_deploy_owner_checked(&repo1).await.unwrap(),
+            Some("owner".to_string())
+        );
+
+        // Genuinely absent -> Ok(None): a legacy parent, safe to skip the reset.
+        let (_t2, repo2) = repo_with_config("pg-c1");
+        let uc2 = use_case(
+            MockCompute {
+                stdout: r#"[{"username":"alice","can_login":true,"is_superuser":false}]"#.into(),
+                ..Default::default()
+            },
+            true,
+        )
+        .0;
+        assert_eq!(uc2.detect_deploy_owner_checked(&repo2).await.unwrap(), None);
+
+        // Detection FAILURE -> Err (F1): a listing error must propagate, never be
+        // swallowed to Ok(None) — that would make the clone fresh-reset silently
+        // skip and leave the parent's owner password live on the child.
+        let (_t3, repo3) = repo_with_config("pg-c1");
+        let uc3 = use_case(
+            MockCompute {
+                exit_code: 1,
+                stderr: "list roles boom".into(),
+                ..Default::default()
+            },
+            true,
+        )
+        .0;
+        assert!(
+            uc3.detect_deploy_owner_checked(&repo3).await.is_err(),
+            "a listing error must propagate, not become Ok(None)"
+        );
+        // The lenient variant still degrades to None for its preset-scoping callers.
+        assert_eq!(uc3.detect_deploy_owner(&repo3).await, None);
     }
 
     #[tokio::test]

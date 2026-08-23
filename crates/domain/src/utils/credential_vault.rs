@@ -55,8 +55,22 @@ impl RepoCredentialVault {
             set_mode(dir, 0o700)?;
         }
         write_secret_file(&path, value)?;
-        // Best-effort: drop the pre-A1 copy so no plaintext lingers in the tree.
-        let _ = std::fs::remove_file(legacy_dir(repositories_dir, org, project, db)?.join(name));
+        // Migration: drop the pre-A1 in-repo copy so no plaintext lingers in the
+        // versioned tree. The new out-of-tree copy is authoritative for reads, so
+        // this is best-effort — but a real failure to remove it defeats A1's
+        // intent, so surface it rather than swallow it.
+        match std::fs::remove_file(legacy_dir(repositories_dir, org, project, db)?.join(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                org,
+                project,
+                db,
+                name,
+                error = %e,
+                "failed to clear legacy in-repo secret after migration; plaintext may linger in the repo tree"
+            ),
+        }
         Ok(())
     }
 
