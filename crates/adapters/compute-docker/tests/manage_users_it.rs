@@ -396,7 +396,7 @@ async fn reconcile_drops_surplus_login_roles_keeps_intended_on_live_pg() {
 
     // The intended set: deploy defaults ({owner, developers}) plus the one app
     // user we still want. `app_stale` is deliberately NOT intended.
-    IntendedUserSet::add(&repositories_dir, org, project, db, "app_ro").expect("seed intended");
+    IntendedUserSet::add(&repositories_dir, org, project, db, "app_ro", None).expect("seed intended");
 
     let compute = Arc::new(DockerCompute::new().expect("docker compute"));
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
@@ -564,4 +564,75 @@ async fn rekey_skips_out_of_charset_username_without_bricking_on_live_pg() {
         login(pg.name(), "App_RW", "upper_stays_1234"),
         "the skipped uppercase role is untouched — keeps its snapshot password"
     );
+}
+
+/// RFC 012 phase 3: a checkout restores a role's snapshot privileges. Re-applying
+/// the role's *current* recorded preset (declaratively) enforces exactly that
+/// preset — so a privilege downgraded/revoked since that commit stays revoked.
+#[tokio::test]
+async fn reapply_presets_enforces_the_recorded_preset_over_snapshot_privileges_on_live_pg() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    let pg = Postgres::start();
+    // Owner + a table; `app` created readwrite (has INSERT) — as a restored snapshot
+    // of the pre-downgrade commit would leave it.
+    pg.psql("CREATE ROLE owner LOGIN; GRANT CREATE ON SCHEMA public TO owner; CREATE TABLE public.t(id int);");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repositories_dir = tmp.path().join("repositories");
+    let (org, project, db) = ("acme", "proj", "db-preset");
+    let repo = repositories_dir.join(org).join(project).join(db);
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    write_repo(&repo, pg.name());
+
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+
+    // The cluster has `app` as readwrite (snapshot state).
+    ManageUsersUseCase::new(compute.clone(), registry.clone())
+        .create_role(
+            &repo,
+            &RoleSpec {
+                username: "app".into(),
+                password: "pw_app_1234".into(),
+                preset: Some(RolePreset::Readwrite),
+                default_privileges_owner: Some("owner".into()),
+            },
+        )
+        .await
+        .expect("create readwrite app");
+    let insert_before = pg.psql("SELECT has_table_privilege('app','public.t','INSERT')");
+
+    // The node-local record says the CURRENT preset is readonly (a downgrade recorded
+    // since the checked-out commit).
+    gfs_domain::utils::intended_users::IntendedUserSet::add(
+        &repositories_dir,
+        org,
+        project,
+        db,
+        "app",
+        Some(RolePreset::Readonly),
+    )
+    .expect("record readonly preset");
+
+    let reapplied = ReconcileManagedUsersUseCase::new(compute, registry)
+        .reapply_presets_from_record(&repo, &repositories_dir, org, project, db, "owner")
+        .await
+        .expect("reapply presets");
+
+    let insert_after = pg.psql("SELECT has_table_privilege('app','public.t','INSERT')");
+    let select_after = pg.psql("SELECT has_table_privilege('app','public.t','SELECT')");
+
+    // The container is removed by `pg`'s Drop even on a failed assertion below.
+    assert_eq!(reapplied, vec!["app".to_string()], "app's preset is re-applied");
+    assert_eq!(insert_before, "t", "readwrite grants INSERT (snapshot state)");
+    assert_eq!(
+        insert_after, "f",
+        "re-applying the recorded readonly preset revokes INSERT — the downgrade holds"
+    );
+    assert_eq!(select_after, "t", "readonly still allows SELECT");
 }

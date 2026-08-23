@@ -162,6 +162,75 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
         }
         Ok(rekeyed)
     }
+
+    /// Re-apply each present managed login role's current **preset** from the
+    /// node-local record (RFC 012 phase 3). A version swap restores the snapshot's
+    /// ACLs, so a privilege revoked since that commit would resurrect; `apply_preset`
+    /// is declarative (revoke-all-then-grant-preset), so re-applying a role's current
+    /// preset makes its privileges exactly that preset again — the revoked privilege
+    /// stays revoked. `owner` is the deploy owner used for the preset's default
+    /// privileges. A role with no recorded preset, or not present after the swap, is
+    /// skipped (its privileges revert to the snapshot — no regression vs pre-phase-3).
+    ///
+    /// Best-effort per user (a failed apply is warned + skipped, never bricking the
+    /// checkout); only a failure to enumerate roles propagates. Returns roles
+    /// re-applied.
+    ///
+    /// # Errors
+    /// Propagates a failure to read the record or to list the cluster's roles.
+    pub async fn reapply_presets_from_record(
+        &self,
+        repo_path: &Path,
+        repositories_dir: &Path,
+        org: &str,
+        project: &str,
+        db: &str,
+        owner: &str,
+    ) -> Result<Vec<String>, ManageUsersError> {
+        let presets = IntendedUserSet::load_presets(repositories_dir, org, project, db)
+            .map_err(|e| ManageUsersError::Config(format!("read intended presets: {e}")))?;
+        if presets.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Only re-apply to roles that survive reconcile (present + can login). A
+        // recorded user absent from this snapshot (created after the checked-out
+        // commit) is skipped — apply_preset on a missing role would just error.
+        let present: BTreeSet<String> = self
+            .manage
+            .list_roles(repo_path)
+            .await?
+            .into_iter()
+            .filter(|r| r.can_login)
+            .map(|r| r.username)
+            .collect();
+
+        let mut reapplied = Vec::new();
+        for (name, preset) in presets {
+            if is_reserved_role(&name) || !present.contains(&name) {
+                continue;
+            }
+            if let Err(e) = self
+                .manage
+                .apply_preset(repo_path, &name, preset, Some(owner))
+                .await
+            {
+                tracing::warn!(
+                    user = %name,
+                    error = %e,
+                    "re-apply preset: failed to enforce the recorded preset; leaving this role on its snapshot privileges"
+                );
+                continue;
+            }
+            reapplied.push(name);
+        }
+        if !reapplied.is_empty() {
+            tracing::warn!(
+                reapplied = ?reapplied,
+                "re-applied managed-user presets after the version swap (revoked privileges made durable)"
+            );
+        }
+        Ok(reapplied)
+    }
 }
 
 /// The managed **login** roles eligible for re-key: non-reserved login roles.
