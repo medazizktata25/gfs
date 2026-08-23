@@ -19,6 +19,8 @@ use gfs_domain::model::db_user::{
 };
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::usecases::repository::manage_users_usecase::ManageUsersUseCase;
+use gfs_domain::usecases::repository::reconcile_managed_users_usecase::ReconcileManagedUsersUseCase;
+use gfs_domain::utils::intended_users::IntendedUserSet;
 
 /// A container name unique to each call (pid + counter) so tests never collide,
 /// whether run in parallel or back-to-back within one test binary.
@@ -360,4 +362,73 @@ async fn apply_preset_downgrade_revokes_write_privileges() {
         "downgrade to readonly must REVOKE INSERT (declarative, not additive)"
     );
     assert_eq!(select_after, "t", "readonly must still allow SELECT");
+}
+
+/// Reconcile after a version swap: the restored `pg_authid` re-lists a managed
+/// login role that is no longer intended (it was dropped since this commit).
+/// Reconcile drops that surplus role — making the prior removal durable across
+/// time-travel — while every currently-intended role survives. A second pass is
+/// a no-op (idempotent).
+#[tokio::test]
+async fn reconcile_drops_surplus_login_roles_keeps_intended_on_live_pg() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    let pg = Postgres::start();
+    // The cluster as an older checkout restores it: the deploy defaults, a
+    // currently-intended app user, and a STALE login role that was dropped since
+    // this commit (absent from the intended set) yet re-listed by pg_authid.
+    pg.psql(
+        "CREATE ROLE \"owner\" LOGIN; \
+         CREATE ROLE developers NOLOGIN; \
+         CREATE ROLE app_ro LOGIN PASSWORD 'pw_app_ro_1234'; \
+         CREATE ROLE app_stale LOGIN PASSWORD 'pw_stale_1234';",
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repositories_dir = tmp.path().join("repositories");
+    let (org, project, db) = ("acme", "proj", "db-1234");
+    let repo = repositories_dir.join(org).join(project).join(db);
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    write_repo(&repo, pg.name());
+
+    // The intended set: deploy defaults ({owner, developers}) plus the one app
+    // user we still want. `app_stale` is deliberately NOT intended.
+    IntendedUserSet::add(&repositories_dir, org, project, db, "app_ro").expect("seed intended");
+
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+    let uc = ReconcileManagedUsersUseCase::new(compute, registry);
+
+    let outcome = uc
+        .reconcile(&repo, &repositories_dir, org, project, db, "checkout")
+        .await
+        .expect("reconcile");
+
+    let exists = |role: &str| pg.psql(&format!("SELECT 1 FROM pg_roles WHERE rolname='{role}'"));
+
+    // The container is removed by `pg`'s Drop even on a failed assertion below.
+    assert_eq!(
+        outcome.dropped,
+        vec!["app_stale".to_string()],
+        "only the surplus (non-intended) LOGIN role is dropped"
+    );
+    assert_eq!(exists("app_stale"), "", "app_stale must be gone after reconcile");
+    assert_eq!(exists("app_ro"), "1", "the intended app user must survive");
+    assert_eq!(exists("owner"), "1", "owner must survive");
+    assert_eq!(exists("developers"), "1", "the developers group must survive");
+
+    // Idempotent: a second reconcile on the now-aligned cluster drops nothing.
+    let again = uc
+        .reconcile(&repo, &repositories_dir, org, project, db, "checkout")
+        .await
+        .expect("reconcile idempotent");
+    assert!(
+        again.is_noop(),
+        "an aligned cluster reconciles to a no-op, got: {:?}",
+        again.dropped
+    );
 }
