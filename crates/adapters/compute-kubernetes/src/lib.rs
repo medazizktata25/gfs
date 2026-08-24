@@ -430,13 +430,13 @@ impl KubernetesCompute {
             })
             .collect();
 
-        let mounts = vec![VolumeMount {
+        let mut mounts = vec![VolumeMount {
             name: "data".to_string(),
             mount_path: def.data_dir.to_string_lossy().into_owned(),
             ..Default::default()
         }];
 
-        let volumes = vec![Volume {
+        let mut volumes = vec![Volume {
             name: "data".to_string(),
             persistent_volume_claim: Some(
                 k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
@@ -447,6 +447,48 @@ impl KubernetesCompute {
             ..Default::default()
         }];
 
+        let mut args = def.args.clone();
+        let mut init_containers: Vec<Container> = Vec::new();
+
+        // Startup seal (RFC 012 I1): boot Postgres with a node-controlled `hba_file`
+        // that trusts ONLY loopback, so NO network path (NodePort / hostPort /
+        // in-cluster ClusterIP) can authenticate with the credentials a snapshot
+        // restore rolls back. The reconciler runs over the loopback exec seam while
+        // sealed; the data-plane opens external auth (appends `host all all all
+        // scram-sha-256` + `pg_reload_conf`) only AFTER reconcile completes. An
+        // initContainer populates the file in a shared emptyDir before Postgres starts,
+        // so the seal is airtight from the pod's first byte on the wire.
+        if def.image.contains("postgres") {
+            mounts.push(VolumeMount {
+                name: "gfs-hba".to_string(),
+                mount_path: "/gfs-hba".to_string(),
+                ..Default::default()
+            });
+            volumes.push(Volume {
+                name: "gfs-hba".to_string(),
+                empty_dir: Some(Default::default()),
+                ..Default::default()
+            });
+            init_containers.push(Container {
+                name: "gfs-seal-hba".to_string(),
+                image: Some(def.image.clone()),
+                image_pull_policy: Some("IfNotPresent".to_string()),
+                command: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'local all all trust\\nhost all all 127.0.0.1/32 trust\\nhost all all ::1/128 trust\\n' > /gfs-hba/pg_hba.conf".to_string(),
+                ]),
+                volume_mounts: Some(vec![VolumeMount {
+                    name: "gfs-hba".to_string(),
+                    mount_path: "/gfs-hba".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            args.push("-c".to_string());
+            args.push("hba_file=/gfs-hba/pg_hba.conf".to_string());
+        }
+
         let container = Container {
             name: "db".to_string(),
             image: Some(def.image.clone()),
@@ -454,11 +496,7 @@ impl KubernetesCompute {
             env: Some(env),
             ports: Some(container_ports),
             volume_mounts: Some(mounts),
-            args: if def.args.is_empty() {
-                None
-            } else {
-                Some(def.args.clone())
-            },
+            args: if args.is_empty() { None } else { Some(args) },
             ..Default::default()
         };
 
@@ -498,6 +536,11 @@ impl KubernetesCompute {
                             run_as_user: Some(0),
                             ..Default::default()
                         }),
+                        init_containers: if init_containers.is_empty() {
+                            None
+                        } else {
+                            Some(init_containers)
+                        },
                         containers: vec![container],
                         volumes: Some(volumes),
                         node_selector: k8s_schedule_node_name()
