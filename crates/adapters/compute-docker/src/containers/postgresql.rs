@@ -723,6 +723,31 @@ impl DatabaseProvider for PostgresqlProvider {
         )?))
     }
 
+    fn quarantine_role_command(
+        &self,
+        username: &str,
+        new_password: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        let ident = pg_quote_ident(username)?;
+        // Neutralize a surplus role we could not DROP (it owns objects in the
+        // restored older data). NOLOGIN denies authentication for the role
+        // cluster-wide — a stronger, dependency-free guarantee than DROP: it needs
+        // no ownership reassignment and touches no customer data. The fresh random
+        // password overwrites the resurrected snapshot verifier so the old
+        // credential is destroyed even if the role is later re-enabled. NOLOGIN
+        // subsumes a per-database `REVOKE CONNECT` (login is refused everywhere), so
+        // we do not enumerate databases. Transactional so a half-applied
+        // neutralization can never leave the role able to log in with its snapshot
+        // password.
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
+            &format!(
+                "BEGIN;\nALTER ROLE {ident} NOLOGIN;\nALTER ROLE {ident} WITH PASSWORD '{}';\nCOMMIT;",
+                sql_lit(new_password)
+            ),
+            None,
+        )?))
+    }
+
     fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {
         // `-tA` (tuples-only, unaligned) → clean JSON on stdout. `left(rolname,3)`
         // filters system `pg_*` roles without LIKE-escape fragility; the private
@@ -1790,6 +1815,33 @@ mod tests {
         assert!(provider.drop_role_command("bad name").is_err());
         let alter = provider.alter_password_command("app_ro", "new'pw").unwrap();
         assert!(alter.contains(r#"ALTER ROLE "app_ro" WITH PASSWORD 'new''pw';"#));
+    }
+
+    #[test]
+    fn quarantine_role_command_disables_login_and_rotates_password() {
+        let provider = PostgresqlProvider::new();
+        let cmd = provider
+            .quarantine_role_command("app_stale", "thrown'away")
+            .unwrap();
+        assert!(
+            cmd.contains(r#"ALTER ROLE "app_stale" NOLOGIN;"#),
+            "quarantine must disable login (the airtight, cluster-wide access denial)"
+        );
+        assert!(
+            cmd.contains(r#"ALTER ROLE "app_stale" WITH PASSWORD 'thrown''away';"#),
+            "quarantine must overwrite the resurrected snapshot password (literal escaped)"
+        );
+        // NOLOGIN before the password rotation, both inside one transaction, so a
+        // half-applied neutralization can never leave the role able to log in.
+        assert!(
+            cmd.find("NOLOGIN").unwrap() < cmd.find("WITH PASSWORD").unwrap(),
+            "login must be disabled before (or with) the rotation"
+        );
+        assert!(cmd.contains("BEGIN;") && cmd.contains("COMMIT;"), "must be transactional");
+        assert!(
+            provider.quarantine_role_command("bad name", "x").is_err(),
+            "an invalid identifier must be rejected, never interpolated"
+        );
     }
 
     #[test]

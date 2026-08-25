@@ -449,6 +449,21 @@ pub trait DatabaseProvider: Send + Sync {
         Err(ProviderError::UnsupportedFormat("drop_role".into()))
     }
 
+    /// In-instance command that **neutralizes** `username` without dropping it:
+    /// disable login and overwrite its password with `new_password`. Used as the
+    /// reconcile fallback when a surplus role cannot be dropped (it owns objects in
+    /// the restored older data version) — access is removed by disabling the role
+    /// (a cheap, dependency-free op) rather than by mutating customer data, and the
+    /// fresh password destroys the resurrected snapshot credential.
+    fn quarantine_role_command(
+        &self,
+        username: &str,
+        new_password: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = (username, new_password);
+        Err(ProviderError::UnsupportedFormat("quarantine_role".into()))
+    }
+
     /// In-instance command that lists login roles as JSON (parsed into
     /// [`crate::model::db_user::RoleInfo`]). Never includes a password.
     fn list_roles_command(&self) -> std::result::Result<String, ProviderError> {

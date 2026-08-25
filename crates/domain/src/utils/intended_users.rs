@@ -17,7 +17,7 @@ use std::io;
 use std::path::Path;
 
 use crate::model::db_user::RolePreset;
-use crate::utils::credential_vault::{out_of_tree_dir, set_mode, write_secret_file};
+use crate::utils::node_local_store::{out_of_tree_dir, set_mode, write_secret_file};
 
 /// Filename of the intended-record within the out-of-tree store.
 const INTENDED_USERS_FILE: &str = "intended_users";

@@ -450,11 +450,139 @@ fn login(container: &str, user: &str, password: &str) -> bool {
     out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1"
 }
 
-/// RFC 012 phase 2 / RFC 008 A2: a checkout restores a role's *snapshot* password.
-/// `rekey_from_vault` re-applies the role's *current* password from the durability
-/// vault, so a rotated-away password stops authenticating and the current one works.
+/// A surplus role that cannot be DROPped (it owns objects in another database, so
+/// REASSIGN/DROP OWNED in the reconcile db cannot clear the dependency) must be
+/// QUARANTINED — disabled + password rotated — never left able to log in, and the
+/// checkout must NOT be bricked. Degrade toward disabled, never toward exposed.
 #[tokio::test]
-async fn rekey_from_vault_restores_current_password_over_a_stale_one_on_live_pg() {
+async fn reconcile_quarantines_a_surplus_role_it_cannot_drop_on_live_pg() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    let pg = Postgres::start();
+    // Deploy defaults + a surplus (non-intended) LOGIN role that OWNS a table in a
+    // *second* database. reconcile connects to the default `postgres` db, so its
+    // REASSIGN/DROP OWNED there cannot reach the object in `otherdb` and DROP ROLE
+    // fails — exactly the case the quarantine fallback exists for.
+    pg.psql(
+        "CREATE ROLE \"owner\" LOGIN; \
+         CREATE ROLE developers NOLOGIN; \
+         CREATE ROLE app_stale LOGIN PASSWORD 'pw_stale_1234';",
+    );
+    // Separate statement: CREATE DATABASE cannot run inside the implicit
+    // transaction block that a multi-statement `psql -c` batch forms.
+    pg.psql("CREATE DATABASE otherdb;");
+    let exec_otherdb = |sql: &str| {
+        let out = Command::new("docker")
+            .args(["exec", pg.name(), "psql", "-U", "postgres", "-d", "otherdb", "-tAc", sql])
+            .output()
+            .expect("docker exec psql -d otherdb");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    exec_otherdb(
+        "CREATE TABLE owned_by_stale(id int); ALTER TABLE owned_by_stale OWNER TO app_stale;",
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repositories_dir = tmp.path().join("repositories");
+    let (org, project, db) = ("acme", "proj", "db-quar");
+    let repo = repositories_dir.join(org).join(project).join(db);
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    write_repo(&repo, pg.name());
+    // Intended set = {owner, developers}; app_stale is deliberately NOT intended.
+    IntendedUserSet::seed(&repositories_dir, org, project, db).expect("seed intended");
+
+    // The resurrected credential is LIVE before reconcile (the exposure this closes).
+    assert!(
+        login(pg.name(), "app_stale", "pw_stale_1234"),
+        "precondition: the surplus role authenticates before reconcile"
+    );
+    let verifier_before = pg.psql("SELECT rolpassword FROM pg_authid WHERE rolname='app_stale'");
+
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+    let uc = ReconcileManagedUsersUseCase::new(compute, registry);
+
+    // Must NOT fail-close even though DROP ROLE cannot run: degrade to quarantine.
+    let outcome = uc
+        .reconcile(&repo, &repositories_dir, org, project, db, "checkout")
+        .await
+        .expect("reconcile must degrade to quarantine, never brick, when DROP can't run");
+
+    assert!(
+        outcome.dropped.is_empty(),
+        "the undroppable role must not be reported dropped, got: {:?}",
+        outcome.dropped
+    );
+    assert_eq!(
+        outcome.quarantined,
+        vec!["app_stale".to_string()],
+        "the surplus role DROP could not remove must be quarantined"
+    );
+
+    // The resurrected credential is DEAD after reconcile — the security guarantee.
+    assert!(
+        !login(pg.name(), "app_stale", "pw_stale_1234"),
+        "quarantine must kill the resurrected credential's login"
+    );
+    // Quarantine, not drop: the role still exists (its owned data is untouched)...
+    assert_eq!(
+        pg.psql("SELECT 1 FROM pg_roles WHERE rolname='app_stale'"),
+        "1",
+        "quarantine must not drop the role (no data destroyed)"
+    );
+    // ...login is disabled cluster-wide...
+    assert_eq!(
+        pg.psql("SELECT rolcanlogin FROM pg_roles WHERE rolname='app_stale'"),
+        "f",
+        "quarantine must set NOLOGIN"
+    );
+    // ...the resurrected password verifier was overwritten...
+    let verifier_after = pg.psql("SELECT rolpassword FROM pg_authid WHERE rolname='app_stale'");
+    assert_ne!(
+        verifier_before, verifier_after,
+        "quarantine must rotate the resurrected snapshot password"
+    );
+    // ...and the role's data in otherdb is intact (access removed, data preserved).
+    assert_eq!(
+        exec_otherdb("SELECT 1 FROM information_schema.tables WHERE table_name='owned_by_stale'"),
+        "1",
+        "quarantine must not destroy the role's owned objects"
+    );
+
+    // Idempotent: a second reconcile on the SAME data version is a no-op — the
+    // role is already NOLOGIN, so it is no longer a *login* role to reconcile; it
+    // stays neutralized (a real later checkout that restores LOGIN re-quarantines).
+    let again = uc
+        .reconcile(&repo, &repositories_dir, org, project, db, "checkout")
+        .await
+        .expect("second reconcile must not brick");
+    assert!(
+        again.is_noop(),
+        "a quarantined (NOLOGIN) role needs no further reconcile, got dropped={:?} quarantined={:?}",
+        again.dropped,
+        again.quarantined
+    );
+    assert_eq!(
+        pg.psql("SELECT rolcanlogin FROM pg_roles WHERE rolname='app_stale'"),
+        "f",
+        "the quarantined role stays disabled after a second reconcile"
+    );
+    assert!(
+        !login(pg.name(), "app_stale", "pw_stale_1234"),
+        "the quarantined role still cannot authenticate"
+    );
+}
+
+/// A checkout restores a role's *snapshot* password. `reapply_passwords` re-applies
+/// the role's *current* password (resolved out-of-band by the data plane from the
+/// vault port), so a rotated-away password stops authenticating and the current one
+/// works. The vault I/O + key encoding are the DP adapter's concern (tested there).
+#[tokio::test]
+async fn reapply_passwords_applies_current_over_stale_on_live_pg() {
     if !docker_ok() {
         eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
         return;
@@ -471,98 +599,31 @@ async fn rekey_from_vault_restores_current_password_over_a_stale_one_on_live_pg(
     std::fs::create_dir_all(&repo).expect("mkdir repo");
     write_repo(&repo, pg.name());
 
-    // The durability vault holds the CURRENT password (as create/set_password wrote it).
-    gfs_domain::utils::credential_vault::RepoCredentialVault::put(
-        &repositories_dir,
-        org,
-        project,
-        db,
-        "userpw_app_rw",
-        b"p_new_current_1234",
-    )
-    .expect("seed durability vault");
-
     let compute = Arc::new(DockerCompute::new().expect("docker compute"));
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
     containers::register_all(&*registry).expect("register providers");
     let uc = ReconcileManagedUsersUseCase::new(compute, registry);
 
-    // Baseline: the stale password authenticates, the current one does not (yet).
+    // Baseline: the stale password authenticates.
     assert!(login(pg.name(), "app_rw", "p_old_stale_1234"), "baseline: stale pw authenticates pre-rekey");
 
-    let rekeyed = uc
-        .rekey_from_vault(&repo, &repositories_dir, org, project, db)
-        .await
-        .expect("rekey");
+    // The DP enumerates rekeyable roles, resolves each current password from the
+    // vault, and hands the map back to the domain to apply.
+    let rekeyable = uc.list_rekeyable_roles(&repo).await.expect("list rekeyable");
+    assert!(rekeyable.contains(&"app_rw".to_string()), "app_rw is a rekeyable login role");
+    let mut passwords = std::collections::BTreeMap::new();
+    passwords.insert("app_rw".to_string(), "p_new_current_1234".to_string());
+    let rekeyed = uc.reapply_passwords(&repo, &passwords).await.expect("reapply");
 
     // The container is removed by `pg`'s Drop even on a failed assertion below.
-    assert_eq!(rekeyed, vec!["app_rw".to_string()], "the non-reserved login role is re-keyed");
+    assert_eq!(rekeyed, vec!["app_rw".to_string()], "the login role is re-keyed");
     assert!(
         login(pg.name(), "app_rw", "p_new_current_1234"),
-        "current (vaulted) password must authenticate after re-key"
+        "current password must authenticate after re-key"
     );
     assert!(
         !login(pg.name(), "app_rw", "p_old_stale_1234"),
         "the stale snapshot password must no longer authenticate after re-key"
-    );
-}
-
-/// Re-key must be best-effort per user: a role whose vault key the (lowercase-only)
-/// vault rejects — e.g. an uppercase-named user, which the platform's username
-/// charset allows — must be skipped, NOT fail-close the whole checkout. Regression
-/// guard for the "one out-of-charset user bricks every version swap" bug.
-#[tokio::test]
-async fn rekey_skips_out_of_charset_username_without_bricking_on_live_pg() {
-    if !docker_ok() {
-        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
-        return;
-    }
-
-    let pg = Postgres::start();
-    // An uppercase-named login role (its `userpw_App_RW` key is rejected by the
-    // lowercase-only vault) beside a normal lowercase user that has a vault entry.
-    pg.psql(
-        "CREATE ROLE \"App_RW\" LOGIN PASSWORD 'upper_stays_1234'; \
-         CREATE ROLE app_ro LOGIN PASSWORD 'ro_old_1234';",
-    );
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let repositories_dir = tmp.path().join("repositories");
-    let (org, project, db) = ("acme", "proj", "db-mixedcase");
-    let repo = repositories_dir.join(org).join(project).join(db);
-    std::fs::create_dir_all(&repo).expect("mkdir repo");
-    write_repo(&repo, pg.name());
-    gfs_domain::utils::credential_vault::RepoCredentialVault::put(
-        &repositories_dir,
-        org,
-        project,
-        db,
-        "userpw_app_ro",
-        b"ro_new_1234",
-    )
-    .expect("seed vault for the lowercase user");
-
-    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
-    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    containers::register_all(&*registry).expect("register providers");
-    let uc = ReconcileManagedUsersUseCase::new(compute, registry);
-
-    // Must NOT fail-close despite the uppercase role's unusable vault key.
-    let rekeyed = uc
-        .rekey_from_vault(&repo, &repositories_dir, org, project, db)
-        .await
-        .expect("re-key must not fail-close on an out-of-charset username");
-
-    // The container is removed by `pg`'s Drop even on a failed assertion below.
-    assert_eq!(
-        rekeyed,
-        vec!["app_ro".to_string()],
-        "the valid lowercase user is re-keyed; the uppercase one is skipped, not fatal"
-    );
-    assert!(login(pg.name(), "app_ro", "ro_new_1234"), "app_ro re-keyed to its vaulted password");
-    assert!(
-        login(pg.name(), "App_RW", "upper_stays_1234"),
-        "the skipped uppercase role is untouched — keeps its snapshot password"
     );
 }
 

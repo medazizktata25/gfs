@@ -160,6 +160,27 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         expect_success(self.run(&container, &command).await?)
     }
 
+    /// Neutralize a role we intend to remove but cannot [`Self::drop_role`] (it
+    /// owns objects in the restored older data version): disable login and
+    /// overwrite its password with a fresh unknowable one. Degrades access to
+    /// *disabled* without mutating customer data — the fail-closed guarantee that
+    /// does not depend on DROP. The caller supplies `new_password`; it is meant to
+    /// be thrown away (never surfaced, never vaulted — its unknowability is the
+    /// point), so callers pass a fresh random value.
+    pub async fn quarantine_role(
+        &self,
+        path: &Path,
+        username: &str,
+        new_password: &str,
+    ) -> Result<(), ManageUsersError> {
+        reject_reserved_role(username)?;
+        let (provider, container) = self.resolve(path)?;
+        let command = provider
+            .quarantine_role_command(username, new_password)
+            .map_err(map_provider_err)?;
+        expect_success(self.run(&container, &command).await?)
+    }
+
     /// Apply a role preset to an existing role.
     ///
     /// `default_privileges_owner`, when set, is the role whose future objects the

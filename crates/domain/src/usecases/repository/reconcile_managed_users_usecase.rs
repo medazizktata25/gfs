@@ -19,7 +19,6 @@ use crate::ports::database_provider::DatabaseProviderRegistry;
 use crate::usecases::repository::manage_users_usecase::{
     ManageUsersError, ManageUsersUseCase, is_reserved_role,
 };
-use crate::utils::credential_vault::RepoCredentialVault;
 use crate::utils::intended_users::IntendedUserSet;
 
 /// What a reconcile did, returned so the caller (the DP daemon) can audit it.
@@ -29,11 +28,15 @@ use crate::utils::intended_users::IntendedUserSet;
 pub struct ReconcileOutcome {
     /// Managed login roles dropped because they were not in the intended set.
     pub dropped: Vec<String>,
+    /// Surplus login roles that could not be dropped (they own objects in the
+    /// restored older data) and were instead **quarantined** — disabled + password
+    /// rotated — so access is removed without mutating customer data.
+    pub quarantined: Vec<String>,
 }
 
 impl ReconcileOutcome {
     pub fn is_noop(&self) -> bool {
-        self.dropped.is_empty()
+        self.dropped.is_empty() && self.quarantined.is_empty()
     }
 }
 
@@ -94,81 +97,105 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
             // `drop_role` is transactional + dependent-safe (REASSIGN OWNED +
             // DROP OWNED before DROP ROLE), so a surplus role that owns objects in
             // the restored older data is neither orphaned nor blocks the drop.
-            self.manage.drop_role(repo_path, &username).await?;
-            outcome.dropped.push(username);
+            match self.manage.drop_role(repo_path, &username).await {
+                Ok(()) => outcome.dropped.push(username),
+                Err(drop_err) => {
+                    // DROP could not complete (e.g. REASSIGN/DROP OWNED could not
+                    // fully clear this role's ownership in the restored data).
+                    // Degrade to *disabled* instead of bricking the checkout:
+                    // quarantine removes access (NOLOGIN + rotated password)
+                    // without mutating customer data. The security guarantee
+                    // ("this role has no access") rides on this cheap,
+                    // dependency-free op, not on DROP. Only if quarantine ALSO
+                    // fails do we fail-closed — a surplus role still able to log in
+                    // with its snapshot password is unacceptable.
+                    tracing::warn!(
+                        user = %username,
+                        error = %drop_err,
+                        "reconcile could not drop a surplus managed login role; falling back to quarantine"
+                    );
+                    // A fresh, unknowable, thrown-away password (~244 bits). Never
+                    // surfaced and never vaulted: its unknowability IS the control,
+                    // and re-quarantine happens fresh on every future checkout.
+                    let throwaway = format!(
+                        "{}{}",
+                        uuid::Uuid::new_v4().simple(),
+                        uuid::Uuid::new_v4().simple()
+                    );
+                    if let Err(quarantine_err) =
+                        self.manage.quarantine_role(repo_path, &username, &throwaway).await
+                    {
+                        return Err(ManageUsersError::Failed {
+                            exit_code: 1,
+                            message: format!(
+                                "reconcile could neither drop nor quarantine surplus login role {username}: drop={drop_err}; quarantine={quarantine_err}"
+                            ),
+                        });
+                    }
+                    outcome.quarantined.push(username);
+                }
+            }
         }
 
         if !outcome.is_noop() {
             tracing::warn!(
                 trigger,
                 dropped = ?outcome.dropped,
-                "reconcile dropped non-intended managed login roles (revoked access made durable across the version swap)"
+                quarantined = ?outcome.quarantined,
+                "reconcile removed non-intended managed login roles (revoked access made durable across the version swap)"
             );
         }
         Ok(outcome)
     }
 
-    /// Re-key each present managed **login** role to its current password from the
-    /// node-local durability vault (`userpw_<username>`, RFC 008 A2). After a
-    /// version swap the restored catalog holds each role's *snapshot* password, so
-    /// a password rotated away since that commit would otherwise reappear. Reserved
-    /// roles are skipped: `owner` has no rotation path (its vault value always
-    /// equals the snapshot — a no-op) and the rest are not user-managed. A role
-    /// with no vault entry (pre-A2 or clone-inherited) is left on its snapshot
-    /// password — no regression over pre-A2 behaviour.
-    ///
-    /// Best-effort per user: a single unreadable entry or failed apply is warned
-    /// and skipped (the role keeps its snapshot password — the documented degrade),
-    /// never fail-closing the checkout — one bad entry must not brick every version
-    /// swap. Only a failure to *enumerate* roles propagates. Returns roles re-keyed.
+    /// The present managed **login** roles eligible for re-keying (non-reserved).
+    /// The data plane resolves each one's current password from the node-local
+    /// credential vault (behind a port) and hands them back to
+    /// [`Self::reapply_passwords`] — the domain never reads a secret store itself.
+    /// An enumeration failure propagates: a checkout cannot proceed if the roles
+    /// cannot be listed.
     ///
     /// # Errors
     /// Propagates a failure to list the cluster's roles.
-    pub async fn rekey_from_vault(
+    pub async fn list_rekeyable_roles(
         &self,
         repo_path: &Path,
-        repositories_dir: &Path,
-        org: &str,
-        project: &str,
-        db: &str,
     ) -> Result<Vec<String>, ManageUsersError> {
         let roles = self.manage.list_roles(repo_path).await?;
+        Ok(rekeyable_login_roles(&roles))
+    }
+
+    /// Apply each `(username -> current password)` to the cluster so a password
+    /// rotated away since the checked-out commit cannot reappear (RFC 008 A2). The
+    /// passwords are resolved out-of-band by the data plane (the domain never reads
+    /// a secret store). Best-effort PER USER — a single failed apply is warned and
+    /// skipped so one bad user cannot brick the version swap. Returns the roles
+    /// re-keyed.
+    ///
+    /// # Errors
+    /// Never fail-closes on a per-user apply; currently infallible at the boundary
+    /// but returns `Result` for symmetry and future strictness.
+    pub async fn reapply_passwords(
+        &self,
+        repo_path: &Path,
+        passwords: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<String>, ManageUsersError> {
         let mut rekeyed = Vec::new();
-        for username in rekeyable_login_roles(&roles) {
-            let key = format!("userpw_{username}");
-            // Best-effort PER USER: a single bad/unreadable entry (e.g. an
-            // out-of-charset username whose key the vault rejects, or a transient
-            // I/O error) must NOT fail-close the whole checkout — that would brick
-            // every version swap of the database. Warn and leave that role on its
-            // snapshot password (the documented degrade), and keep re-keying the
-            // rest. A listing failure still propagates (we cannot enumerate).
-            let entry = match RepoCredentialVault::get(repositories_dir, org, project, db, &key) {
-                Ok(entry) => entry,
-                Err(e) => {
-                    tracing::warn!(
-                        user = %username,
-                        error = %e,
-                        "re-key: unreadable durability-vault entry; leaving this role on its snapshot password"
-                    );
-                    continue;
-                }
-            };
-            let Some(bytes) = entry else { continue }; // pre-A2 / inherited → keep snapshot pw
-            let password = String::from_utf8_lossy(&bytes);
-            if let Err(e) = self.manage.set_password(repo_path, &username, &password).await {
+        for (username, password) in passwords {
+            if let Err(e) = self.manage.set_password(repo_path, username, password).await {
                 tracing::warn!(
                     user = %username,
                     error = %e,
-                    "re-key: failed to apply the vaulted password; leaving this role on its snapshot password"
+                    "re-key: failed to apply the current password; leaving this role on its snapshot password"
                 );
                 continue;
             }
-            rekeyed.push(username);
+            rekeyed.push(username.clone());
         }
         if !rekeyed.is_empty() {
             tracing::warn!(
                 rekeyed = ?rekeyed,
-                "re-keyed managed login roles to their current vaulted passwords (a rotated-away password cannot reappear across the version swap)"
+                "re-keyed managed login roles to their current passwords (a rotated-away password cannot reappear across the version swap)"
             );
         }
         Ok(rekeyed)
