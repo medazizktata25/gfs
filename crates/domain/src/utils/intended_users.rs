@@ -22,6 +22,10 @@ use crate::utils::node_local_store::{out_of_tree_dir, set_mode, write_secret_fil
 /// Filename of the intended-record within the out-of-tree store.
 const INTENDED_USERS_FILE: &str = "intended_users";
 
+/// Filename of the tombstone record (deprovisioned managed-user names) within the
+/// out-of-tree store, a sibling of the intended record.
+const TOMBSTONES_FILE: &str = "tombstones";
+
 /// The always-present managed roles (RFC 009): the customer's least-privileged
 /// `owner` login and the `developers` group. These are provisioned at deploy,
 /// are non-revocable via RFC 007, and reconcile never drops them. They carry no
@@ -92,7 +96,10 @@ impl IntendedUserSet {
     ) -> io::Result<()> {
         let mut map = Self::load_map(repositories_dir, org, project, db)?;
         map.insert(name.to_string(), preset);
-        Self::save_map(repositories_dir, org, project, db, &map)
+        Self::save_map(repositories_dir, org, project, db, &map)?;
+        // A re-created name supersedes any prior deprovision, so it is no longer
+        // re-dropped on the next version swap.
+        Self::untombstone(repositories_dir, org, project, db, name)
     }
 
     /// Update a managed user's current preset (after an in-cluster `apply_preset`).
@@ -136,6 +143,90 @@ impl IntendedUserSet {
         let mut map = Self::load_map(repositories_dir, org, project, db)?;
         map.remove(name);
         Self::save_map(repositories_dir, org, project, db, &map)
+    }
+
+    /// Tombstone a managed user after its in-cluster drop: record that this name was
+    /// DEPROVISIONED via the managed route, and remove it from the live set. On a
+    /// later version swap that resurrects it, reconcile re-drops a tombstoned name —
+    /// but never a name that was merely never tracked (a customer's own SQL role
+    /// survives). The always-intended roles cannot be tombstoned.
+    ///
+    /// # Errors
+    /// As [`Self::load`] / [`Self::save_map`].
+    pub fn tombstone(
+        repositories_dir: &Path,
+        org: &str,
+        project: &str,
+        db: &str,
+        name: &str,
+    ) -> io::Result<()> {
+        if ALWAYS_INTENDED.contains(&name) {
+            return Ok(());
+        }
+        let mut map = Self::load_map(repositories_dir, org, project, db)?;
+        map.remove(name);
+        Self::save_map(repositories_dir, org, project, db, &map)?;
+        let mut tombs = Self::load_tombstones(repositories_dir, org, project, db)?;
+        if tombs.insert(name.to_string()) {
+            Self::save_tombstones(repositories_dir, org, project, db, &tombs)?;
+        }
+        Ok(())
+    }
+
+    /// Clear a name's tombstone (after a managed re-create). Idempotent.
+    ///
+    /// # Errors
+    /// As [`Self::load_tombstones`] / [`Self::save_tombstones`].
+    pub fn untombstone(
+        repositories_dir: &Path,
+        org: &str,
+        project: &str,
+        db: &str,
+        name: &str,
+    ) -> io::Result<()> {
+        let mut tombs = Self::load_tombstones(repositories_dir, org, project, db)?;
+        if tombs.remove(name) {
+            Self::save_tombstones(repositories_dir, org, project, db, &tombs)?;
+        }
+        Ok(())
+    }
+
+    /// Load the set of tombstoned (deprovisioned) managed-user names. Absent → empty.
+    /// The always-intended roles can never be tombstoned and are filtered defensively.
+    ///
+    /// # Errors
+    /// An invalid identity segment or a filesystem error other than not-found.
+    pub fn load_tombstones(
+        repositories_dir: &Path,
+        org: &str,
+        project: &str,
+        db: &str,
+    ) -> io::Result<BTreeSet<String>> {
+        let path = out_of_tree_dir(repositories_dir, org, project, db)?.join(TOMBSTONES_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => Ok(contents
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !ALWAYS_INTENDED.contains(l))
+                .map(str::to_string)
+                .collect()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn save_tombstones(
+        repositories_dir: &Path,
+        org: &str,
+        project: &str,
+        db: &str,
+        tombs: &BTreeSet<String>,
+    ) -> io::Result<()> {
+        let dir = out_of_tree_dir(repositories_dir, org, project, db)?;
+        std::fs::create_dir_all(&dir)?;
+        set_mode(&dir, 0o700)?;
+        let body = tombs.iter().cloned().collect::<Vec<_>>().join("\n");
+        write_secret_file(&dir.join(TOMBSTONES_FILE), body.as_bytes())
     }
 
     /// Load the full name→optional-preset map, with the defaults folded in.
@@ -330,5 +421,54 @@ mod tests {
         let (_t, repos) = layout();
         assert!(IntendedUserSet::load(&repos, "..", PROJECT, DB).is_err());
         assert!(IntendedUserSet::add(&repos, ORG, "a/b", DB, "x", None).is_err());
+    }
+
+    #[test]
+    fn tombstone_deprovisions_a_user_and_load_tombstones_returns_it() {
+        let (_t, repos) = layout();
+        IntendedUserSet::add(&repos, ORG, PROJECT, DB, "app_ro", Some(RolePreset::Readonly)).unwrap();
+        IntendedUserSet::tombstone(&repos, ORG, PROJECT, DB, "app_ro").unwrap();
+        // Removed from the live set...
+        assert!(!IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap().contains("app_ro"));
+        // ...and recorded as deprovisioned.
+        assert!(
+            IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB).unwrap().contains("app_ro"),
+            "a dropped managed user must be tombstoned so a checkout re-drops it"
+        );
+    }
+
+    #[test]
+    fn add_untombstones_a_recreated_user() {
+        let (_t, repos) = layout();
+        IntendedUserSet::tombstone(&repos, ORG, PROJECT, DB, "app_ro").unwrap();
+        assert!(IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB).unwrap().contains("app_ro"));
+        // Re-creating the user supersedes the deprovision.
+        IntendedUserSet::add(&repos, ORG, PROJECT, DB, "app_ro", None).unwrap();
+        assert!(
+            !IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB).unwrap().contains("app_ro"),
+            "re-creating a managed user must clear its tombstone so reconcile keeps it"
+        );
+        assert!(IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap().contains("app_ro"));
+    }
+
+    #[test]
+    fn a_default_role_can_never_be_tombstoned() {
+        let (_t, repos) = layout();
+        IntendedUserSet::tombstone(&repos, ORG, PROJECT, DB, "owner").unwrap();
+        assert!(
+            IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB).unwrap().is_empty(),
+            "owner/developers are never tombstoned"
+        );
+        assert!(IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap().contains("owner"));
+    }
+
+    #[test]
+    fn an_untracked_role_is_neither_intended_nor_tombstoned() {
+        // A role the platform never recorded (a customer's own SQL role) is absent
+        // from both sets — so reconcile leaves it alone.
+        let (_t, repos) = layout();
+        IntendedUserSet::seed(&repos, ORG, PROJECT, DB).unwrap();
+        assert!(!IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap().contains("customer_role"));
+        assert!(!IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB).unwrap().contains("customer_role"));
     }
 }

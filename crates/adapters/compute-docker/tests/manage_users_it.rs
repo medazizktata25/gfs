@@ -370,21 +370,23 @@ async fn apply_preset_downgrade_revokes_write_privileges() {
 /// time-travel — while every currently-intended role survives. A second pass is
 /// a no-op (idempotent).
 #[tokio::test]
-async fn reconcile_drops_surplus_login_roles_keeps_intended_on_live_pg() {
+async fn reconcile_drops_tombstoned_roles_and_keeps_untracked_ones_on_live_pg() {
     if !docker_ok() {
         eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
         return;
     }
 
     let pg = Postgres::start();
-    // The cluster as an older checkout restores it: the deploy defaults, a
-    // currently-intended app user, and a STALE login role that was dropped since
-    // this commit (absent from the intended set) yet re-listed by pg_authid.
+    // As an older checkout restores it: the deploy defaults, a live managed user
+    // (app_ro), a managed user DEPROVISIONED since this commit (app_stale, now
+    // resurrected by the snapshot), and a role the customer created themselves via
+    // raw SQL that the platform never tracked (app_untracked).
     pg.psql(
         "CREATE ROLE \"owner\" LOGIN; \
          CREATE ROLE developers NOLOGIN; \
          CREATE ROLE app_ro LOGIN PASSWORD 'pw_app_ro_1234'; \
-         CREATE ROLE app_stale LOGIN PASSWORD 'pw_stale_1234';",
+         CREATE ROLE app_stale LOGIN PASSWORD 'pw_stale_1234'; \
+         CREATE ROLE app_untracked LOGIN PASSWORD 'pw_untracked_1234';",
     );
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -394,9 +396,11 @@ async fn reconcile_drops_surplus_login_roles_keeps_intended_on_live_pg() {
     std::fs::create_dir_all(&repo).expect("mkdir repo");
     write_repo(&repo, pg.name());
 
-    // The intended set: deploy defaults ({owner, developers}) plus the one app
-    // user we still want. `app_stale` is deliberately NOT intended.
-    IntendedUserSet::add(&repositories_dir, org, project, db, "app_ro", None).expect("seed intended");
+    // app_ro is a live managed user; app_stale was deprovisioned (tombstoned).
+    // app_untracked is deliberately NOT recorded — a customer's own SQL role, which
+    // reconcile must never touch.
+    IntendedUserSet::add(&repositories_dir, org, project, db, "app_ro", None).expect("record live user");
+    IntendedUserSet::tombstone(&repositories_dir, org, project, db, "app_stale").expect("tombstone");
 
     let compute = Arc::new(DockerCompute::new().expect("docker compute"));
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
@@ -414,14 +418,19 @@ async fn reconcile_drops_surplus_login_roles_keeps_intended_on_live_pg() {
     assert_eq!(
         outcome.dropped,
         vec!["app_stale".to_string()],
-        "only the surplus (non-intended) LOGIN role is dropped"
+        "only the tombstoned + resurrected LOGIN role is dropped"
     );
-    assert_eq!(exists("app_stale"), "", "app_stale must be gone after reconcile");
-    assert_eq!(exists("app_ro"), "1", "the intended app user must survive");
+    assert_eq!(exists("app_stale"), "", "the tombstoned role must be gone after reconcile");
+    assert_eq!(exists("app_ro"), "1", "the live managed user must survive");
+    assert_eq!(
+        exists("app_untracked"),
+        "1",
+        "an UNTRACKED customer SQL role must NEVER be dropped (the allowlist over-reach is gone)"
+    );
     assert_eq!(exists("owner"), "1", "owner must survive");
     assert_eq!(exists("developers"), "1", "the developers group must survive");
 
-    // Idempotent: a second reconcile on the now-aligned cluster drops nothing.
+    // Idempotent: app_stale is gone, so a second reconcile drops nothing.
     let again = uc
         .reconcile(&repo, &repositories_dir, org, project, db, "checkout")
         .await
@@ -491,8 +500,10 @@ async fn reconcile_quarantines_a_surplus_role_it_cannot_drop_on_live_pg() {
     let repo = repositories_dir.join(org).join(project).join(db);
     std::fs::create_dir_all(&repo).expect("mkdir repo");
     write_repo(&repo, pg.name());
-    // Intended set = {owner, developers}; app_stale is deliberately NOT intended.
+    // app_stale was deprovisioned (tombstoned) but the restored snapshot resurrects
+    // it; reconcile will try to drop it and fall back to quarantine.
     IntendedUserSet::seed(&repositories_dir, org, project, db).expect("seed intended");
+    IntendedUserSet::tombstone(&repositories_dir, org, project, db, "app_stale").expect("tombstone");
 
     // The resurrected credential is LIVE before reconcile (the exposure this closes).
     assert!(

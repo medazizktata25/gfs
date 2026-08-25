@@ -86,14 +86,18 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
         db: &str,
         trigger: &str,
     ) -> Result<ReconcileOutcome, ManageUsersError> {
-        let intended = IntendedUserSet::load(repositories_dir, org, project, db)
-            .map_err(|e| ManageUsersError::Config(format!("read intended-user set: {e}")))?;
-
-        // Fail-closed: a listing failure must surface, not leave surplus roles.
+        // Deprovision is intent-driven: reconcile removes only the login roles the
+        // platform explicitly tombstoned (deprovisioned via the managed route) that
+        // the restored snapshot has resurrected — never a role it merely does not
+        // recognise (a customer's own SQL role survives). Fail-closed: a failure to
+        // read the tombstones or list the cluster surfaces, never leaving a
+        // resurrected deprovisioned role live.
+        let tombstones = IntendedUserSet::load_tombstones(repositories_dir, org, project, db)
+            .map_err(|e| ManageUsersError::Config(format!("read tombstones: {e}")))?;
         let roles = self.manage.list_roles(repo_path).await?;
 
         let mut outcome = ReconcileOutcome::default();
-        for username in surplus_login_roles(&roles, &intended) {
+        for username in tombstoned_present_roles(&roles, &tombstones) {
             // `drop_role` is transactional + dependent-safe (REASSIGN OWNED +
             // DROP OWNED before DROP ROLE), so a surplus role that owns objects in
             // the restored older data is neither orphaned nor blocks the drop.
@@ -142,7 +146,7 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
                 trigger,
                 dropped = ?outcome.dropped,
                 quarantined = ?outcome.quarantined,
-                "reconcile removed non-intended managed login roles (revoked access made durable across the version swap)"
+                "reconcile removed deprovisioned managed login roles resurrected by the version swap (revoked access made durable)"
             );
         }
         Ok(outcome)
@@ -303,11 +307,11 @@ fn rekeyable_login_roles(roles: &[RoleInfo]) -> Vec<String> {
 /// out the superusers — but guarding here too means a reserved login role can
 /// never be selected for a `drop_role` that would be rejected and fail-close
 /// (brick) the whole checkout, symmetric with the re-key path.
-fn surplus_login_roles(roles: &[RoleInfo], intended: &BTreeSet<String>) -> Vec<String> {
+fn tombstoned_present_roles(roles: &[RoleInfo], tombstones: &BTreeSet<String>) -> Vec<String> {
     roles
         .iter()
         .filter(|r| {
-            r.can_login && !intended.contains(&r.username) && !is_reserved_role(&r.username)
+            r.can_login && tombstones.contains(&r.username) && !is_reserved_role(&r.username)
         })
         .map(|r| r.username.clone())
         .collect()
@@ -327,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn surplus_is_login_roles_not_in_the_intended_set() {
+    fn tombstoned_present_login_roles_are_dropped() {
         let roles = vec![
             role("owner", true),
             role("developers", false),
@@ -335,37 +339,36 @@ mod tests {
             role("app_stale", true),
             role("grp_nologin", false),
         ];
-        let intended: BTreeSet<String> = ["owner", "developers", "app_keep"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        // Only app_stale was deprovisioned (tombstoned). app_keep is a live login
+        // role, and an untracked customer role would be neither tombstoned nor
+        // intended — both survive. Reconcile drops only what was deprovisioned.
+        let tombstones: BTreeSet<String> = ["app_stale"].iter().map(|s| s.to_string()).collect();
         assert_eq!(
-            surplus_login_roles(&roles, &intended),
+            tombstoned_present_roles(&roles, &tombstones),
             vec!["app_stale".to_string()],
-            "only the non-intended LOGIN role is surplus"
+            "only the tombstoned + present LOGIN role is dropped"
         );
     }
 
     #[test]
-    fn intended_and_nonlogin_roles_are_never_surplus() {
+    fn untombstoned_login_roles_are_never_dropped() {
+        // No tombstones → reconcile drops nothing, even a live login role the
+        // platform does not recognise (a customer's own SQL role survives).
         let roles = vec![
             role("owner", true),
             role("developers", false),
-            role("app_keep", true),
+            role("app_customer", true),
         ];
-        let intended: BTreeSet<String> = ["owner", "developers", "app_keep"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(surplus_login_roles(&roles, &intended).is_empty());
+        assert!(tombstoned_present_roles(&roles, &BTreeSet::new()).is_empty());
     }
 
     #[test]
-    fn only_login_roles_are_ever_surplus() {
-        // Even with an empty intended set, a NOLOGIN group is never dropped in phase 1.
+    fn only_login_roles_are_ever_tombstone_dropped() {
+        // A NOLOGIN group is never dropped even when tombstoned (phase-1 scope).
         let roles = vec![role("x", true), role("grp", false)];
+        let tombstones: BTreeSet<String> = ["x", "grp"].iter().map(|s| s.to_string()).collect();
         assert_eq!(
-            surplus_login_roles(&roles, &BTreeSet::new()),
+            tombstoned_present_roles(&roles, &tombstones),
             vec!["x".to_string()]
         );
     }
@@ -387,15 +390,17 @@ mod tests {
     }
 
     #[test]
-    fn reserved_login_roles_are_never_surplus_even_when_absent_from_the_set() {
-        // Defence-in-depth: a reserved login role (owner) must never be selected for
-        // drop even with an EMPTY intended set — drop_role would reject it and
+    fn reserved_login_roles_are_never_tombstone_dropped() {
+        // Defence-in-depth: a reserved login role (owner) is never selected for drop
+        // even if it somehow appears tombstoned — drop_role would reject it and
         // fail-close the whole checkout.
         let roles = vec![role("owner", true), role("app_x", true)];
+        let tombstones: BTreeSet<String> =
+            ["owner", "app_x"].iter().map(|s| s.to_string()).collect();
         assert_eq!(
-            surplus_login_roles(&roles, &BTreeSet::new()),
+            tombstoned_present_roles(&roles, &tombstones),
             vec!["app_x".to_string()],
-            "a reserved login role is never surplus; only the non-reserved one is dropped"
+            "a reserved login role is never dropped; only the non-reserved tombstoned one"
         );
     }
 }
