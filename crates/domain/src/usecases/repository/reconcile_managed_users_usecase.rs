@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::model::db_user::RoleInfo;
+use crate::model::db_user::{RoleInfo, RolePreset, RoleSpec};
 use crate::ports::compute::Compute;
 use crate::ports::database_provider::DatabaseProviderRegistry;
 use crate::usecases::repository::manage_users_usecase::{
@@ -203,6 +203,78 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
             );
         }
         Ok(rekeyed)
+    }
+
+    /// The live managed login roles that the restored snapshot is MISSING — a
+    /// managed user created after the checked-out commit is absent from that older
+    /// `pg_authid`. Returns each absent user with its recorded preset so the caller
+    /// (the data plane) can re-create it with its current vaulted password, keeping
+    /// current managed access complete across the version swap. Reserved roles
+    /// (`owner`/`developers`) are always present (seeded) and never listed here.
+    ///
+    /// # Errors
+    /// Propagates a failure to read the intended record or list the cluster's roles.
+    pub async fn list_absent_intended_roles(
+        &self,
+        repo_path: &Path,
+        repositories_dir: &Path,
+        org: &str,
+        project: &str,
+        db: &str,
+    ) -> Result<Vec<(String, Option<RolePreset>)>, ManageUsersError> {
+        let intended = IntendedUserSet::load(repositories_dir, org, project, db)
+            .map_err(|e| ManageUsersError::Config(format!("read intended set: {e}")))?;
+        let presets = IntendedUserSet::load_presets(repositories_dir, org, project, db)
+            .map_err(|e| ManageUsersError::Config(format!("read intended presets: {e}")))?;
+        let present: BTreeSet<String> = self
+            .manage
+            .list_roles(repo_path)
+            .await?
+            .into_iter()
+            .map(|r| r.username)
+            .collect();
+        Ok(intended
+            .into_iter()
+            .filter(|name| !present.contains(name) && !is_reserved_role(name))
+            .map(|name| {
+                let preset = presets.get(&name).copied();
+                (name, preset)
+            })
+            .collect())
+    }
+
+    /// Re-create the given managed roles (each with its current password + preset,
+    /// supplied by the caller from the vault + record), so a live managed user
+    /// absent from the restored snapshot is present again after the version swap.
+    /// Best-effort PER USER — a single failed create is warned and skipped so one
+    /// bad user cannot brick the checkout. Returns the roles created.
+    ///
+    /// # Errors
+    /// Never fail-closes on a per-user create; returns `Result` for symmetry.
+    pub async fn ensure_present_roles(
+        &self,
+        repo_path: &Path,
+        specs: &[RoleSpec],
+    ) -> Result<Vec<String>, ManageUsersError> {
+        let mut created = Vec::new();
+        for spec in specs {
+            if let Err(e) = self.manage.create_role(repo_path, spec).await {
+                tracing::warn!(
+                    user = %spec.username,
+                    error = %e,
+                    "ensure-present: failed to re-create a live managed role missing from the restored snapshot"
+                );
+                continue;
+            }
+            created.push(spec.username.clone());
+        }
+        if !created.is_empty() {
+            tracing::warn!(
+                created = ?created,
+                "re-created live managed roles the restored snapshot was missing (current managed access made complete across the version swap)"
+            );
+        }
+        Ok(created)
     }
 
     /// Re-apply each present managed login role's current **preset** from the

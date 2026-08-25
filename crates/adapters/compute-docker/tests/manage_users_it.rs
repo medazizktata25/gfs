@@ -588,6 +588,76 @@ async fn reconcile_quarantines_a_surplus_role_it_cannot_drop_on_live_pg() {
     );
 }
 
+/// Ensure-present (completeness): a LIVE managed user missing from the restored
+/// snapshot is re-created with its current password + preset, so current managed
+/// access is complete after a checkout to a commit that predates the user.
+#[tokio::test]
+async fn ensure_present_recreates_a_live_managed_user_missing_from_the_snapshot() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    let pg = Postgres::start();
+    // The snapshot as an OLD checkout restores it: deploy defaults present, but the
+    // managed user app_x (created after this commit) is absent from pg_authid.
+    pg.psql("CREATE ROLE owner LOGIN; CREATE ROLE developers NOLOGIN;");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repositories_dir = tmp.path().join("repositories");
+    let (org, project, db) = ("acme", "proj", "db-ensure");
+    let repo = repositories_dir.join(org).join(project).join(db);
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    write_repo(&repo, pg.name());
+    // The record says app_x is a live managed user with a readonly preset.
+    IntendedUserSet::add(&repositories_dir, org, project, db, "app_x", Some(RolePreset::Readonly))
+        .expect("record live managed user");
+
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+    let uc = ReconcileManagedUsersUseCase::new(compute, registry);
+
+    // app_x is absent from the cluster → listed as absent, with its preset.
+    let absent = uc
+        .list_absent_intended_roles(&repo, &repositories_dir, org, project, db)
+        .await
+        .expect("list absent");
+    assert_eq!(
+        absent,
+        vec![("app_x".to_string(), Some(RolePreset::Readonly))],
+        "the missing live managed user is listed with its recorded preset"
+    );
+
+    // The data plane supplies the current vaulted password; re-create it.
+    let specs = vec![RoleSpec {
+        username: "app_x".to_string(),
+        password: "pw_app_x_1234".to_string(),
+        preset: Some(RolePreset::Readonly),
+        default_privileges_owner: Some("owner".to_string()),
+    }];
+    let created = uc.ensure_present_roles(&repo, &specs).await.expect("ensure present");
+    assert_eq!(created, vec!["app_x".to_string()]);
+
+    // app_x now exists and authenticates with its current password.
+    assert_eq!(
+        pg.psql("SELECT 1 FROM pg_roles WHERE rolname='app_x'"),
+        "1",
+        "the missing live managed user was re-created"
+    );
+    assert!(
+        login(pg.name(), "app_x", "pw_app_x_1234"),
+        "the re-created user authenticates with its current password"
+    );
+
+    // Idempotent: nothing is absent now.
+    let none = uc
+        .list_absent_intended_roles(&repo, &repositories_dir, org, project, db)
+        .await
+        .expect("list absent again");
+    assert!(none.is_empty(), "no live managed user is absent after ensure-present");
+}
+
 /// A checkout restores a role's *snapshot* password. `reapply_passwords` re-applies
 /// the role's *current* password (resolved out-of-band by the data plane from the
 /// vault port), so a rotated-away password stops authenticating and the current one
