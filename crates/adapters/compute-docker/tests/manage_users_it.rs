@@ -767,3 +767,101 @@ async fn reapply_presets_enforces_the_recorded_preset_over_snapshot_privileges_o
     );
     assert_eq!(select_after, "t", "readonly still allows SELECT");
 }
+
+/// Declarable intent: adopting a customer-created SQL role promotes it into the
+/// managed set, so a later checkout to a snapshot that predates it re-creates the
+/// role (ensure-present). A customer role that is NOT adopted stays untracked — it
+/// is faithful content and is never re-created. Reserved and NOLOGIN roles cannot
+/// be adopted.
+#[tokio::test]
+async fn adopt_promotes_a_customer_role_into_the_managed_set_making_it_durable() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    let pg = Postgres::start();
+    // Deploy defaults + two login roles a customer made via RAW SQL (untracked).
+    pg.psql("CREATE ROLE owner LOGIN; CREATE ROLE developers NOLOGIN;");
+    pg.psql("CREATE ROLE adopted_u LOGIN PASSWORD 'adopted_pw_1234';");
+    pg.psql("CREATE ROLE untracked_u LOGIN PASSWORD 'untracked_pw_1234';");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repositories_dir = tmp.path().join("repositories");
+    let (org, project, db) = ("acme", "proj", "db-adopt");
+    let repo = repositories_dir.join(org).join(project).join(db);
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    write_repo(&repo, pg.name());
+
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+    let uc = ReconcileManagedUsersUseCase::new(compute, registry);
+
+    // Adopt one of the two customer roles; the other is left untracked.
+    let outcome = uc
+        .adopt_role(&repo, &repositories_dir, org, project, db, "adopted_u")
+        .await
+        .expect("adopt");
+    assert!(outcome.newly_adopted, "first adopt is a fresh promotion");
+    // Idempotent: re-adopting reports already-tracked.
+    let again = uc
+        .adopt_role(&repo, &repositories_dir, org, project, db, "adopted_u")
+        .await
+        .expect("re-adopt");
+    assert!(!again.newly_adopted, "re-adopt is idempotent");
+
+    // A reserved role, a NOLOGIN group role, and a non-existent role cannot be adopted.
+    assert!(
+        uc.adopt_role(&repo, &repositories_dir, org, project, db, "owner").await.is_err(),
+        "a reserved platform role is not adoptable"
+    );
+    assert!(
+        uc.adopt_role(&repo, &repositories_dir, org, project, db, "developers").await.is_err(),
+        "a reserved NOLOGIN group role is not adoptable"
+    );
+    assert!(
+        uc.adopt_role(&repo, &repositories_dir, org, project, db, "ghost").await.is_err(),
+        "a non-existent role is not adoptable"
+    );
+
+    // Simulate a checkout to a snapshot that predates BOTH customer roles.
+    pg.psql("DROP ROLE adopted_u; DROP ROLE untracked_u;");
+
+    // Only the ADOPTED role is listed absent to re-create; the untracked one is faithful.
+    let absent = uc
+        .list_absent_intended_roles(&repo, &repositories_dir, org, project, db)
+        .await
+        .expect("list absent");
+    assert_eq!(
+        absent,
+        vec![("adopted_u".to_string(), None)],
+        "only the adopted role is re-created; the untracked customer role is left faithful"
+    );
+
+    // The data plane supplies the vaulted password (adopted with its current pw).
+    let specs = vec![RoleSpec {
+        username: "adopted_u".to_string(),
+        password: "adopted_pw_1234".to_string(),
+        preset: None,
+        default_privileges_owner: Some("owner".to_string()),
+    }];
+    let created = uc.ensure_present_roles(&repo, &specs).await.expect("ensure present");
+    assert_eq!(created, vec!["adopted_u".to_string()]);
+
+    // adopted_u is back and authenticates; untracked_u stays gone.
+    assert_eq!(
+        pg.psql("SELECT 1 FROM pg_roles WHERE rolname='adopted_u'"),
+        "1",
+        "the adopted role was re-created"
+    );
+    assert!(
+        login(pg.name(), "adopted_u", "adopted_pw_1234"),
+        "the re-created adopted role authenticates with its vaulted password"
+    );
+    assert_eq!(
+        pg.psql("SELECT count(*) FROM pg_roles WHERE rolname='untracked_u'"),
+        "0",
+        "the untracked customer role is NOT re-created (faithful content)"
+    );
+}

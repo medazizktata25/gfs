@@ -51,6 +51,18 @@ pub struct PresetReapplyOutcome {
     pub failed: Vec<String>,
 }
 
+/// What an adopt did (declarable intent). Returned so the caller can report
+/// whether the role was newly promoted into the managed set or already tracked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptOutcome {
+    /// The adopted role.
+    pub username: String,
+    /// Its current preset (read from the role's comment), carried into the record.
+    pub preset: Option<RolePreset>,
+    /// `false` if the role was already in the intended set (adopt is idempotent).
+    pub newly_adopted: bool,
+}
+
 /// Reconcile the cluster's managed login roles to the repository's intended set.
 pub struct ReconcileManagedUsersUseCase<R: DatabaseProviderRegistry> {
     manage: ManageUsersUseCase<R>,
@@ -275,6 +287,70 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
             );
         }
         Ok(created)
+    }
+
+    /// Adopt an existing customer login role into the managed set — promote it
+    /// from customer content to platform-managed config, so it becomes durable
+    /// (re-created by ensure-present if a restored snapshot predates it) instead of
+    /// being treated as an untracked customer role. Reads the role's current preset
+    /// from the engine and carries it into the record. Idempotent: adopting an
+    /// already-tracked role refreshes its preset and reports `newly_adopted = false`.
+    ///
+    /// Rejects a reserved platform role (already managed) and a NOLOGIN role (only
+    /// login users are adopted). The caller supplies + vaults the role's current
+    /// password out of band, so ensure-present can re-create it unchanged.
+    ///
+    /// # Errors
+    /// The role does not exist, is reserved, or is not a login role; or the
+    /// intended-set read/write fails.
+    pub async fn adopt_role(
+        &self,
+        repo_path: &Path,
+        repositories_dir: &Path,
+        org: &str,
+        project: &str,
+        db: &str,
+        username: &str,
+    ) -> Result<AdoptOutcome, ManageUsersError> {
+        if is_reserved_role(username) {
+            return Err(ManageUsersError::InvalidInput(format!(
+                "'{username}' is a reserved platform role and is already platform-managed"
+            )));
+        }
+        let role = self
+            .manage
+            .list_roles(repo_path)
+            .await?
+            .into_iter()
+            .find(|r| r.username == username)
+            .ok_or_else(|| {
+                ManageUsersError::InvalidInput(format!(
+                    "role '{username}' does not exist; nothing to adopt"
+                ))
+            })?;
+        if !role.can_login {
+            return Err(ManageUsersError::InvalidInput(format!(
+                "'{username}' is a NOLOGIN group role, not a login user; only login users are adopted"
+            )));
+        }
+        let preset = role.preset.as_deref().and_then(RolePreset::parse);
+        let newly_adopted = !IntendedUserSet::load(repositories_dir, org, project, db)
+            .map_err(|e| ManageUsersError::Config(format!("read intended set: {e}")))?
+            .iter()
+            .any(|n| n.as_str() == username);
+        IntendedUserSet::add(repositories_dir, org, project, db, username, preset)
+            .map_err(|e| ManageUsersError::Config(format!("record adopted role: {e}")))?;
+        tracing::info!(
+            user = %username,
+            preset = ?preset,
+            newly_adopted,
+            "adopted a customer role into the managed set (durable across time-travel)"
+        );
+        Ok(AdoptOutcome {
+            username: username.to_string(),
+            preset,
+            newly_adopted,
+        })
     }
 
     /// Re-apply each present managed login role's current **preset** from the
