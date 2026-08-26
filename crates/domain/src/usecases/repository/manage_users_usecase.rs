@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::model::config::GfsConfig;
 use crate::model::db_user::{
-    DeployEnvSpec, GrantSpec, GrantableObject, ObjectPrivilege, Privilege, RevokeSpec, RoleInfo,
-    RolePreset, RoleSpec,
+    DeployEnvSpec, GrantSpec, GrantableObject, ObjectPrivilege, PRESET_GROUP_ROLES, Privilege,
+    RevokeSpec, RoleInfo, RolePreset, RoleSpec,
 };
 use crate::ports::compute::{Compute, ExecOutput, InstanceId};
 use crate::ports::database_provider::{DatabaseProvider, DatabaseProviderRegistry};
@@ -382,12 +382,16 @@ fn reject_superuser_role(username: &str) -> Result<(), ManageUsersError> {
 }
 
 /// Whether `username` is a reserved platform role (`owner`/`developers` + the
-/// management superusers). Public so the reconcile re-key can skip them — a
-/// reserved role must not be re-keyed as a normal managed user. Case-insensitive:
-/// a look-alike like `POSTGRES` is a *distinct* Postgres role, but treating every
-/// case variant as reserved avoids confusion with the real one.
+/// management superusers + the preset group roles). Public so the reconcile
+/// re-key can skip them — a reserved role must not be re-keyed as a normal
+/// managed user. The preset group roles (`gfs_readonly`/`gfs_readwrite`/
+/// `gfs_admin`) carry the platform-managed privilege level; a client must never
+/// create, drop, or rotate one. Case-insensitive: a look-alike like `POSTGRES`
+/// is a *distinct* Postgres role, but treating every case variant as reserved
+/// avoids confusion with the real one.
 pub fn is_reserved_role(username: &str) -> bool {
-    RESERVED_ROLES.contains(&username.to_ascii_lowercase().as_str())
+    let lower = username.to_ascii_lowercase();
+    RESERVED_ROLES.contains(&lower.as_str()) || PRESET_GROUP_ROLES.contains(&lower.as_str())
 }
 
 fn reject_reserved_role(username: &str) -> Result<(), ManageUsersError> {
@@ -428,6 +432,12 @@ mod tests {
         // Case variants of a reserved name are refused (no confusing look-alikes).
         assert!(reject_reserved_role("POSTGRES").is_err());
         assert!(reject_reserved_role("Owner").is_err());
+        // The preset group roles carry the platform-managed level — a client must
+        // never create, drop, or rotate one (any case variant).
+        assert!(reject_reserved_role("gfs_readonly").is_err());
+        assert!(reject_reserved_role("gfs_readwrite").is_err());
+        assert!(reject_reserved_role("gfs_admin").is_err());
+        assert!(reject_reserved_role("GFS_Admin").is_err());
         assert!(reject_reserved_role("app_rw").is_ok());
     }
 

@@ -240,11 +240,12 @@ async fn grant_revoke_list_through_real_usecase() {
 
 /// A preset's `ALTER DEFAULT PRIVILEGES` must be role-scoped to the deploy
 /// `owner` so a preset user automatically sees tables the OWNER creates LATER —
-/// not just the tables that existed at create time: `create_role` with
-/// `default_privileges_owner: Some("owner")` emits `... FOR ROLE "owner" ...`.
-/// The `reader_self` role (owner `None`) is the control: without `FOR ROLE`, a
-/// preset only covers the connecting admin's future objects, so it must NOT see
-/// the owner's future table.
+/// not just the tables that existed at create time. Under the group model this
+/// scoping is a property of the preset GROUP (`ALTER DEFAULT PRIVILEGES FOR ROLE
+/// owner ... TO gfs_readonly`), set once and shared by every member — a database
+/// has a single deploy owner, so all its readonly users correctly see the
+/// owner's future objects via inherited group SELECT. The control is the *level*:
+/// readonly confers SELECT, never INSERT, even on the owner's future table.
 #[tokio::test]
 async fn preset_default_privileges_follow_owner_future_objects() {
     if !docker_ok() {
@@ -266,7 +267,7 @@ async fn preset_default_privileges_follow_owner_future_objects() {
     containers::register_all(&*registry).expect("register providers");
     let uc = ManageUsersUseCase::new(compute, registry);
 
-    // reader: readonly preset whose defaults are role-scoped to `owner` (the fix).
+    // reader: readonly preset whose group defaults are role-scoped to `owner`.
     uc.create_role(
         repo,
         &RoleSpec {
@@ -279,34 +280,21 @@ async fn preset_default_privileges_follow_owner_future_objects() {
     .await
     .expect("create reader");
 
-    // reader_self: readonly preset with NO deploy owner — defaults role-scope to
-    // the connecting admin (postgres), so they cannot cover owner's future objects.
-    uc.create_role(
-        repo,
-        &RoleSpec {
-            username: "reader_self".into(),
-            password: "pw_reader_1234".into(),
-            preset: Some(RolePreset::Readonly),
-            default_privileges_owner: None,
-        },
-    )
-    .await
-    .expect("create reader_self");
-
-    // The OWNER creates a FUTURE table (after both presets were applied).
+    // The OWNER creates a FUTURE table (after the preset was applied).
     pg.psql("SET ROLE owner; CREATE TABLE public.future_t(id int); RESET ROLE;");
 
-    let reader_sees = pg.psql("SELECT has_table_privilege('reader','public.future_t','SELECT')");
-    let reader_self_sees =
-        pg.psql("SELECT has_table_privilege('reader_self','public.future_t','SELECT')");
+    let reader_selects =
+        pg.psql("SELECT has_table_privilege('reader','public.future_t','SELECT')");
+    let reader_inserts =
+        pg.psql("SELECT has_table_privilege('reader','public.future_t','INSERT')");
 
     assert_eq!(
-        reader_sees, "t",
-        "preset defaults FOR ROLE owner must auto-grant SELECT on owner's future table"
+        reader_selects, "t",
+        "readonly group defaults FOR ROLE owner must auto-grant SELECT on owner's future table"
     );
     assert_eq!(
-        reader_self_sees, "f",
-        "control: without FOR ROLE owner, a preset must NOT cover the owner's future objects"
+        reader_inserts, "f",
+        "readonly level must never confer INSERT, even on the owner's future table"
     );
 }
 

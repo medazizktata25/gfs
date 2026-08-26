@@ -39,7 +39,28 @@ impl RolePreset {
             Self::Admin => "admin",
         }
     }
+
+    /// Every preset, for iteration (there is no derive for this).
+    pub const ALL: [RolePreset; 3] = [Self::Readonly, Self::Readwrite, Self::Admin];
+
+    /// The reserved NOLOGIN **group role** whose membership grants this preset's
+    /// privileges. A managed user's level is expressed as membership in exactly
+    /// one of these groups — never as direct object grants on the user — so any
+    /// privilege the customer grants the user directly (via raw SQL) stays
+    /// distinguishable from the platform-managed level and survives a reconcile.
+    pub fn group_role(&self) -> &'static str {
+        match self {
+            Self::Readonly => "gfs_readonly",
+            Self::Readwrite => "gfs_readwrite",
+            Self::Admin => "gfs_admin",
+        }
+    }
 }
+
+/// The reserved NOLOGIN group roles that carry preset privileges. Membership in
+/// one of these is the platform-managed access level; these roles are reserved
+/// (never created, dropped, re-keyed, or tombstoned as ordinary managed users).
+pub const PRESET_GROUP_ROLES: [&str; 3] = ["gfs_readonly", "gfs_readwrite", "gfs_admin"];
 
 /// Everything needed to create a login role.
 #[derive(Debug, Clone)]
