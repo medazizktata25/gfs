@@ -470,6 +470,16 @@ pub trait DatabaseProvider: Send + Sync {
         Err(ProviderError::UnsupportedFormat("list_roles".into()))
     }
 
+    /// In-instance command that prints `username`'s stored password verifier on
+    /// stdout (empty when the role is absent or has no password). The engine
+    /// computes and stores this one-way verifier; possessing it does not let one
+    /// authenticate. It is what the durability store keeps at rest instead of the
+    /// plaintext, and re-key compares it by value to detect credential drift.
+    fn user_verifier_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        let _ = username;
+        Err(ProviderError::UnsupportedFormat("user_verifier".into()))
+    }
+
     /// In-instance command that applies `preset`'s privilege bundle to `username`.
     ///
     /// `default_privileges_owner`, when set, is the role whose FUTURE objects the

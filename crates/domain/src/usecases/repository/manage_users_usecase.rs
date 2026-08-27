@@ -230,6 +230,30 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
             .map_err(|e| ManageUsersError::Parse(e.to_string()))
     }
 
+    /// Read `username`'s stored password verifier (`pg_authid.rolpassword`), or
+    /// `None` when the role is absent or carries no password. The verifier is a
+    /// one-way value: it is what the durability store keeps at rest instead of the
+    /// plaintext, and re-key compares it by value to detect credential drift.
+    ///
+    /// # Errors
+    /// Propagates a provider or exec failure.
+    pub async fn user_verifier(
+        &self,
+        path: &Path,
+        username: &str,
+    ) -> Result<Option<String>, ManageUsersError> {
+        let (provider, container) = self.resolve(path)?;
+        let command = provider
+            .user_verifier_command(username)
+            .map_err(map_provider_err)?;
+        let output = self.run(&container, &command).await?;
+        if output.exit_code != 0 {
+            return Err(fail(output));
+        }
+        let verifier = output.stdout.trim();
+        Ok((!verifier.is_empty()).then(|| verifier.to_string()))
+    }
+
     /// Detect the deploy's object-creating `owner` role (RFC 009 §5.1) so a
     /// preset's `ALTER DEFAULT PRIVILEGES` covers the customer's future tables,
     /// not the connecting admin's. The CLI/MCP don't know the deploy owner: if the

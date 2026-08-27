@@ -165,8 +165,10 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
                         uuid::Uuid::new_v4().simple(),
                         uuid::Uuid::new_v4().simple()
                     );
-                    if let Err(quarantine_err) =
-                        self.manage.quarantine_role(repo_path, &username, &throwaway).await
+                    if let Err(quarantine_err) = self
+                        .manage
+                        .quarantine_role(repo_path, &username, &throwaway)
+                        .await
                     {
                         return Err(ManageUsersError::Failed {
                             exit_code: 1,
@@ -223,22 +225,44 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
         repo_path: &Path,
         passwords: &std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<String>, ManageUsersError> {
+        use crate::model::db_user::is_scram_verifier;
         let mut rekeyed = Vec::new();
-        for (username, password) in passwords {
-            if let Err(e) = self.manage.set_password(repo_path, username, password).await {
+        let mut already_current: usize = 0;
+        for (username, secret) in passwords {
+            // Drift check: when the stored secret is a verifier, compare it by
+            // value against the live catalog verifier. Equal ⇒ the restored
+            // snapshot already carries the current credential, so skip the needless
+            // ALTER (no drift). A legacy plaintext secret cannot be value-compared
+            // (Postgres would re-hash it on apply), so it is always applied.
+            if is_scram_verifier(secret) {
+                match self.manage.user_verifier(repo_path, username).await {
+                    Ok(Some(live)) if &live == secret => {
+                        already_current += 1;
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!(
+                        user = %username,
+                        error = %e,
+                        "re-key: live verifier unreadable; applying the stored credential rather than risk leaving a drifted one"
+                    ),
+                }
+            }
+            if let Err(e) = self.manage.set_password(repo_path, username, secret).await {
                 tracing::warn!(
                     user = %username,
                     error = %e,
-                    "re-key: failed to apply the current password; leaving this role on its snapshot password"
+                    "re-key: failed to apply the current credential; leaving this role on its snapshot password"
                 );
                 continue;
             }
             rekeyed.push(username.clone());
         }
-        if !rekeyed.is_empty() {
+        if !rekeyed.is_empty() || already_current > 0 {
             tracing::warn!(
                 rekeyed = ?rekeyed,
-                "re-keyed managed login roles to their current passwords (a rotated-away password cannot reappear across the version swap)"
+                already_current,
+                "re-key: applied drifted managed credentials, left already-current roles untouched (a rotated-away password cannot reappear across the version swap)"
             );
         }
         Ok(rekeyed)

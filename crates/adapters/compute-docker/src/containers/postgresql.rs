@@ -693,9 +693,10 @@ impl DatabaseProvider for PostgresqlProvider {
             ));
         }
         // Wrap in a transaction so create+grants are atomic (fixes v2 partial-state).
-        Ok(Self::pin_mgmt_search_path(
-            self.query_in_instance_command(&format!("BEGIN;\n{sql}\nCOMMIT;"), None)?,
-        ))
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
+            &format!("BEGIN;\n{sql}\nCOMMIT;"),
+            None,
+        )?))
     }
 
     fn alter_password_command(
@@ -770,6 +771,21 @@ impl DatabaseProvider for PostgresqlProvider {
         let sql = "SELECT COALESCE(json_agg(json_build_object('username', rolname, 'can_login', rolcanlogin, 'is_superuser', rolsuper, 'preset', substring(shobj_description(oid, 'pg_authid') FROM '^gfs-preset:(.*)$')) ORDER BY rolname), '[]'::json) \
                    FROM pg_roles WHERE left(rolname, 3) <> 'pg_' AND rolname NOT IN ('guepard-admin', 'postgres', 'gfs_readonly', 'gfs_readwrite', 'gfs_admin');";
         let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, sql)?;
+        Ok(format!(
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -tA -v ON_ERROR_STOP=1 -c "{body}""#
+        ))
+    }
+
+    fn user_verifier_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        // Superuser-only read of the stored verifier (`pg_authid.rolpassword`). The
+        // management connection is the container superuser. `-tA` yields the bare
+        // verifier on stdout; an absent role or a NULL password yields empty output.
+        const DELIM: &str = "GFS_SQL_EOF";
+        let sql = format!(
+            "SELECT COALESCE(rolpassword, '') FROM pg_authid WHERE rolname = '{}';",
+            sql_lit(username)
+        );
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, &sql)?;
         Ok(format!(
             r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -tA -v ON_ERROR_STOP=1 -c "{body}""#
         ))
@@ -857,9 +873,10 @@ impl DatabaseProvider for PostgresqlProvider {
         )?;
         // Transactional so a multi-statement grant (+ optional default-privileges
         // line) is atomic — no partial grant on failure (fixes v2 gap).
-        Ok(Self::pin_mgmt_search_path(
-            self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"), None)?,
-        ))
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
+            &format!("BEGIN;\n{stmts}\nCOMMIT;"),
+            None,
+        )?))
     }
 
     fn revoke_command(&self, spec: &RevokeSpec) -> std::result::Result<String, ProviderError> {
@@ -872,9 +889,10 @@ impl DatabaseProvider for PostgresqlProvider {
             spec.cascade,
             None,
         )?;
-        Ok(Self::pin_mgmt_search_path(
-            self.query_in_instance_command(&format!("BEGIN;\n{stmts}\nCOMMIT;"), None)?,
-        ))
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
+            &format!("BEGIN;\n{stmts}\nCOMMIT;"),
+            None,
+        )?))
     }
 
     fn list_privileges_command(&self, role: &str) -> std::result::Result<String, ProviderError> {
@@ -1819,7 +1837,9 @@ mod tests {
             "must not revoke object privileges from the user — customer direct grants survive; got:\n{cmd}"
         );
         // Membership revoke precedes the grant (declarative order).
-        let revoke_at = cmd.find(r#"REVOKE "gfs_readonly", "gfs_readwrite""#).unwrap();
+        let revoke_at = cmd
+            .find(r#"REVOKE "gfs_readonly", "gfs_readwrite""#)
+            .unwrap();
         let grant_at = cmd.find(r#"GRANT "gfs_readonly" TO "app_rw""#).unwrap();
         assert!(revoke_at < grant_at, "revoke-all must run before the grant");
     }
@@ -1909,7 +1929,10 @@ mod tests {
             cmd.find("NOLOGIN").unwrap() < cmd.find("WITH PASSWORD").unwrap(),
             "login must be disabled before (or with) the rotation"
         );
-        assert!(cmd.contains("BEGIN;") && cmd.contains("COMMIT;"), "must be transactional");
+        assert!(
+            cmd.contains("BEGIN;") && cmd.contains("COMMIT;"),
+            "must be transactional"
+        );
         assert!(
             provider.quarantine_role_command("bad name", "x").is_err(),
             "an invalid identifier must be rejected, never interpolated"

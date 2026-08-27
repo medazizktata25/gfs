@@ -285,10 +285,8 @@ async fn preset_default_privileges_follow_owner_future_objects() {
     // The OWNER creates a FUTURE table (after the preset was applied).
     pg.psql("SET ROLE owner; CREATE TABLE public.future_t(id int); RESET ROLE;");
 
-    let reader_selects =
-        pg.psql("SELECT has_table_privilege('reader','public.future_t','SELECT')");
-    let reader_inserts =
-        pg.psql("SELECT has_table_privilege('reader','public.future_t','INSERT')");
+    let reader_selects = pg.psql("SELECT has_table_privilege('reader','public.future_t','SELECT')");
+    let reader_inserts = pg.psql("SELECT has_table_privilege('reader','public.future_t','INSERT')");
 
     assert_eq!(
         reader_selects, "t",
@@ -389,8 +387,10 @@ async fn reconcile_drops_tombstoned_roles_and_keeps_untracked_ones_on_live_pg() 
     // app_ro is a live managed user; app_stale was deprovisioned (tombstoned).
     // app_untracked is deliberately NOT recorded — a customer's own SQL role, which
     // reconcile must never touch.
-    IntendedUserSet::add(&repositories_dir, org, project, db, "app_ro", None).expect("record live user");
-    IntendedUserSet::tombstone(&repositories_dir, org, project, db, "app_stale").expect("tombstone");
+    IntendedUserSet::add(&repositories_dir, org, project, db, "app_ro", None)
+        .expect("record live user");
+    IntendedUserSet::tombstone(&repositories_dir, org, project, db, "app_stale")
+        .expect("tombstone");
 
     let compute = Arc::new(DockerCompute::new().expect("docker compute"));
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
@@ -398,7 +398,14 @@ async fn reconcile_drops_tombstoned_roles_and_keeps_untracked_ones_on_live_pg() 
     let uc = ReconcileManagedUsersUseCase::new(compute, registry);
 
     let outcome = uc
-        .reconcile(&repo, &repositories_dir, org, project, db, ReconcileMode::Faithful)
+        .reconcile(
+            &repo,
+            &repositories_dir,
+            org,
+            project,
+            db,
+            ReconcileMode::Faithful,
+        )
         .await
         .expect("reconcile");
 
@@ -410,7 +417,11 @@ async fn reconcile_drops_tombstoned_roles_and_keeps_untracked_ones_on_live_pg() 
         vec!["app_stale".to_string()],
         "only the tombstoned + resurrected LOGIN role is dropped"
     );
-    assert_eq!(exists("app_stale"), "", "the tombstoned role must be gone after reconcile");
+    assert_eq!(
+        exists("app_stale"),
+        "",
+        "the tombstoned role must be gone after reconcile"
+    );
     assert_eq!(exists("app_ro"), "1", "the live managed user must survive");
     assert_eq!(
         exists("app_untracked"),
@@ -418,11 +429,22 @@ async fn reconcile_drops_tombstoned_roles_and_keeps_untracked_ones_on_live_pg() 
         "an UNTRACKED customer SQL role must NEVER be dropped (the allowlist over-reach is gone)"
     );
     assert_eq!(exists("owner"), "1", "owner must survive");
-    assert_eq!(exists("developers"), "1", "the developers group must survive");
+    assert_eq!(
+        exists("developers"),
+        "1",
+        "the developers group must survive"
+    );
 
     // Idempotent: app_stale is gone, so a second reconcile drops nothing.
     let again = uc
-        .reconcile(&repo, &repositories_dir, org, project, db, ReconcileMode::Faithful)
+        .reconcile(
+            &repo,
+            &repositories_dir,
+            org,
+            project,
+            db,
+            ReconcileMode::Faithful,
+        )
         .await
         .expect("reconcile idempotent");
     assert!(
@@ -490,7 +512,17 @@ async fn reconcile_quarantines_a_surplus_role_it_cannot_drop_on_live_pg() {
     pg.psql("CREATE DATABASE otherdb;");
     let exec_otherdb = |sql: &str| {
         let out = Command::new("docker")
-            .args(["exec", pg.name(), "psql", "-U", "postgres", "-d", "otherdb", "-tAc", sql])
+            .args([
+                "exec",
+                pg.name(),
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "otherdb",
+                "-tAc",
+                sql,
+            ])
             .output()
             .expect("docker exec psql -d otherdb");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -508,7 +540,8 @@ async fn reconcile_quarantines_a_surplus_role_it_cannot_drop_on_live_pg() {
     // app_stale was deprovisioned (tombstoned) but the restored snapshot resurrects
     // it; reconcile will try to drop it and fall back to quarantine.
     IntendedUserSet::seed(&repositories_dir, org, project, db).expect("seed intended");
-    IntendedUserSet::tombstone(&repositories_dir, org, project, db, "app_stale").expect("tombstone");
+    IntendedUserSet::tombstone(&repositories_dir, org, project, db, "app_stale")
+        .expect("tombstone");
 
     // The resurrected credential is LIVE before reconcile (the exposure this closes).
     assert!(
@@ -524,7 +557,14 @@ async fn reconcile_quarantines_a_surplus_role_it_cannot_drop_on_live_pg() {
 
     // Must NOT fail-close even though DROP ROLE cannot run: degrade to quarantine.
     let outcome = uc
-        .reconcile(&repo, &repositories_dir, org, project, db, ReconcileMode::Faithful)
+        .reconcile(
+            &repo,
+            &repositories_dir,
+            org,
+            project,
+            db,
+            ReconcileMode::Faithful,
+        )
         .await
         .expect("reconcile must degrade to quarantine, never brick, when DROP can't run");
 
@@ -573,7 +613,14 @@ async fn reconcile_quarantines_a_surplus_role_it_cannot_drop_on_live_pg() {
     // role is already NOLOGIN, so it is no longer a *login* role to reconcile; it
     // stays neutralized (a real later checkout that restores LOGIN re-quarantines).
     let again = uc
-        .reconcile(&repo, &repositories_dir, org, project, db, ReconcileMode::Faithful)
+        .reconcile(
+            &repo,
+            &repositories_dir,
+            org,
+            project,
+            db,
+            ReconcileMode::Faithful,
+        )
         .await
         .expect("second reconcile must not brick");
     assert!(
@@ -615,8 +662,15 @@ async fn ensure_present_recreates_a_live_managed_user_missing_from_the_snapshot(
     std::fs::create_dir_all(&repo).expect("mkdir repo");
     write_repo(&repo, pg.name());
     // The record says app_x is a live managed user with a readonly preset.
-    IntendedUserSet::add(&repositories_dir, org, project, db, "app_x", Some(RolePreset::Readonly))
-        .expect("record live managed user");
+    IntendedUserSet::add(
+        &repositories_dir,
+        org,
+        project,
+        db,
+        "app_x",
+        Some(RolePreset::Readonly),
+    )
+    .expect("record live managed user");
 
     let compute = Arc::new(DockerCompute::new().expect("docker compute"));
     let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
@@ -641,7 +695,10 @@ async fn ensure_present_recreates_a_live_managed_user_missing_from_the_snapshot(
         preset: Some(RolePreset::Readonly),
         default_privileges_owner: Some("owner".to_string()),
     }];
-    let created = uc.ensure_present_roles(&repo, &specs).await.expect("ensure present");
+    let created = uc
+        .ensure_present_roles(&repo, &specs)
+        .await
+        .expect("ensure present");
     assert_eq!(created, vec!["app_x".to_string()]);
 
     // app_x now exists and authenticates with its current password.
@@ -660,7 +717,10 @@ async fn ensure_present_recreates_a_live_managed_user_missing_from_the_snapshot(
         .list_absent_intended_roles(&repo, &repositories_dir, org, project, db)
         .await
         .expect("list absent again");
-    assert!(none.is_empty(), "no live managed user is absent after ensure-present");
+    assert!(
+        none.is_empty(),
+        "no live managed user is absent after ensure-present"
+    );
 }
 
 /// A checkout restores a role's *snapshot* password. `reapply_passwords` re-applies
@@ -691,18 +751,34 @@ async fn reapply_passwords_applies_current_over_stale_on_live_pg() {
     let uc = ReconcileManagedUsersUseCase::new(compute, registry);
 
     // Baseline: the stale password authenticates.
-    assert!(login(pg.name(), "app_rw", "p_old_stale_1234"), "baseline: stale pw authenticates pre-rekey");
+    assert!(
+        login(pg.name(), "app_rw", "p_old_stale_1234"),
+        "baseline: stale pw authenticates pre-rekey"
+    );
 
     // The DP enumerates rekeyable roles, resolves each current password from the
     // vault, and hands the map back to the domain to apply.
-    let rekeyable = uc.list_rekeyable_roles(&repo).await.expect("list rekeyable");
-    assert!(rekeyable.contains(&"app_rw".to_string()), "app_rw is a rekeyable login role");
+    let rekeyable = uc
+        .list_rekeyable_roles(&repo)
+        .await
+        .expect("list rekeyable");
+    assert!(
+        rekeyable.contains(&"app_rw".to_string()),
+        "app_rw is a rekeyable login role"
+    );
     let mut passwords = std::collections::BTreeMap::new();
     passwords.insert("app_rw".to_string(), "p_new_current_1234".to_string());
-    let rekeyed = uc.reapply_passwords(&repo, &passwords).await.expect("reapply");
+    let rekeyed = uc
+        .reapply_passwords(&repo, &passwords)
+        .await
+        .expect("reapply");
 
     // The container is removed by `pg`'s Drop even on a failed assertion below.
-    assert_eq!(rekeyed, vec!["app_rw".to_string()], "the login role is re-keyed");
+    assert_eq!(
+        rekeyed,
+        vec!["app_rw".to_string()],
+        "the login role is re-keyed"
+    );
     assert!(
         login(pg.name(), "app_rw", "p_new_current_1234"),
         "current password must authenticate after re-key"
@@ -775,9 +851,16 @@ async fn reapply_presets_enforces_the_recorded_preset_over_snapshot_privileges_o
     let select_after = pg.psql("SELECT has_table_privilege('app','public.t','SELECT')");
 
     // The container is removed by `pg`'s Drop even on a failed assertion below.
-    assert_eq!(outcome.reapplied, vec!["app".to_string()], "app's preset is re-applied");
+    assert_eq!(
+        outcome.reapplied,
+        vec!["app".to_string()],
+        "app's preset is re-applied"
+    );
     assert!(outcome.failed.is_empty(), "no re-apply failures");
-    assert_eq!(insert_before, "t", "readwrite grants INSERT (snapshot state)");
+    assert_eq!(
+        insert_before, "t",
+        "readwrite grants INSERT (snapshot state)"
+    );
     assert_eq!(
         insert_after, "f",
         "re-applying the recorded readonly preset revokes INSERT — the downgrade holds"
@@ -833,11 +916,15 @@ async fn adopt_promotes_a_customer_role_into_the_managed_set_making_it_durable()
 
     // A reserved role, a NOLOGIN group role, and a non-existent role cannot be adopted.
     assert!(
-        uc.adopt_role(&repo, &repositories_dir, org, project, db, "owner").await.is_err(),
+        uc.adopt_role(&repo, &repositories_dir, org, project, db, "owner")
+            .await
+            .is_err(),
         "a reserved platform role is not adoptable"
     );
     assert!(
-        uc.adopt_role(&repo, &repositories_dir, org, project, db, "developers").await.is_err(),
+        uc.adopt_role(&repo, &repositories_dir, org, project, db, "developers")
+            .await
+            .is_err(),
         "a reserved NOLOGIN group role is not adoptable"
     );
     assert!(
@@ -847,7 +934,9 @@ async fn adopt_promotes_a_customer_role_into_the_managed_set_making_it_durable()
         "a non-reserved role that cannot log in is not adoptable"
     );
     assert!(
-        uc.adopt_role(&repo, &repositories_dir, org, project, db, "ghost").await.is_err(),
+        uc.adopt_role(&repo, &repositories_dir, org, project, db, "ghost")
+            .await
+            .is_err(),
         "a non-existent role is not adoptable"
     );
 
@@ -872,7 +961,10 @@ async fn adopt_promotes_a_customer_role_into_the_managed_set_making_it_durable()
         preset: None,
         default_privileges_owner: Some("owner".to_string()),
     }];
-    let created = uc.ensure_present_roles(&repo, &specs).await.expect("ensure present");
+    let created = uc
+        .ensure_present_roles(&repo, &specs)
+        .await
+        .expect("ensure present");
     assert_eq!(created, vec!["adopted_u".to_string()]);
 
     // adopted_u is back and authenticates; untracked_u stays gone.
@@ -940,7 +1032,10 @@ async fn a_managed_user_cannot_escape_the_reserved_group_fence() {
         "false",
         "the preset-group membership carries no ADMIN OPTION"
     );
-    assert!(login(pg.name(), "app", "app_pw_1234"), "app can log in (baseline)");
+    assert!(
+        login(pg.name(), "app", "app_pw_1234"),
+        "app can log in (baseline)"
+    );
 
     // Positive control: the SAME harness runs a permitted statement AS app and it
     // succeeds — proving `as_user_ok` genuinely executes and distinguishes allow from
@@ -987,5 +1082,144 @@ async fn a_managed_user_cannot_escape_the_reserved_group_fence() {
         pg.psql("SELECT count(*)::text FROM pg_roles WHERE rolname='evil'"),
         "0",
         "app created no roles (NOCREATEROLE)"
+    );
+}
+
+/// SCRAM verifier at rest + credential-drift skip on re-key. The durability
+/// secret stored and compared is the engine-computed verifier, never the
+/// plaintext: a role set to another role's verifier authenticates with the
+/// ORIGINAL plaintext; re-key skips a role whose live verifier already matches the
+/// stored one (no drift) and applies only on drift; a legacy pre-verifier
+/// plaintext secret is always applied.
+#[tokio::test]
+async fn rekey_stores_and_compares_verifiers_not_plaintext() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    let pg = Postgres::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path();
+    write_repo(repo, pg.name());
+
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+    let mu = ManageUsersUseCase::new(compute.clone(), registry.clone());
+    let recon = ReconcileManagedUsersUseCase::new(compute, registry);
+
+    // alice with a known plaintext → read back her stored verifier.
+    mu.create_role(
+        repo,
+        &RoleSpec {
+            username: "alice".into(),
+            password: "alice_pw_AAAA".into(),
+            preset: None,
+            default_privileges_owner: None,
+        },
+    )
+    .await
+    .expect("create alice");
+    let v_alice = mu
+        .user_verifier(repo, "alice")
+        .await
+        .expect("read verifier")
+        .expect("alice has a verifier");
+    assert!(
+        v_alice.starts_with("SCRAM-SHA-256$"),
+        "the stored form is a verifier, not the plaintext: {v_alice}"
+    );
+    assert_ne!(
+        v_alice, "alice_pw_AAAA",
+        "the verifier is not the plaintext"
+    );
+
+    // #22 core: set bob's credential to alice's VERIFIER verbatim → bob then
+    // authenticates with ALICE's plaintext (the durability mechanism), proving a
+    // verifier applies verbatim and is login-equivalent to the original plaintext.
+    mu.create_role(
+        repo,
+        &RoleSpec {
+            username: "bob".into(),
+            password: "bob_pw_BBBB".into(),
+            preset: None,
+            default_privileges_owner: None,
+        },
+    )
+    .await
+    .expect("create bob");
+    let mut to_alice_verifier = std::collections::BTreeMap::new();
+    to_alice_verifier.insert("bob".to_string(), v_alice.clone());
+    let rekeyed = recon
+        .reapply_passwords(repo, &to_alice_verifier)
+        .await
+        .expect("rekey bob");
+    assert_eq!(
+        rekeyed,
+        vec!["bob".to_string()],
+        "bob's live verifier differs from alice's → applied"
+    );
+    assert!(
+        login(pg.name(), "bob", "alice_pw_AAAA"),
+        "bob authenticates with alice's plaintext via the applied verifier"
+    );
+    assert!(
+        !login(pg.name(), "bob", "bob_pw_BBBB"),
+        "bob's old password no longer works after re-key"
+    );
+
+    // #35 drift-skip: re-applying alice's OWN verifier while live already matches →
+    // no-op, returns empty (the needless ALTER is skipped).
+    let mut alice_same = std::collections::BTreeMap::new();
+    alice_same.insert("alice".to_string(), v_alice.clone());
+    let skipped = recon
+        .reapply_passwords(repo, &alice_same)
+        .await
+        .expect("rekey alice no-op");
+    assert!(
+        skipped.is_empty(),
+        "alice's live verifier already matches the stored one → re-key skipped"
+    );
+
+    // #35 drift-correct: rotate alice's live credential out-of-band, then re-key to
+    // the stored verifier → drift detected → applied → reverts to alice_pw_AAAA.
+    mu.set_password(repo, "alice", "alice_rotated_XXXX")
+        .await
+        .expect("rotate alice");
+    assert!(
+        login(pg.name(), "alice", "alice_rotated_XXXX"),
+        "rotation took"
+    );
+    let corrected = recon
+        .reapply_passwords(repo, &alice_same)
+        .await
+        .expect("rekey alice drift");
+    assert_eq!(
+        corrected,
+        vec!["alice".to_string()],
+        "alice's live verifier drifted from the stored one → re-key applied"
+    );
+    assert!(
+        login(pg.name(), "alice", "alice_pw_AAAA"),
+        "alice reverted to her stored (vaulted) credential"
+    );
+
+    // Legacy pre-verifier plaintext secret: not a verifier → cannot be value-
+    // compared → always applied (pg hashes it), so durability still holds.
+    let mut legacy = std::collections::BTreeMap::new();
+    legacy.insert("alice".to_string(), "legacy_plain_LLLL".to_string());
+    let applied = recon
+        .reapply_passwords(repo, &legacy)
+        .await
+        .expect("rekey alice legacy");
+    assert_eq!(
+        applied,
+        vec!["alice".to_string()],
+        "a legacy plaintext secret is applied unconditionally"
+    );
+    assert!(
+        login(pg.name(), "alice", "legacy_plain_LLLL"),
+        "the legacy plaintext took effect (engine hashed it on apply)"
     );
 }

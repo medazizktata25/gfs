@@ -62,6 +62,16 @@ impl RolePreset {
 /// (never created, dropped, re-keyed, or tombstoned as ordinary managed users).
 pub const PRESET_GROUP_ROLES: [&str; 3] = ["gfs_readonly", "gfs_readwrite", "gfs_admin"];
 
+/// Whether a stored durability secret is already an engine-computed SCRAM
+/// verifier rather than a legacy pre-verifier plaintext. Postgres stores a
+/// verifier verbatim and would re-hash a plaintext, so only verifier-vs-verifier
+/// is a valid value comparison — re-key uses this to decide whether a stored
+/// secret can be drift-compared against the live catalog (verifier) or must be
+/// applied unconditionally (legacy plaintext).
+pub fn is_scram_verifier(secret: &str) -> bool {
+    secret.starts_with("SCRAM-SHA-256$")
+}
+
 /// Everything needed to create a login role.
 #[derive(Debug, Clone)]
 pub struct RoleSpec {
@@ -424,5 +434,17 @@ mod tests {
             serde_json::from_str::<GrantableObject>(&json).unwrap(),
             object
         );
+    }
+
+    #[test]
+    fn is_scram_verifier_distinguishes_verifiers_from_plaintext() {
+        assert!(is_scram_verifier(
+            "SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy"
+        ));
+        assert!(!is_scram_verifier("hunter2"));
+        assert!(!is_scram_verifier("md5abc123"));
+        assert!(!is_scram_verifier(""));
+        // A plaintext that merely mentions scram is not the verifier prefix.
+        assert!(!is_scram_verifier("my-SCRAM-SHA-256-password"));
     }
 }
