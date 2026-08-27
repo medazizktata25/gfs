@@ -19,7 +19,9 @@ use gfs_domain::model::db_user::{
 };
 use gfs_domain::ports::database_provider::InMemoryDatabaseProviderRegistry;
 use gfs_domain::usecases::repository::manage_users_usecase::ManageUsersUseCase;
-use gfs_domain::usecases::repository::reconcile_managed_users_usecase::ReconcileManagedUsersUseCase;
+use gfs_domain::usecases::repository::reconcile_managed_users_usecase::{
+    ReconcileManagedUsersUseCase, ReconcileMode,
+};
 use gfs_domain::utils::intended_users::IntendedUserSet;
 
 /// A container name unique to each call (pid + counter) so tests never collide,
@@ -396,7 +398,7 @@ async fn reconcile_drops_tombstoned_roles_and_keeps_untracked_ones_on_live_pg() 
     let uc = ReconcileManagedUsersUseCase::new(compute, registry);
 
     let outcome = uc
-        .reconcile(&repo, &repositories_dir, org, project, db, "checkout")
+        .reconcile(&repo, &repositories_dir, org, project, db, ReconcileMode::Faithful)
         .await
         .expect("reconcile");
 
@@ -420,7 +422,7 @@ async fn reconcile_drops_tombstoned_roles_and_keeps_untracked_ones_on_live_pg() 
 
     // Idempotent: app_stale is gone, so a second reconcile drops nothing.
     let again = uc
-        .reconcile(&repo, &repositories_dir, org, project, db, "checkout")
+        .reconcile(&repo, &repositories_dir, org, project, db, ReconcileMode::Faithful)
         .await
         .expect("reconcile idempotent");
     assert!(
@@ -507,7 +509,7 @@ async fn reconcile_quarantines_a_surplus_role_it_cannot_drop_on_live_pg() {
 
     // Must NOT fail-close even though DROP ROLE cannot run: degrade to quarantine.
     let outcome = uc
-        .reconcile(&repo, &repositories_dir, org, project, db, "checkout")
+        .reconcile(&repo, &repositories_dir, org, project, db, ReconcileMode::Faithful)
         .await
         .expect("reconcile must degrade to quarantine, never brick, when DROP can't run");
 
@@ -556,7 +558,7 @@ async fn reconcile_quarantines_a_surplus_role_it_cannot_drop_on_live_pg() {
     // role is already NOLOGIN, so it is no longer a *login* role to reconcile; it
     // stays neutralized (a real later checkout that restores LOGIN re-quarantines).
     let again = uc
-        .reconcile(&repo, &repositories_dir, org, project, db, "checkout")
+        .reconcile(&repo, &repositories_dir, org, project, db, ReconcileMode::Faithful)
         .await
         .expect("second reconcile must not brick");
     assert!(

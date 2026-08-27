@@ -40,6 +40,32 @@ impl ReconcileOutcome {
     }
 }
 
+/// How a version swap should treat the managed-user set — the checkout/clone
+/// split made explicit, so a caller must declare which trust relationship the
+/// restored data has to the current node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileMode {
+    /// In-place time-travel (`checkout` / branch): faithful content. The platform
+    /// re-asserts only its own config (drop tombstoned users, ensure-present,
+    /// re-key, re-apply presets); a customer's own roles and grants are untouched.
+    Faithful,
+    /// A new trust domain (`clone`, typically prod→dev): the inherited managed
+    /// state is derived, so platform credentials are re-keyed at the trust-boundary
+    /// crossing — the caller fresh-resets the owner and tombstones the inherited
+    /// login roles before reconciling.
+    Derived,
+}
+
+impl ReconcileMode {
+    /// Log/audit label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Faithful => "faithful",
+            Self::Derived => "derived",
+        }
+    }
+}
+
 /// What a preset re-apply did (RFC 012 phase 3). `failed` is returned so the caller
 /// surfaces it — a failed re-apply leaves that role on its restored-snapshot
 /// privileges (a revoked privilege may be live), which must be visible, not silent.
@@ -78,8 +104,9 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
     /// Drop every managed **login** role on the cluster that is not in the
     /// repository's intended set. `repo_path` resolves the cluster (its `.gfs`
     /// config); the `(org, project, db)` triple + `repositories_dir` key the
-    /// out-of-tree intended-set record. `trigger` names the operation for the
-    /// log/audit.
+    /// out-of-tree intended-set record. `mode` declares the trust relationship of
+    /// the restored data (faithful in-place checkout vs derived clone) for the
+    /// log/audit and the caller's surrounding re-key policy.
     ///
     /// Fail-closed: a listing error propagates (never leave surplus roles by
     /// silently skipping). Idempotent: an already-aligned cluster drops nothing.
@@ -96,7 +123,7 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
         org: &str,
         project: &str,
         db: &str,
-        trigger: &str,
+        mode: ReconcileMode,
     ) -> Result<ReconcileOutcome, ManageUsersError> {
         // Deprovision is intent-driven: reconcile removes only the login roles the
         // platform explicitly tombstoned (deprovisioned via the managed route) that
@@ -155,7 +182,7 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
 
         if !outcome.is_noop() {
             tracing::warn!(
-                trigger,
+                mode = mode.as_str(),
                 dropped = ?outcome.dropped,
                 quarantined = ?outcome.quarantined,
                 "reconcile removed deprovisioned managed login roles resurrected by the version swap (revoked access made durable)"
@@ -550,5 +577,13 @@ mod tests {
             vec!["app_x".to_string()],
             "a reserved login role is never dropped; only the non-reserved tombstoned one"
         );
+    }
+
+    #[test]
+    fn reconcile_mode_labels_are_stable() {
+        // The checkout/clone split is explicit: faithful in-place time-travel vs a
+        // derived new-trust-domain clone. The labels flow into logs/audit.
+        assert_eq!(ReconcileMode::Faithful.as_str(), "faithful");
+        assert_eq!(ReconcileMode::Derived.as_str(), "derived");
     }
 }
