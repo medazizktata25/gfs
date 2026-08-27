@@ -202,6 +202,21 @@ impl<R: DatabaseProviderRegistry> ReconcileManagedUsersUseCase<R> {
     ///
     /// # Errors
     /// Propagates a failure to list the cluster's roles.
+    /// Read a managed user's live stored verifier (`pg_authid.rolpassword`).
+    /// Passthrough to [`ManageUsersUseCase::user_verifier`] so the data plane can
+    /// upgrade a legacy plaintext durability entry to the verifier after a re-key
+    /// without reaching past this use case.
+    ///
+    /// # Errors
+    /// Propagates a provider or exec failure.
+    pub async fn user_verifier(
+        &self,
+        repo_path: &Path,
+        username: &str,
+    ) -> Result<Option<String>, ManageUsersError> {
+        self.manage.user_verifier(repo_path, username).await
+    }
+
     pub async fn list_rekeyable_roles(
         &self,
         repo_path: &Path,

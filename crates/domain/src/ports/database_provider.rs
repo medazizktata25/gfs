@@ -471,10 +471,12 @@ pub trait DatabaseProvider: Send + Sync {
     }
 
     /// In-instance command that prints `username`'s stored password verifier on
-    /// stdout (empty when the role is absent or has no password). The engine
-    /// computes and stores this one-way verifier; possessing it does not let one
-    /// authenticate. It is what the durability store keeps at rest instead of the
-    /// plaintext, and re-key compares it by value to detect credential drift.
+    /// stdout (empty when the role is absent or has no password). It is what the
+    /// durability store keeps at rest instead of the plaintext, and re-key compares
+    /// it by value to detect credential drift. With the default SCRAM-SHA-256
+    /// encryption this verifier is one-way (a store compromise does not yield a
+    /// reusable credential); under the deprecated `password_encryption = md5` the
+    /// stored hash is auth-equivalent, so that at-rest property assumes SCRAM.
     fn user_verifier_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
         let _ = username;
         Err(ProviderError::UnsupportedFormat("user_verifier".into()))
