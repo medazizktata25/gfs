@@ -449,6 +449,21 @@ fn login(container: &str, user: &str, password: &str) -> bool {
     out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1"
 }
 
+/// Run one statement AS a managed client user (over the customer-facing scram
+/// endpoint, not the mgmt loopback), returning whether it SUCCEEDED. A
+/// permission-denied error makes psql (with `ON_ERROR_STOP`) exit non-zero, so a
+/// rejected escape reads as `false`.
+fn as_user_ok(container: &str, user: &str, password: &str, sql: &str) -> bool {
+    let cmd = format!(
+        "PGPASSWORD='{password}' psql -h \"$(hostname -i)\" -U '{user}' -d postgres -v ON_ERROR_STOP=1 -c \"{sql}\""
+    );
+    Command::new("docker")
+        .args(["exec", container, "sh", "-c", &cmd])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// A surplus role that cannot be DROPped (it owns objects in another database, so
 /// REASSIGN/DROP OWNED in the reconcile db cannot clear the dependency) must be
 /// QUARANTINED — disabled + password rotated — never left able to log in, and the
@@ -865,5 +880,95 @@ async fn adopt_promotes_a_customer_role_into_the_managed_set_making_it_durable()
         pg.psql("SELECT count(*) FROM pg_roles WHERE rolname='untracked_u'"),
         "0",
         "the untracked customer role is NOT re-created (faithful content)"
+    );
+}
+
+/// The reserved-group fence, verified (not enforced via an in-DB trigger — Postgres
+/// event triggers do NOT fire on GRANT / role DDL). A managed customer user is
+/// NOSUPERUSER NOCREATEROLE and holds its preset-group membership WITHOUT admin
+/// option, so it cannot escape the platform-managed level via raw SQL: it can
+/// neither drop nor alter a reserved group role, grant itself into a higher group,
+/// create roles, nor self-escalate to superuser. "Membership == level" is only
+/// trustworthy because these attempts are denied by the standard privilege system.
+#[tokio::test]
+async fn a_managed_user_cannot_escape_the_reserved_group_fence() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    let pg = Postgres::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path();
+    write_repo(repo, pg.name());
+
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+    let uc = ManageUsersUseCase::new(compute, registry);
+
+    // A managed readonly user — the platform grants it INTO gfs_readonly.
+    uc.create_role(
+        repo,
+        &RoleSpec {
+            username: "app".into(),
+            password: "app_pw_1234".into(),
+            preset: Some(RolePreset::Readonly),
+            default_privileges_owner: None,
+        },
+    )
+    .await
+    .expect("create app");
+
+    // Fence preconditions: not privileged, and the group membership has no ADMIN OPTION.
+    assert_eq!(
+        pg.psql("SELECT (rolsuper OR rolcreaterole OR rolcreatedb)::text FROM pg_roles WHERE rolname='app'"),
+        "false",
+        "a managed user is never SUPERUSER / CREATEROLE / CREATEDB"
+    );
+    assert_eq!(
+        pg.psql("SELECT COALESCE(bool_or(admin_option), false)::text FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid JOIN pg_roles u ON u.oid = m.member WHERE u.rolname='app' AND g.rolname IN ('gfs_readonly','gfs_readwrite','gfs_admin')"),
+        "false",
+        "the preset-group membership carries no ADMIN OPTION"
+    );
+    assert!(login(pg.name(), "app", "app_pw_1234"), "app can log in (baseline)");
+
+    // Every privilege-escalation attempt, run AS app, must be REJECTED.
+    let escapes = [
+        "DROP ROLE gfs_readonly",
+        "ALTER ROLE gfs_admin NOLOGIN",
+        "GRANT gfs_admin TO app",
+        "GRANT gfs_readwrite TO app",
+        "CREATE ROLE evil LOGIN PASSWORD 'x'",
+        "ALTER ROLE app SUPERUSER",
+        "ALTER ROLE app CREATEROLE",
+    ];
+    for sql in escapes {
+        assert!(
+            !as_user_ok(pg.name(), "app", "app_pw_1234", sql),
+            "the reserved-group fence must reject: {sql}"
+        );
+    }
+
+    // The fence held: reserved groups intact, app not escalated, no new role created.
+    assert_eq!(
+        pg.psql("SELECT count(*)::text FROM pg_roles WHERE rolname IN ('gfs_readonly','gfs_readwrite','gfs_admin')"),
+        "3",
+        "the reserved group roles are intact"
+    );
+    assert_eq!(
+        pg.psql("SELECT rolsuper::text FROM pg_roles WHERE rolname='app'"),
+        "false",
+        "app did not self-escalate to superuser"
+    );
+    assert_eq!(
+        pg.psql("SELECT pg_has_role('app','gfs_admin','MEMBER')::text"),
+        "false",
+        "app did not grant itself into gfs_admin"
+    );
+    assert_eq!(
+        pg.psql("SELECT count(*)::text FROM pg_roles WHERE rolname='evil'"),
+        "0",
+        "app created no roles (NOCREATEROLE)"
     );
 }
