@@ -800,6 +800,9 @@ async fn adopt_promotes_a_customer_role_into_the_managed_set_making_it_durable()
     let pg = Postgres::start();
     // Deploy defaults + two login roles a customer made via RAW SQL (untracked).
     pg.psql("CREATE ROLE owner LOGIN; CREATE ROLE developers NOLOGIN;");
+    // A customer-made NOLOGIN group role whose name is NOT reserved: it passes the
+    // reserved check but must still be refused because it cannot log in.
+    pg.psql("CREATE ROLE analytics_grp NOLOGIN;");
     pg.psql("CREATE ROLE adopted_u LOGIN PASSWORD 'adopted_pw_1234';");
     pg.psql("CREATE ROLE untracked_u LOGIN PASSWORD 'untracked_pw_1234';");
 
@@ -836,6 +839,12 @@ async fn adopt_promotes_a_customer_role_into_the_managed_set_making_it_durable()
     assert!(
         uc.adopt_role(&repo, &repositories_dir, org, project, db, "developers").await.is_err(),
         "a reserved NOLOGIN group role is not adoptable"
+    );
+    assert!(
+        uc.adopt_role(&repo, &repositories_dir, org, project, db, "analytics_grp")
+            .await
+            .is_err(),
+        "a non-reserved role that cannot log in is not adoptable"
     );
     assert!(
         uc.adopt_role(&repo, &repositories_dir, org, project, db, "ghost").await.is_err(),
@@ -932,6 +941,14 @@ async fn a_managed_user_cannot_escape_the_reserved_group_fence() {
         "the preset-group membership carries no ADMIN OPTION"
     );
     assert!(login(pg.name(), "app", "app_pw_1234"), "app can log in (baseline)");
+
+    // Positive control: the SAME harness runs a permitted statement AS app and it
+    // succeeds — proving `as_user_ok` genuinely executes and distinguishes allow from
+    // deny, so the rejected escapes below are real denials, not a dead connection.
+    assert!(
+        as_user_ok(pg.name(), "app", "app_pw_1234", "SELECT 1"),
+        "a permitted statement AS app must succeed"
+    );
 
     // Every privilege-escalation attempt, run AS app, must be REJECTED.
     let escapes = [
