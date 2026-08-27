@@ -1169,6 +1169,25 @@ async fn rekey_stores_and_compares_verifiers_not_plaintext() {
         "bob's old password no longer works after re-key"
     );
 
+    // #22 via CREATE ROLE: ensure-present re-creates an absent managed user with the
+    // vaulted verifier. CREATE ROLE also stores a verifier verbatim (not re-hashed),
+    // so the re-created role authenticates with the ORIGINAL plaintext.
+    mu.create_role(
+        repo,
+        &RoleSpec {
+            username: "carol".into(),
+            password: v_alice.clone(),
+            preset: None,
+            default_privileges_owner: None,
+        },
+    )
+    .await
+    .expect("create carol with a verifier");
+    assert!(
+        login(pg.name(), "carol", "alice_pw_AAAA"),
+        "carol, created with alice's verifier, authenticates with alice's plaintext"
+    );
+
     // #35 drift-skip: re-applying alice's OWN verifier while live already matches →
     // no-op, returns empty (the needless ALTER is skipped).
     let mut alice_same = std::collections::BTreeMap::new();
