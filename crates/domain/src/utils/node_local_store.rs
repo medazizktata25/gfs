@@ -51,10 +51,8 @@ fn triple(org: &str, project: &str, db: &str) -> io::Result<PathBuf> {
 /// An identity segment must be a single, non-empty path component — no separators,
 /// `.`/`..`, or NUL — so a triple can never escape the store root.
 fn validate_segment<'a>(label: &str, value: &'a str) -> io::Result<&'a str> {
-    let ok = !value.is_empty()
-        && value != "."
-        && value != ".."
-        && !value.contains(['/', '\\', '\0']);
+    let ok =
+        !value.is_empty() && value != "." && value != ".." && !value.contains(['/', '\\', '\0']);
     if ok {
         Ok(value)
     } else {

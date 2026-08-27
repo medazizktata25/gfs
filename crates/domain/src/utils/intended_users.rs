@@ -314,7 +314,10 @@ mod tests {
         let set = IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap();
         assert_eq!(
             set,
-            ["developers", "owner"].iter().map(|s| s.to_string()).collect()
+            ["developers", "owner"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
         );
         // No presets by default.
         assert!(
@@ -328,8 +331,24 @@ mod tests {
     fn add_then_load_roundtrips_and_keeps_defaults() {
         let (_t, repos) = layout();
         IntendedUserSet::seed(&repos, ORG, PROJECT, DB).unwrap();
-        IntendedUserSet::add(&repos, ORG, PROJECT, DB, "app_ro", Some(RolePreset::Readonly)).unwrap();
-        IntendedUserSet::add(&repos, ORG, PROJECT, DB, "app_rw", Some(RolePreset::Readwrite)).unwrap();
+        IntendedUserSet::add(
+            &repos,
+            ORG,
+            PROJECT,
+            DB,
+            "app_ro",
+            Some(RolePreset::Readonly),
+        )
+        .unwrap();
+        IntendedUserSet::add(
+            &repos,
+            ORG,
+            PROJECT,
+            DB,
+            "app_rw",
+            Some(RolePreset::Readwrite),
+        )
+        .unwrap();
         let set = IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap();
         assert!(set.contains("owner") && set.contains("developers"));
         assert!(set.contains("app_ro") && set.contains("app_rw"));
@@ -357,8 +376,24 @@ mod tests {
     #[test]
     fn remove_drops_a_user_but_never_a_default_and_keeps_other_presets() {
         let (_t, repos) = layout();
-        IntendedUserSet::add(&repos, ORG, PROJECT, DB, "app_ro", Some(RolePreset::Readonly)).unwrap();
-        IntendedUserSet::add(&repos, ORG, PROJECT, DB, "app_rw", Some(RolePreset::Readwrite)).unwrap();
+        IntendedUserSet::add(
+            &repos,
+            ORG,
+            PROJECT,
+            DB,
+            "app_ro",
+            Some(RolePreset::Readonly),
+        )
+        .unwrap();
+        IntendedUserSet::add(
+            &repos,
+            ORG,
+            PROJECT,
+            DB,
+            "app_rw",
+            Some(RolePreset::Readwrite),
+        )
+        .unwrap();
         IntendedUserSet::remove(&repos, ORG, PROJECT, DB, "app_ro").unwrap();
         let set = IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap();
         assert!(!set.contains("app_ro"), "removed user must be gone");
@@ -381,7 +416,11 @@ mod tests {
         // Simulate a pre-phase-3 record: names only, no preset column.
         let dir = tmp.path().join("secrets").join(ORG).join(PROJECT).join(DB);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("intended_users"), "owner\ndevelopers\napp_legacy\n").unwrap();
+        std::fs::write(
+            dir.join("intended_users"),
+            "owner\ndevelopers\napp_legacy\n",
+        )
+        .unwrap();
         let set = IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap();
         assert!(set.contains("app_legacy"));
         // No presets on a names-only record → phase-3 re-apply is a no-op for it.
@@ -395,7 +434,15 @@ mod tests {
     #[test]
     fn stored_out_of_tree_not_in_repo_and_0600() {
         let (tmp, repos) = layout();
-        IntendedUserSet::add(&repos, ORG, PROJECT, DB, "app_ro", Some(RolePreset::Readonly)).unwrap();
+        IntendedUserSet::add(
+            &repos,
+            ORG,
+            PROJECT,
+            DB,
+            "app_ro",
+            Some(RolePreset::Readonly),
+        )
+        .unwrap();
         let record = tmp
             .path()
             .join("secrets")
@@ -403,7 +450,11 @@ mod tests {
             .join(PROJECT)
             .join(DB)
             .join("intended_users");
-        assert!(record.exists(), "record must live out of tree at {}", record.display());
+        assert!(
+            record.exists(),
+            "record must live out of tree at {}",
+            record.display()
+        );
         assert!(
             !repos.join(ORG).join(PROJECT).join(DB).join(".gfs").exists(),
             "nothing written inside the repo tree"
@@ -426,13 +477,27 @@ mod tests {
     #[test]
     fn tombstone_deprovisions_a_user_and_load_tombstones_returns_it() {
         let (_t, repos) = layout();
-        IntendedUserSet::add(&repos, ORG, PROJECT, DB, "app_ro", Some(RolePreset::Readonly)).unwrap();
+        IntendedUserSet::add(
+            &repos,
+            ORG,
+            PROJECT,
+            DB,
+            "app_ro",
+            Some(RolePreset::Readonly),
+        )
+        .unwrap();
         IntendedUserSet::tombstone(&repos, ORG, PROJECT, DB, "app_ro").unwrap();
         // Removed from the live set...
-        assert!(!IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap().contains("app_ro"));
+        assert!(
+            !IntendedUserSet::load(&repos, ORG, PROJECT, DB)
+                .unwrap()
+                .contains("app_ro")
+        );
         // ...and recorded as deprovisioned.
         assert!(
-            IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB).unwrap().contains("app_ro"),
+            IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB)
+                .unwrap()
+                .contains("app_ro"),
             "a dropped managed user must be tombstoned so a checkout re-drops it"
         );
     }
@@ -441,14 +506,24 @@ mod tests {
     fn add_untombstones_a_recreated_user() {
         let (_t, repos) = layout();
         IntendedUserSet::tombstone(&repos, ORG, PROJECT, DB, "app_ro").unwrap();
-        assert!(IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB).unwrap().contains("app_ro"));
+        assert!(
+            IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB)
+                .unwrap()
+                .contains("app_ro")
+        );
         // Re-creating the user supersedes the deprovision.
         IntendedUserSet::add(&repos, ORG, PROJECT, DB, "app_ro", None).unwrap();
         assert!(
-            !IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB).unwrap().contains("app_ro"),
+            !IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB)
+                .unwrap()
+                .contains("app_ro"),
             "re-creating a managed user must clear its tombstone so reconcile keeps it"
         );
-        assert!(IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap().contains("app_ro"));
+        assert!(
+            IntendedUserSet::load(&repos, ORG, PROJECT, DB)
+                .unwrap()
+                .contains("app_ro")
+        );
     }
 
     #[test]
@@ -456,10 +531,16 @@ mod tests {
         let (_t, repos) = layout();
         IntendedUserSet::tombstone(&repos, ORG, PROJECT, DB, "owner").unwrap();
         assert!(
-            IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB).unwrap().is_empty(),
+            IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB)
+                .unwrap()
+                .is_empty(),
             "owner/developers are never tombstoned"
         );
-        assert!(IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap().contains("owner"));
+        assert!(
+            IntendedUserSet::load(&repos, ORG, PROJECT, DB)
+                .unwrap()
+                .contains("owner")
+        );
     }
 
     #[test]
@@ -468,7 +549,15 @@ mod tests {
         // from both sets — so reconcile leaves it alone.
         let (_t, repos) = layout();
         IntendedUserSet::seed(&repos, ORG, PROJECT, DB).unwrap();
-        assert!(!IntendedUserSet::load(&repos, ORG, PROJECT, DB).unwrap().contains("customer_role"));
-        assert!(!IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB).unwrap().contains("customer_role"));
+        assert!(
+            !IntendedUserSet::load(&repos, ORG, PROJECT, DB)
+                .unwrap()
+                .contains("customer_role")
+        );
+        assert!(
+            !IntendedUserSet::load_tombstones(&repos, ORG, PROJECT, DB)
+                .unwrap()
+                .contains("customer_role")
+        );
     }
 }
