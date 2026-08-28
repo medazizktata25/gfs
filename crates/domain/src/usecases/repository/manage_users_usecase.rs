@@ -153,6 +153,17 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
     /// Drop a role.
     pub async fn drop_role(&self, path: &Path, username: &str) -> Result<(), ManageUsersError> {
         reject_reserved_role(username)?;
+        // Immediate revocation: kill the role's live backends before removing it, so
+        // a dropped user cannot keep operating on an already-open connection until it
+        // happens to disconnect. Best-effort — a terminate failure must not block the
+        // removal, which is the actual guarantee.
+        if let Err(e) = self.terminate_user_sessions(path, username).await {
+            tracing::warn!(
+                user = %username,
+                error = %e,
+                "drop: could not terminate live sessions first; proceeding with the drop"
+            );
+        }
         let (provider, container) = self.resolve(path)?;
         let command = provider
             .drop_role_command(username)
@@ -252,6 +263,34 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         }
         let verifier = output.stdout.trim();
         Ok((!verifier.is_empty()).then(|| verifier.to_string()))
+    }
+
+    /// Terminate every live backend for `username` except the management session,
+    /// returning the number terminated. Makes a drop or password rotation take
+    /// effect on open connections immediately. Refuses reserved roles — the
+    /// platform never kills its own management / bootstrap sessions.
+    ///
+    /// # Errors
+    /// Propagates a provider or exec failure; a parse error on a non-numeric count.
+    pub async fn terminate_user_sessions(
+        &self,
+        path: &Path,
+        username: &str,
+    ) -> Result<u64, ManageUsersError> {
+        reject_reserved_role(username)?;
+        let (provider, container) = self.resolve(path)?;
+        let command = provider
+            .terminate_user_sessions_command(username)
+            .map_err(map_provider_err)?;
+        let output = self.run(&container, &command).await?;
+        if output.exit_code != 0 {
+            return Err(fail(output));
+        }
+        output
+            .stdout
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| ManageUsersError::Parse(e.to_string()))
     }
 
     /// Detect the deploy's object-creating `owner` role (RFC 009 §5.1) so a

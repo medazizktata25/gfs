@@ -482,6 +482,20 @@ pub trait DatabaseProvider: Send + Sync {
         Err(ProviderError::UnsupportedFormat("user_verifier".into()))
     }
 
+    /// In-instance command that terminates every live backend belonging to
+    /// `username` except the caller's own, printing the count terminated on stdout.
+    /// Makes an access change (drop / password rotation) take effect on open
+    /// sessions immediately instead of only when they next disconnect.
+    fn terminate_user_sessions_command(
+        &self,
+        username: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        let _ = username;
+        Err(ProviderError::UnsupportedFormat(
+            "terminate_user_sessions".into(),
+        ))
+    }
+
     /// In-instance command that applies `preset`'s privilege bundle to `username`.
     ///
     /// `default_privileges_owner`, when set, is the role whose FUTURE objects the

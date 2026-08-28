@@ -1242,3 +1242,122 @@ async fn rekey_stores_and_compares_verifiers_not_plaintext() {
         "the legacy plaintext took effect (engine hashed it on apply)"
     );
 }
+
+/// Session termination for immediate revocation: `terminate_user_sessions` kills a
+/// managed user's live backends (returning the count), and `drop_role` bakes the
+/// same in so a dropped user's open connection dies at once instead of lingering
+/// until it happens to disconnect.
+#[tokio::test]
+async fn terminate_user_sessions_kills_live_backends_and_drop_bakes_it_in() {
+    if !docker_ok() {
+        eprintln!("skip: set GFS_DOCKER_IT=1 and ensure docker is running");
+        return;
+    }
+
+    let pg = Postgres::start();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path();
+    write_repo(repo, pg.name());
+
+    let compute = Arc::new(DockerCompute::new().expect("docker compute"));
+    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
+    containers::register_all(&*registry).expect("register providers");
+    let mu = ManageUsersUseCase::new(compute, registry);
+
+    mu.create_role(
+        repo,
+        &RoleSpec {
+            username: "app".into(),
+            password: "app_pw_1234".into(),
+            preset: None,
+            default_privileges_owner: None,
+        },
+    )
+    .await
+    .expect("create app");
+
+    // No sessions yet → terminate is a safe no-op returning 0.
+    assert_eq!(
+        mu.terminate_user_sessions(repo, "app")
+            .await
+            .expect("terminate (none)"),
+        0,
+        "no live backends to terminate initially"
+    );
+
+    // Open two held sessions as app (backgrounded pg_sleep over the scram endpoint).
+    let mut s1 = spawn_held_session(pg.name(), "app", "app_pw_1234");
+    let mut s2 = spawn_held_session(pg.name(), "app", "app_pw_1234");
+    wait_for_session_count(pg.name(), "app", 2, true);
+
+    // Explicit terminate kills both and reports the count.
+    let killed = mu
+        .terminate_user_sessions(repo, "app")
+        .await
+        .expect("terminate (two)");
+    assert!(killed >= 2, "terminated app's live backends, got {killed}");
+    wait_for_session_count(pg.name(), "app", 0, false);
+    let _ = s1.kill();
+    let _ = s2.kill();
+
+    // drop_role bakes it in: a held session dies when the role is dropped.
+    let mut s3 = spawn_held_session(pg.name(), "app", "app_pw_1234");
+    wait_for_session_count(pg.name(), "app", 1, true);
+    mu.drop_role(repo, "app").await.expect("drop app");
+    wait_for_session_count(pg.name(), "app", 0, false);
+    let _ = s3.kill();
+
+    // Reserved roles are never terminated (fail-closed).
+    assert!(
+        mu.terminate_user_sessions(repo, "owner").await.is_err(),
+        "terminate refuses reserved roles"
+    );
+}
+
+/// Hold a live backend open as `user` for ~30s (backgrounded `pg_sleep`) over the
+/// container's scram endpoint, so a test can observe it being terminated.
+fn spawn_held_session(container: &str, user: &str, password: &str) -> std::process::Child {
+    let inner = format!(
+        "PGPASSWORD='{password}' psql -h \"$(hostname -i)\" -U '{user}' -d postgres -c 'SELECT pg_sleep(30)'"
+    );
+    Command::new("docker")
+        .args(["exec", container, "sh", "-c", &inner])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn held session")
+}
+
+/// Count `user`'s live backends via the management (superuser) loopback.
+fn app_session_count(container: &str, user: &str) -> u64 {
+    let sql = format!("SELECT count(*) FROM pg_stat_activity WHERE usename='{user}'");
+    let inner = format!(
+        "PGPASSWORD=\"${{POSTGRES_PASSWORD:-postgres}}\" psql -h 127.0.0.1 -U \"${{POSTGRES_USER:-postgres}}\" -d postgres -tAc \"{sql}\""
+    );
+    let out = Command::new("docker")
+        .args(["exec", container, "sh", "-c", &inner])
+        .output()
+        .expect("count sessions");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// Poll until `user`'s backend count reaches `want` (when `at_least`, count >=
+/// want; else count <= want). Backends appear/disappear a beat after connect /
+/// terminate, so this tolerates that lag.
+fn wait_for_session_count(container: &str, user: &str, want: u64, at_least: bool) {
+    for _ in 0..50 {
+        let n = app_session_count(container, user);
+        if (at_least && n >= want) || (!at_least && n <= want) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!(
+        "session count for {user} never {} {want} (last={})",
+        if at_least { ">=" } else { "<=" },
+        app_session_count(container, user)
+    );
+}

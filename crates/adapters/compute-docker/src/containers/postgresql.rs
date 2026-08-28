@@ -791,6 +791,24 @@ impl DatabaseProvider for PostgresqlProvider {
         ))
     }
 
+    fn terminate_user_sessions_command(
+        &self,
+        username: &str,
+    ) -> std::result::Result<String, ProviderError> {
+        // Superuser terminates the role's backends, never its own (`pid <>
+        // pg_backend_pid()` keeps the management session alive). `-tA` prints the
+        // count terminated.
+        const DELIM: &str = "GFS_SQL_EOF";
+        let sql = format!(
+            "SELECT count(*)::text FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{}' AND pid <> pg_backend_pid()) AS terminated;",
+            sql_lit(username)
+        );
+        let body = gfs_domain::utils::shell::sql_heredoc_body(DELIM, &sql)?;
+        Ok(format!(
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -tA -v ON_ERROR_STOP=1 -c "{body}""#
+        ))
+    }
+
     fn apply_preset_command(
         &self,
         username: &str,
