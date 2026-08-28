@@ -496,6 +496,14 @@ pub trait DatabaseProvider: Send + Sync {
         ))
     }
 
+    /// In-instance command that disables `username`'s ability to open NEW sessions
+    /// (`ALTER ROLE … NOLOGIN`), committed immediately. Used before a drop to close
+    /// the reconnect window while the role's live backends are terminated.
+    fn disable_login_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        let _ = username;
+        Err(ProviderError::UnsupportedFormat("disable_login".into()))
+    }
+
     /// In-instance command that applies `preset`'s privilege bundle to `username`.
     ///
     /// `default_privileges_owner`, when set, is the role whose FUTURE objects the

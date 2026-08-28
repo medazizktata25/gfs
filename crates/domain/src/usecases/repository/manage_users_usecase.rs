@@ -126,7 +126,20 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
         let command = provider
             .alter_password_command(username, password)
             .map_err(map_provider_err)?;
-        expect_success(self.run(&container, &command).await?)
+        expect_success(self.run(&container, &command).await?)?;
+        // Immediate revocation: kill any session still authenticated with the OLD
+        // password so a rotation takes effect at once, not only when that session
+        // disconnects. Best-effort — a terminate failure must not fail the rotation,
+        // which has already changed the credential. (On the checkout re-key path the
+        // pod is fresh, so this is a no-op.)
+        if let Err(e) = self.terminate_user_sessions(path, username).await {
+            tracing::warn!(
+                user = %username,
+                error = %e,
+                "set-password: could not terminate live sessions after rotation"
+            );
+        }
+        Ok(())
     }
 
     /// Reset the deploy `owner`'s password as a **platform** operation (clone
@@ -151,17 +164,41 @@ impl<R: DatabaseProviderRegistry> ManageUsersUseCase<R> {
     }
 
     /// Drop a role.
+    /// Disable `username`'s ability to open NEW sessions (`ALTER ROLE … NOLOGIN`),
+    /// committed immediately. Used before a drop to close the reconnect window while
+    /// the role's live backends are terminated. Refuses reserved roles.
+    ///
+    /// # Errors
+    /// Propagates a provider or exec failure.
+    pub async fn disable_login(&self, path: &Path, username: &str) -> Result<(), ManageUsersError> {
+        reject_reserved_role(username)?;
+        let (provider, container) = self.resolve(path)?;
+        let command = provider
+            .disable_login_command(username)
+            .map_err(map_provider_err)?;
+        expect_success(self.run(&container, &command).await?)
+    }
+
     pub async fn drop_role(&self, path: &Path, username: &str) -> Result<(), ManageUsersError> {
         reject_reserved_role(username)?;
-        // Immediate revocation: kill the role's live backends before removing it, so
-        // a dropped user cannot keep operating on an already-open connection until it
-        // happens to disconnect. Best-effort — a terminate failure must not block the
-        // removal, which is the actual guarantee.
+        // Immediate revocation with no reconnect window: first disable login
+        // (committed, so no NEW session can authenticate), then terminate the live
+        // backends, then drop. Without the disable-login step a client with the
+        // still-valid credential could reconnect during the terminate→drop gap and
+        // survive the drop as an orphan. Both pre-steps are best-effort — a failure
+        // must not block the removal, which is the actual guarantee.
+        if let Err(e) = self.disable_login(path, username).await {
+            tracing::warn!(
+                user = %username,
+                error = %e,
+                "drop: could not disable login before terminate; a brief reconnect window remains"
+            );
+        }
         if let Err(e) = self.terminate_user_sessions(path, username).await {
             tracing::warn!(
                 user = %username,
                 error = %e,
-                "drop: could not terminate live sessions first; proceeding with the drop"
+                "drop: could not terminate live sessions before drop; proceeding with the drop"
             );
         }
         let (provider, container) = self.resolve(path)?;

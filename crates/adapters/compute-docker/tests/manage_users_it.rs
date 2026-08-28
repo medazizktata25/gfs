@@ -1298,14 +1298,28 @@ async fn terminate_user_sessions_kills_live_backends_and_drop_bakes_it_in() {
     assert!(killed >= 2, "terminated app's live backends, got {killed}");
     wait_for_session_count(pg.name(), "app", 0, false);
     let _ = s1.kill();
+    let _ = s1.wait();
     let _ = s2.kill();
+    let _ = s2.wait();
+
+    // set_password (rotation) bakes in termination too: a session authenticated
+    // with the OLD credential dies when the password is rotated.
+    let mut s_rot = spawn_held_session(pg.name(), "app", "app_pw_1234");
+    wait_for_session_count(pg.name(), "app", 1, true);
+    mu.set_password(repo, "app", "app_pw_ROTATED_9999")
+        .await
+        .expect("rotate app");
+    wait_for_session_count(pg.name(), "app", 0, false);
+    let _ = s_rot.kill();
+    let _ = s_rot.wait();
 
     // drop_role bakes it in: a held session dies when the role is dropped.
-    let mut s3 = spawn_held_session(pg.name(), "app", "app_pw_1234");
+    let mut s3 = spawn_held_session(pg.name(), "app", "app_pw_ROTATED_9999");
     wait_for_session_count(pg.name(), "app", 1, true);
     mu.drop_role(repo, "app").await.expect("drop app");
     wait_for_session_count(pg.name(), "app", 0, false);
     let _ = s3.kill();
+    let _ = s3.wait();
 
     // Reserved roles are never terminated (fail-closed).
     assert!(

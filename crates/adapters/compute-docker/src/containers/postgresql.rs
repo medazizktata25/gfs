@@ -797,7 +797,7 @@ impl DatabaseProvider for PostgresqlProvider {
     ) -> std::result::Result<String, ProviderError> {
         // Superuser terminates the role's backends, never its own (`pid <>
         // pg_backend_pid()` keeps the management session alive). `-tA` prints the
-        // count terminated.
+        // count of backends signalled (death is asynchronous).
         const DELIM: &str = "GFS_SQL_EOF";
         let sql = format!(
             "SELECT count(*)::text FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '{}' AND pid <> pg_backend_pid()) AS terminated;",
@@ -807,6 +807,14 @@ impl DatabaseProvider for PostgresqlProvider {
         Ok(format!(
             r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -tA -v ON_ERROR_STOP=1 -c "{body}""#
         ))
+    }
+
+    fn disable_login_command(&self, username: &str) -> std::result::Result<String, ProviderError> {
+        let ident = pg_quote_ident(username)?;
+        Ok(Self::pin_mgmt_search_path(self.query_in_instance_command(
+            &format!("ALTER ROLE {ident} WITH NOLOGIN;"),
+            None,
+        )?))
     }
 
     fn apply_preset_command(
