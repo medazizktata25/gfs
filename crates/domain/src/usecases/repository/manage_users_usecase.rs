@@ -847,6 +847,7 @@ mod tests {
             }),
             storage: None,
             compute: None,
+            deleted_branch_retention_days: None,
         };
         config.save(&path).expect("save config");
         (temp, path)
