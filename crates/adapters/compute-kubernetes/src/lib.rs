@@ -286,6 +286,23 @@ fn labels_for(instance: &str) -> BTreeMap<String, String> {
     m
 }
 
+/// Recover the [`InstanceId`] a managed pod belongs to from its instance label.
+fn instance_id_from_pod(pod: &Pod) -> Option<InstanceId> {
+    pod.metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(INSTANCE_LABEL_KEY))
+        .map(|value| InstanceId(value.clone()))
+}
+
+/// Map a watched pod to `(InstanceId, InstanceState)` using the same readiness
+/// mapping the poll path uses, so the watch changes only the timing of an edge.
+fn instance_update_from_pod(pod: &Pod) -> Option<(InstanceId, InstanceState)> {
+    let id = instance_id_from_pod(pod)?;
+    let state = KubernetesCompute::instance_status_from_pod(&id, Some(pod.clone())).state;
+    Some((id, state))
+}
+
 /// Name of the per-instance Secret that is the durable home of the
 /// deploy-time database credentials (the admin password).
 ///
@@ -1270,6 +1287,59 @@ impl Compute for KubernetesCompute {
 
     async fn status(&self, id: &InstanceId) -> Result<InstanceStatus> {
         Ok(Self::instance_status_from_pod(id, self.get_pod(id).await?))
+    }
+
+    async fn watch_status(
+        &self,
+    ) -> Result<Option<tokio::sync::mpsc::Receiver<(InstanceId, InstanceState)>>> {
+        use kube::runtime::watcher;
+        use tokio_stream::StreamExt;
+
+        // Stream every managed instance pod (app label) so one watch covers all
+        // instances on the node; each pod carries the instance label to recover
+        // its id. The readiness verdict reuses the same status mapping the poll
+        // uses, so the watch only changes *when* an edge is seen, not *what*.
+        let api = self.api_pods();
+        let config =
+            watcher::Config::default().labels(&format!("{APP_LABEL_KEY}={APP_LABEL_VALUE}"));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+        tokio::spawn(async move {
+            let stream = watcher(api, config);
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                let updates = match event {
+                    Ok(watcher::Event::Apply(pod)) | Ok(watcher::Event::InitApply(pod)) => {
+                        instance_update_from_pod(&pod)
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                    }
+                    // A deleted pod is gone from the API — the same signal the
+                    // poll turns into "stopped" when `get_pod` finds nothing.
+                    Ok(watcher::Event::Delete(pod)) => instance_id_from_pod(&pod)
+                        .map(|id| (id, InstanceState::Unknown))
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    // Init markers bracket the initial/resync list; the individual
+                    // InitApply events carry the states, so nothing to emit here.
+                    Ok(watcher::Event::Init) | Ok(watcher::Event::InitDone) => Vec::new(),
+                    Err(e) => {
+                        // `watcher` retries (relist) internally on error; keep the
+                        // stream alive so a transient API blip never ends the watch.
+                        tracing::warn!("compute pod watcher error (retrying): {e}");
+                        continue;
+                    }
+                };
+                for update in updates {
+                    if tx.send(update).await.is_err() {
+                        // Receiver dropped (health watch shut down) — stop watching.
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Some(rx))
     }
 
     async fn get_connection_info(
