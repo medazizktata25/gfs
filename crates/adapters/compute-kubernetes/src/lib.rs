@@ -861,7 +861,7 @@ impl KubernetesCompute {
     /// still be Terminating while the new one is Pending; exec'ing into a
     /// not-ready pod fails the WebSocket upgrade with `400 Bad Request`.
     async fn wait_ready_pod_name(&self, instance: &str) -> Result<String> {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         // Fast-fail if the instance is stopped (StatefulSet scaled to zero): no pod
         // exists and none is coming, so don't burn the full deadline hanging and
         // then return a misleading "not Ready" error. Tell the caller to resume it.
@@ -876,41 +876,71 @@ impl KubernetesCompute {
                  (e.g. `gfs compute start`) before running this operation"
             )));
         }
+        use kube::runtime::watcher;
+        use tokio_stream::StreamExt;
+
         let api = self.api_pods();
-        let lp = ListParams::default().labels(&format!("{INSTANCE_LABEL_KEY}={instance}"));
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            let pods = api
-                .list(&lp)
-                .await
-                .map_err(|e| ComputeError::Internal(format!("k8s pod list failed: {e}")))?;
-            let mut ready: Vec<&Pod> = pods
-                .items
-                .iter()
-                .filter(|p| p.metadata.deletion_timestamp.is_none() && pod_is_ready(p))
-                .collect();
-            ready.sort_by(|a, b| {
-                a.metadata
-                    .creation_timestamp
-                    .as_ref()
-                    .map(|t| t.0)
-                    .cmp(&b.metadata.creation_timestamp.as_ref().map(|t| t.0))
-            });
-            if let Some(name) = ready.last().and_then(|p| p.metadata.name.clone()) {
-                return Ok(name);
+        let config = watcher::Config::default().labels(&format!("{INSTANCE_LABEL_KEY}={instance}"));
+
+        // Watch the instance's pods and return the newest Ready, non-terminating
+        // one the moment it appears — no polling. The watcher's initial list seeds
+        // the current pods; ongoing events report each transition (including a
+        // Ready-condition flip), so a pod that becomes ready after the watch
+        // starts is delivered as an event rather than caught on the next tick.
+        // Bounded by the same 120s deadline.
+        let find_ready = async {
+            let mut pods: std::collections::HashMap<String, Pod> = std::collections::HashMap::new();
+            let stream = watcher(api, config);
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(watcher::Event::Apply(pod)) | Ok(watcher::Event::InitApply(pod)) => {
+                        if let Some(name) = pod.metadata.name.clone() {
+                            pods.insert(name, pod);
+                        }
+                    }
+                    Ok(watcher::Event::Delete(pod)) => {
+                        if let Some(name) = pod.metadata.name.as_ref() {
+                            pods.remove(name);
+                        }
+                    }
+                    // A relist begins: drop the stale snapshot and rebuild it from
+                    // the InitApply events that follow.
+                    Ok(watcher::Event::Init) => pods.clear(),
+                    Ok(watcher::Event::InitDone) => {}
+                    Err(e) => {
+                        tracing::debug!("wait_ready pod watch error (retrying): {e}");
+                        continue;
+                    }
+                }
+                // Same selection as the former poll: the newest non-terminating
+                // Ready pod, so a checkout reprovision's terminating old pod is
+                // ignored in favour of the fresh one.
+                let mut ready: Vec<&Pod> = pods
+                    .values()
+                    .filter(|p| p.metadata.deletion_timestamp.is_none() && pod_is_ready(p))
+                    .collect();
+                ready.sort_by(|a, b| {
+                    a.metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .map(|t| t.0)
+                        .cmp(&b.metadata.creation_timestamp.as_ref().map(|t| t.0))
+                });
+                if let Some(name) = ready.last().and_then(|p| p.metadata.name.clone()) {
+                    return Ok::<String, ComputeError>(name);
+                }
             }
-            if Instant::now() >= deadline {
-                let last_phase = pods
-                    .items
-                    .first()
-                    .and_then(|p| p.status.as_ref())
-                    .and_then(|s| s.phase.clone())
-                    .unwrap_or_else(|| "<none>".into());
-                return Err(ComputeError::Internal(format!(
-                    "pod for instance '{instance}' not Ready in time (last phase: {last_phase})"
-                )));
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            Err(ComputeError::Internal(format!(
+                "pod watch for instance '{instance}' ended before a Ready pod appeared"
+            )))
+        };
+
+        match tokio::time::timeout(Duration::from_secs(120), find_ready).await {
+            Ok(result) => result,
+            Err(_) => Err(ComputeError::Internal(format!(
+                "pod for instance '{instance}' not Ready in time"
+            ))),
         }
     }
 
