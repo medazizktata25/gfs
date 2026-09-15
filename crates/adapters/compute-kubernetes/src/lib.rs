@@ -286,6 +286,23 @@ fn labels_for(instance: &str) -> BTreeMap<String, String> {
     m
 }
 
+/// Recover the [`InstanceId`] a managed pod belongs to from its instance label.
+fn instance_id_from_pod(pod: &Pod) -> Option<InstanceId> {
+    pod.metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(INSTANCE_LABEL_KEY))
+        .map(|value| InstanceId(value.clone()))
+}
+
+/// Map a watched pod to `(InstanceId, InstanceState)` using the same readiness
+/// mapping the poll path uses, so the watch changes only the timing of an edge.
+fn instance_update_from_pod(pod: &Pod) -> Option<(InstanceId, InstanceState)> {
+    let id = instance_id_from_pod(pod)?;
+    let state = KubernetesCompute::instance_status_from_pod(&id, Some(pod.clone())).state;
+    Some((id, state))
+}
+
 /// Name of the per-instance Secret that is the durable home of the
 /// deploy-time database credentials (the admin password).
 ///
@@ -844,7 +861,7 @@ impl KubernetesCompute {
     /// still be Terminating while the new one is Pending; exec'ing into a
     /// not-ready pod fails the WebSocket upgrade with `400 Bad Request`.
     async fn wait_ready_pod_name(&self, instance: &str) -> Result<String> {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         // Fast-fail if the instance is stopped (StatefulSet scaled to zero): no pod
         // exists and none is coming, so don't burn the full deadline hanging and
         // then return a misleading "not Ready" error. Tell the caller to resume it.
@@ -859,41 +876,71 @@ impl KubernetesCompute {
                  (e.g. `gfs compute start`) before running this operation"
             )));
         }
+        use kube::runtime::watcher;
+        use tokio_stream::StreamExt;
+
         let api = self.api_pods();
-        let lp = ListParams::default().labels(&format!("{INSTANCE_LABEL_KEY}={instance}"));
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            let pods = api
-                .list(&lp)
-                .await
-                .map_err(|e| ComputeError::Internal(format!("k8s pod list failed: {e}")))?;
-            let mut ready: Vec<&Pod> = pods
-                .items
-                .iter()
-                .filter(|p| p.metadata.deletion_timestamp.is_none() && pod_is_ready(p))
-                .collect();
-            ready.sort_by(|a, b| {
-                a.metadata
-                    .creation_timestamp
-                    .as_ref()
-                    .map(|t| t.0)
-                    .cmp(&b.metadata.creation_timestamp.as_ref().map(|t| t.0))
-            });
-            if let Some(name) = ready.last().and_then(|p| p.metadata.name.clone()) {
-                return Ok(name);
+        let config = watcher::Config::default().labels(&format!("{INSTANCE_LABEL_KEY}={instance}"));
+
+        // Watch the instance's pods and return the newest Ready, non-terminating
+        // one the moment it appears — no polling. The watcher's initial list seeds
+        // the current pods; ongoing events report each transition (including a
+        // Ready-condition flip), so a pod that becomes ready after the watch
+        // starts is delivered as an event rather than caught on the next tick.
+        // Bounded by the same 120s deadline.
+        let find_ready = async {
+            let mut pods: std::collections::HashMap<String, Pod> = std::collections::HashMap::new();
+            let stream = watcher(api, config);
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(watcher::Event::Apply(pod)) | Ok(watcher::Event::InitApply(pod)) => {
+                        if let Some(name) = pod.metadata.name.clone() {
+                            pods.insert(name, pod);
+                        }
+                    }
+                    Ok(watcher::Event::Delete(pod)) => {
+                        if let Some(name) = pod.metadata.name.as_ref() {
+                            pods.remove(name);
+                        }
+                    }
+                    // A relist begins: drop the stale snapshot and rebuild it from
+                    // the InitApply events that follow.
+                    Ok(watcher::Event::Init) => pods.clear(),
+                    Ok(watcher::Event::InitDone) => {}
+                    Err(e) => {
+                        tracing::debug!("wait_ready pod watch error (retrying): {e}");
+                        continue;
+                    }
+                }
+                // Same selection as the former poll: the newest non-terminating
+                // Ready pod, so a checkout reprovision's terminating old pod is
+                // ignored in favour of the fresh one.
+                let mut ready: Vec<&Pod> = pods
+                    .values()
+                    .filter(|p| p.metadata.deletion_timestamp.is_none() && pod_is_ready(p))
+                    .collect();
+                ready.sort_by(|a, b| {
+                    a.metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .map(|t| t.0)
+                        .cmp(&b.metadata.creation_timestamp.as_ref().map(|t| t.0))
+                });
+                if let Some(name) = ready.last().and_then(|p| p.metadata.name.clone()) {
+                    return Ok::<String, ComputeError>(name);
+                }
             }
-            if Instant::now() >= deadline {
-                let last_phase = pods
-                    .items
-                    .first()
-                    .and_then(|p| p.status.as_ref())
-                    .and_then(|s| s.phase.clone())
-                    .unwrap_or_else(|| "<none>".into());
-                return Err(ComputeError::Internal(format!(
-                    "pod for instance '{instance}' not Ready in time (last phase: {last_phase})"
-                )));
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            Err(ComputeError::Internal(format!(
+                "pod watch for instance '{instance}' ended before a Ready pod appeared"
+            )))
+        };
+
+        match tokio::time::timeout(Duration::from_secs(120), find_ready).await {
+            Ok(result) => result,
+            Err(_) => Err(ComputeError::Internal(format!(
+                "pod for instance '{instance}' not Ready in time"
+            ))),
         }
     }
 
@@ -1270,6 +1317,59 @@ impl Compute for KubernetesCompute {
 
     async fn status(&self, id: &InstanceId) -> Result<InstanceStatus> {
         Ok(Self::instance_status_from_pod(id, self.get_pod(id).await?))
+    }
+
+    async fn watch_status(
+        &self,
+    ) -> Result<Option<tokio::sync::mpsc::Receiver<(InstanceId, InstanceState)>>> {
+        use kube::runtime::watcher;
+        use tokio_stream::StreamExt;
+
+        // Stream every managed instance pod (app label) so one watch covers all
+        // instances on the node; each pod carries the instance label to recover
+        // its id. The readiness verdict reuses the same status mapping the poll
+        // uses, so the watch only changes *when* an edge is seen, not *what*.
+        let api = self.api_pods();
+        let config =
+            watcher::Config::default().labels(&format!("{APP_LABEL_KEY}={APP_LABEL_VALUE}"));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+        tokio::spawn(async move {
+            let stream = watcher(api, config);
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                let updates = match event {
+                    Ok(watcher::Event::Apply(pod)) | Ok(watcher::Event::InitApply(pod)) => {
+                        instance_update_from_pod(&pod)
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                    }
+                    // A deleted pod is gone from the API — the same signal the
+                    // poll turns into "stopped" when `get_pod` finds nothing.
+                    Ok(watcher::Event::Delete(pod)) => instance_id_from_pod(&pod)
+                        .map(|id| (id, InstanceState::Unknown))
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    // Init markers bracket the initial/resync list; the individual
+                    // InitApply events carry the states, so nothing to emit here.
+                    Ok(watcher::Event::Init) | Ok(watcher::Event::InitDone) => Vec::new(),
+                    Err(e) => {
+                        // `watcher` retries (relist) internally on error; keep the
+                        // stream alive so a transient API blip never ends the watch.
+                        tracing::warn!("compute pod watcher error (retrying): {e}");
+                        continue;
+                    }
+                };
+                for update in updates {
+                    if tx.send(update).await.is_err() {
+                        // Receiver dropped (health watch shut down) — stop watching.
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Some(rx))
     }
 
     async fn get_connection_info(
