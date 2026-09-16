@@ -2052,5 +2052,44 @@ CREATE VIEW gfs.clones AS
       LEFT JOIN gfs.clone_stats st USING (relid)
      ORDER BY s.relid::text;
 
+-- Readable by PUBLIC: every table this extension creates
+-- (`grep -n '^CREATE TABLE gfs\.' schema.sql`) plus both views. The original
+-- list named eleven of the fifteen tables and only one of the two views --
+-- source_baseline, source_table_baseline, sync_policy, drift_state,
+-- drift_notes and the gfs.source_map view were never granted at all, not even
+-- SELECT, though the planner hook reads all of them on an ordinary query
+-- (gfs.refresh_drift_state, reached from route.rs / catalog.rs, reads
+-- gfs.source_map and writes gfs.drift_state). Enumerated in full so a new
+-- table or view gets the same treatment by construction rather than by
+-- remembering to extend this line.
 GRANT USAGE ON SCHEMA gfs TO PUBLIC;
-GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.copy_queue, gfs.tombstone, gfs.clone_stats, gfs.cost, gfs.budget, gfs.clone_mode, gfs.copy_watermark, gfs.clones TO PUBLIC;
+GRANT SELECT ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.copy_queue, gfs.tombstone, gfs.clone_stats, gfs.cost, gfs.budget, gfs.clone_mode, gfs.copy_watermark, gfs.source_baseline, gfs.source_table_baseline, gfs.sync_policy, gfs.drift_state, gfs.drift_notes, gfs.clones, gfs.source_map TO PUBLIC;
+
+-- Writable by PUBLIC: the per-clone bookkeeping the planner hook maintains in
+-- the *invoker's* context. The hook (lib.rs's gfs_planner) does this work both
+-- as raw SPI in the Rust extension (route.rs / hydrate.rs / catalog.rs write
+-- clone_source, cached_predicate, clone_stats and copy_queue directly) and
+-- through plain LANGUAGE plpgsql functions below that are not SECURITY DEFINER
+-- (gfs.note_range -> cached and, via gfs.note_copy, copy_watermark;
+-- gfs.refresh_drift_state -> drift_state + drift_notes; gfs.pull ->
+-- source_baseline; the gfs.note_tombstone AFTER DELETE trigger -> tombstone).
+-- All of that runs as whatever role executed the intercepted query, so a plain
+-- SELECT against a cloned table from a non-superuser fails closed without
+-- these ("permission denied for table clone_source" via bump_access, then
+-- "... for table cached", then "... for table drift_state" -- found one table
+-- at a time live-testing a lazy clone against a real remote source).
+--
+-- Deliberately NOT granted for write: gfs.cost, gfs.budget, gfs.sync_policy
+-- and gfs.clone_mode. Those are the policy/limit knobs, not bookkeeping, and
+-- changing a setting is the owner's to do. Nothing on the hook's invoker path
+-- writes them: gfs.cost is written only by gfs.calibrate() and gfs.clone_mode only by
+-- gfs.freeze_run(), neither of which the Rust hook ever calls; gfs.sync_policy
+-- is never written by any function (it is set by hand by the owner); and
+-- gfs.budget is written only by gfs.take_token(), which is already SECURITY
+-- DEFINER precisely so a low-privilege caller can drive it without holding
+-- write access -- the pattern RFC 008 documents for exactly this problem.
+-- Granting write on gfs.budget would let a clone's own role `DELETE FROM
+-- gfs.budget`, which makes take_token()'s `rate IS NULL` branch return 0 and
+-- permanently disables the token bucket that protects the upstream production
+-- source.
+GRANT INSERT, UPDATE, DELETE ON gfs.clone_source, gfs.cached, gfs.cached_predicate, gfs.copy_queue, gfs.tombstone, gfs.clone_stats, gfs.copy_watermark, gfs.source_baseline, gfs.source_table_baseline, gfs.drift_state, gfs.drift_notes TO PUBLIC;
