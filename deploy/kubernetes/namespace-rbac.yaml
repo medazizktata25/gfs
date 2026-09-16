@@ -30,6 +30,38 @@ rules:
     resources: ["volumesnapshots"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
 ---
+# The startup seal an initContainer writes into each Postgres pod's pg_hba.conf
+# trusts the cluster's pod CIDRs with password auth, so a lazy clone's bootstrap
+# sidecar (a separate pod, on a node not known in advance) can reach the target
+# before the seal lifts. Those CIDRs are read from `node.spec.podCIDRs`.
+#
+# `nodes` is cluster-scoped, so this cannot live in the namespaced Role above:
+# without it the list returns Forbidden, the seal silently degrades to
+# loopback-only, and every lazy clone fails with `no pg_hba.conf entry` from a
+# component far from the actual cause. Read-only, and `nodes` carries no
+# secrets — the Role above is still where every mutating permission lives.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gfs-node-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gfs-node-reader
+subjects:
+  - kind: ServiceAccount
+    name: gfs
+    namespace: gfs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gfs-node-reader
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:

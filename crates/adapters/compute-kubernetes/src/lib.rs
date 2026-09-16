@@ -21,7 +21,7 @@ use gfs_domain::ports::compute::{
 };
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{
-    Container, EnvVarSource, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
+    Container, EnvVarSource, Node, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
     PodSecurityContext, PodSpec, PodTemplateSpec, Probe, Secret, SecretKeySelector, Service,
     ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
 };
@@ -265,6 +265,74 @@ fn ensure_dns_label(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Defence-in-depth: accept only a genuinely well-formed CIDR into the seal's
+/// shell command, and return it in canonical form. This value comes from our
+/// own cluster's Node API, never user input, but two things make parsing worth
+/// more than a character-class check. A `sh -c` string should never see an
+/// unexpected value (e.g. a node annotation someone repurposed); and a
+/// *shape*-valid but semantically-invalid mask is not a graceful degrade --
+/// `198.51.100.0/99` is all digits, dots and slashes, yet Postgres answers it with
+/// `invalid CIDR mask in address` / `could not load .../pg_hba.conf` and the
+/// pod never starts at all. Parsing is what makes "implausible values leave the
+/// seal loopback-only" true rather than "implausible values CrashLoop the pod".
+///
+/// Returning the re-rendered address also makes the result shell-safe by
+/// construction: `IpAddr`'s `Display` emits only hex digits, dots and colons,
+/// and the prefix is checked to be ASCII digits, so nothing a shell would
+/// interpret can survive this function.
+fn canonical_cidr(s: &str) -> Option<String> {
+    let (addr, prefix) = s.split_once('/')?;
+    // `u8::from_str` accepts a leading `+`, which would sail through as
+    // `198.51.100.0/+8` and take the pod down; require plain digits.
+    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let ip: std::net::IpAddr = addr.parse().ok()?;
+    let bits: u8 = prefix.parse().ok()?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    (bits <= max).then(|| format!("{ip}/{bits}"))
+}
+
+/// Every pod CIDR a node advertises. `podCIDRs` is the dual-stack-aware field
+/// and `podCIDR` is merely its first entry, so read the list and fall back to
+/// the singular only when the list is absent. Reading `podCIDR` first (it is
+/// always populated when `podCIDRs` is) would silently drop the IPv6 range on a
+/// dual-stack cluster and re-open this very bug for a bootstrap sidecar that
+/// happens to connect over v6.
+fn pod_cidrs_from_spec(pod_cidr: Option<String>, pod_cidrs: Option<Vec<String>>) -> Vec<String> {
+    match pod_cidrs {
+        Some(list) if !list.is_empty() => list,
+        _ => pod_cidr.into_iter().collect(),
+    }
+}
+
+/// Build the startup seal's `pg_hba.conf` contents (see `statefulset_manifest`
+/// for why this exists). Loopback is always `trust`; each well-formed entry in
+/// `cluster_cidrs` is added as its own `scram-sha-256` rule (password
+/// required), never `trust`, so a same-cluster peer still needs the real
+/// credential.
+///
+/// Sorted and deduped, which matters for more than tidiness: this string is
+/// baked into the StatefulSet's pod template, so if it varied with the order
+/// the Node API happened to return, an unrelated reconcile could rewrite the
+/// template and trigger a rolling restart of a running customer database.
+/// Sorting makes the seal a pure function of the *set* of node CIDRs.
+fn seal_hba_contents(cluster_cidrs: &[String]) -> String {
+    let mut rules: Vec<String> = cluster_cidrs
+        .iter()
+        .filter_map(|c| canonical_cidr(c))
+        .collect();
+    rules.sort();
+    rules.dedup();
+    let cluster_rules: String = rules
+        .iter()
+        .map(|cidr| format!("host all all {cidr} scram-sha-256\\n"))
+        .collect();
+    format!(
+        "local all all trust\\nhost all all 127.0.0.1/32 trust\\nhost all all ::1/128 trust\\n{cluster_rules}"
+    )
+}
+
 fn instance_name_from_definition(def: &ComputeDefinition) -> String {
     let image = def.image.to_ascii_lowercase();
     let prefix = if image.contains("postgres") {
@@ -463,6 +531,46 @@ impl KubernetesCompute {
         format!("{instance}-svc")
     }
 
+    /// The startup seal (see `statefulset_manifest`) needs to know which pod
+    /// CIDRs to trust with password auth before the target pod exists, so
+    /// there is no pod IP to key off yet (the StatefulSet apply this feeds
+    /// is what triggers scheduling), so which node — and therefore which
+    /// node's `/24` — the sidecar's own pod (pinned to run alongside it) will
+    /// land on isn't knowable in advance either. This cluster is not always
+    /// single-node — the local dev stack alone joins a CP and a DP VM into one
+    /// — so trusting every node's CIDR, not just the first one listed, is what
+    /// actually covers "wherever the scheduler puts it" instead of covering it
+    /// by accident on a single-node cluster and silently missing it otherwise.
+    ///
+    /// Returns an empty list when nodes can't be listed, which leaves the seal
+    /// exactly as loopback-only as it was before this existed — but that is a
+    /// degraded mode, not a neutral one: a lazy clone's bootstrap sidecar will
+    /// then be refused by the seal and the clone will fail. `nodes` is a
+    /// cluster-scoped resource, so the caller needs a ClusterRole granting
+    /// `list` on it (see `deploy/kubernetes/namespace-rbac.yaml`); a namespaced
+    /// Role cannot grant it and the list comes back `Forbidden`. That is why
+    /// this logs at `warn` — the symptom otherwise surfaces much later, as an
+    /// unexplained `no pg_hba.conf entry` from a different component.
+    async fn cluster_pod_cidrs(&self) -> Vec<String> {
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        let list = match nodes.list(&ListParams::default()).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(
+                    "cluster_pod_cidrs: cannot list nodes ({e}); the startup seal stays \
+                     loopback-only, which will refuse a lazy clone's bootstrap sidecar. \
+                     Grant `list` on the cluster-scoped `nodes` resource via a ClusterRole."
+                );
+                return Vec::new();
+            }
+        };
+        list.items
+            .into_iter()
+            .filter_map(|n| n.spec)
+            .flat_map(|spec| pod_cidrs_from_spec(spec.pod_cidr, spec.pod_cidrs))
+            .collect()
+    }
+
     fn pvc_name_for(instance: &str, def: &ComputeDefinition) -> String {
         // Kubernetes-specific convention:
         // - if host_data_dir is set to `pvc:<name>` we treat `<name>` as the PVC to mount.
@@ -480,7 +588,12 @@ impl KubernetesCompute {
         format!("{instance}-data")
     }
 
-    fn statefulset_manifest(&self, instance: &str, def: &ComputeDefinition) -> StatefulSet {
+    fn statefulset_manifest(
+        &self,
+        instance: &str,
+        def: &ComputeDefinition,
+        seal_trust_cidrs: &[String],
+    ) -> StatefulSet {
         let labels = labels_for(instance);
         let svc_name = Self::svc_name(instance);
         let pvc_name = Self::pvc_name_for(instance, def);
@@ -542,6 +655,7 @@ impl KubernetesCompute {
                 empty_dir: Some(Default::default()),
                 ..Default::default()
             });
+            let hba_contents = seal_hba_contents(seal_trust_cidrs);
             init_containers.push(Container {
                 name: "gfs-seal-hba".to_string(),
                 image: Some(def.image.clone()),
@@ -549,7 +663,7 @@ impl KubernetesCompute {
                 command: Some(vec![
                     "sh".to_string(),
                     "-c".to_string(),
-                    "printf 'local all all trust\\nhost all all 127.0.0.1/32 trust\\nhost all all ::1/128 trust\\n' > /gfs-hba/pg_hba.conf".to_string(),
+                    format!("printf '{hba_contents}' > /gfs-hba/pg_hba.conf"),
                 ]),
                 volume_mounts: Some(vec![VolumeMount {
                     name: "gfs-hba".to_string(),
@@ -825,7 +939,8 @@ impl KubernetesCompute {
 
     async fn ensure_statefulset(&self, instance: &str, def: &ComputeDefinition) -> Result<()> {
         let api = self.api_statefulsets();
-        let sts = self.statefulset_manifest(instance, def);
+        let seal_trust_cidrs = self.cluster_pod_cidrs().await;
+        let sts = self.statefulset_manifest(instance, def, &seal_trust_cidrs);
         let pp = PatchParams::apply("gfs").force();
         api.patch(instance, &pp, &Patch::Apply(&sts))
             .await
@@ -2366,5 +2481,115 @@ mod tests {
             KubernetesCompute::instance_status_from_pod(&id, Some(pod)).state,
             InstanceState::Stopping
         ));
+    }
+
+    /// The seal's cluster-CIDR rule is what lets a lazy clone's bootstrap
+    /// sidecar (a separate pod) reach a freshly-booted, still-sealed target —
+    /// see `statefulset_manifest`'s seal comment. It must appear as
+    /// `scram-sha-256` (password still required), never `trust`, and it must
+    /// be silently omitted rather than injected when the discovered value
+    /// doesn't look like a CIDR — a stray value here would land straight in a
+    /// `sh -c` string.
+    #[test]
+    fn seal_grants_the_cluster_cidr_password_auth_never_trust() {
+        let sealed = seal_hba_contents(&["198.51.100.0/24".to_string()]);
+        assert!(
+            sealed.contains("host all all 198.51.100.0/24 scram-sha-256"),
+            "expected the cluster CIDR rule, got: {sealed}"
+        );
+        assert!(
+            !sealed.contains("198.51.100.0/24 trust"),
+            "the cluster CIDR must never be trusted passwordless: {sealed}"
+        );
+        // Loopback stays intact regardless.
+        assert!(sealed.contains("host all all 127.0.0.1/32 trust"));
+    }
+
+    /// The target pod isn't scheduled yet when the seal is built, so on a
+    /// multi-node cluster (the local dev stack alone joins a CP and a DP VM
+    /// into one) every node's CIDR must get its own rule — trusting only the
+    /// first one listed silently misses the bootstrap sidecar whenever the
+    /// scheduler picks a different node, which is exactly the bug this fix
+    /// closes.
+    #[test]
+    fn seal_grants_every_nodes_cidr_on_a_multi_node_cluster() {
+        let sealed =
+            seal_hba_contents(&["203.0.113.0/24".to_string(), "198.51.100.0/24".to_string()]);
+        assert!(sealed.contains("host all all 203.0.113.0/24 scram-sha-256"));
+        assert!(sealed.contains("host all all 198.51.100.0/24 scram-sha-256"));
+    }
+
+    #[test]
+    fn seal_stays_loopback_only_when_cidrs_are_unknown_or_implausible() {
+        for input in [
+            Vec::new(),
+            vec!["not-a-cidr".to_string()],
+            vec!["'; rm -rf /gfs-hba #".to_string()],
+        ] {
+            let sealed = seal_hba_contents(&input);
+            assert!(
+                !sealed.contains("scram-sha-256"),
+                "no cluster rule should be added for {input:?}, got: {sealed}"
+            );
+            assert!(sealed.contains("host all all 127.0.0.1/32 trust"));
+        }
+    }
+
+    #[test]
+    fn cidr_check_rejects_shell_metacharacters_and_invalid_masks() {
+        assert_eq!(
+            canonical_cidr("198.51.100.0/24").as_deref(),
+            Some("198.51.100.0/24")
+        );
+        assert_eq!(canonical_cidr("fd00::/8").as_deref(), Some("fd00::/8"));
+        assert!(canonical_cidr("").is_none());
+        assert!(canonical_cidr("198.51.100.0").is_none()); // no prefix — not a CIDR
+        assert!(canonical_cidr("198.51.100.0/24'; rm -rf / #").is_none());
+        assert!(canonical_cidr("$(reboot)").is_none());
+        // Shape-valid but semantically invalid: a character-class check passes
+        // these, and Postgres then refuses to load pg_hba.conf at all, so the
+        // pod CrashLoops instead of degrading to loopback-only.
+        assert!(canonical_cidr("198.51.100.0/99").is_none());
+        assert!(canonical_cidr("fd00::/300").is_none());
+        assert!(canonical_cidr("198.51.100.0/+8").is_none()); // u8::from_str takes '+'
+        assert!(canonical_cidr("999.1.1.1/24").is_none());
+    }
+
+    /// `podCIDR` is only ever `podCIDRs[0]`, so reading it first drops the IPv6
+    /// range on a dual-stack cluster and re-opens this bug for a sidecar that
+    /// connects over v6.
+    #[test]
+    fn every_advertised_pod_cidr_is_used_including_dual_stack() {
+        assert_eq!(
+            pod_cidrs_from_spec(
+                Some("198.51.100.0/24".into()),
+                Some(vec!["198.51.100.0/24".into(), "fd00:42::/64".into()])
+            ),
+            vec!["198.51.100.0/24".to_string(), "fd00:42::/64".to_string()]
+        );
+        // Single-stack: the list is still the source of truth.
+        assert_eq!(
+            pod_cidrs_from_spec(Some("203.0.113.0/24".into()), None),
+            vec!["203.0.113.0/24".to_string()]
+        );
+        assert!(pod_cidrs_from_spec(None, None).is_empty());
+        assert!(pod_cidrs_from_spec(None, Some(vec![])).is_empty());
+    }
+
+    /// The seal string is baked into the StatefulSet pod template, so it must
+    /// depend on the *set* of node CIDRs and not on the order the Node API
+    /// returned them — otherwise an unrelated reconcile rewrites the template
+    /// and rolling-restarts a running customer database.
+    #[test]
+    fn seal_is_stable_under_node_reordering_and_duplicates() {
+        let a = seal_hba_contents(&["203.0.113.0/24".into(), "198.51.100.0/24".into()]);
+        let b = seal_hba_contents(&["198.51.100.0/24".into(), "203.0.113.0/24".into()]);
+        assert_eq!(a, b, "seal must not depend on node list order");
+        let dup = seal_hba_contents(&["198.51.100.0/24".into(), "198.51.100.0/24".into()]);
+        assert_eq!(
+            dup.matches("198.51.100.0/24").count(),
+            1,
+            "a repeated node CIDR must yield one rule, not two: {dup}"
+        );
     }
 }
