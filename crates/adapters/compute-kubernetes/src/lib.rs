@@ -1634,6 +1634,18 @@ impl Compute for KubernetesCompute {
         command: &str,
         linked_to: Option<&InstanceId>,
     ) -> Result<ExecOutput> {
+        self.run_task_impl(definition, command, linked_to).await
+    }
+}
+
+impl KubernetesCompute {
+    /// Shared body of [`Compute::run_task`].
+    async fn run_task_impl(
+        &self,
+        definition: &ComputeDefinition,
+        command: &str,
+        linked_to: Option<&InstanceId>,
+    ) -> Result<ExecOutput> {
         let pods: Api<Pod> = self.api_pods();
         let name = ensure_dns_label(&format!("gfs-task-{}", now_suffix()));
         let labels = labels_for(&name);
@@ -1698,11 +1710,19 @@ impl Compute for KubernetesCompute {
         let mut terminal_phase = String::from("Unknown");
         let mut exit_code: Option<i32> = None;
         // Clone bootstrap: wait for local DB (up to 120s) + pg_dump remote + FDW setup.
+        // A failure in here must NOT return early -- record it, leave the loop, and
+        // surface it after the cleanup below has run.
+        let mut poll_err: Option<ComputeError> = None;
         for _ in 0..360 {
-            let p = pods
-                .get(&name)
-                .await
-                .map_err(|e| ComputeError::Internal(format!("k8s task pod get failed: {e}")))?;
+            let p = match pods.get(&name).await {
+                Ok(p) => p,
+                Err(e) => {
+                    poll_err = Some(ComputeError::Internal(format!(
+                        "k8s task pod get failed: {e}"
+                    )));
+                    break;
+                }
+            };
             let phase = p
                 .status
                 .as_ref()
@@ -1731,6 +1751,11 @@ impl Compute for KubernetesCompute {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let stdout = fetch_task_pod_logs(&pods, &name).await;
         let _ = pods.delete(&name, &DeleteParams::default()).await;
+
+        // Surface a poll failure now that the task pod is gone.
+        if let Some(e) = poll_err {
+            return Err(e);
+        }
 
         // Derive the exit code: prefer the container's terminated state; fall
         // back to the pod phase (Failed → 1, Succeeded/Unknown → 0). A pod that
@@ -1765,6 +1790,7 @@ fn _unused(_p: &Path) {}
 mod tests {
     use super::*;
     use gfs_domain::ports::compute::EnvVar;
+
     use k8s_openapi::ByteString;
 
     fn definition_with_env(env: Vec<EnvVar>) -> ComputeDefinition {
