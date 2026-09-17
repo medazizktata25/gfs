@@ -1710,12 +1710,8 @@ impl KubernetesCompute {
         let mut terminal_phase = String::from("Unknown");
         let mut exit_code: Option<i32> = None;
         // Clone bootstrap: wait for local DB (up to 120s) + pg_dump remote + FDW setup.
-        // A failure in here must NOT return early: the revoke below is the only thing
-        // that removes the allowance, and `granted` is already set. Losing the API
-        // server mid-poll (eviction, preemption, a 5xx from a single-server control
-        // plane) would otherwise strand the rule -- reproduced by deleting the task
-        // pod mid-bootstrap, after which the rule survived indefinitely. Record the
-        // error, leave the loop, and surface it *after* the revoke has run.
+        // A failure in here must NOT return early -- record it, leave the loop, and
+        // surface it after the cleanup below has run.
         let mut poll_err: Option<ComputeError> = None;
         for _ in 0..360 {
             let p = match pods.get(&name).await {

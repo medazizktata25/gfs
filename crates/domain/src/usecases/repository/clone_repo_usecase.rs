@@ -67,6 +67,42 @@ pub struct CloneRepoUseCase<R: DatabaseProviderRegistry> {
     registry: Arc<R>,
 }
 
+/// Build the shell that launches the in-pod bootstrap.
+///
+/// Shared by `run_task_impl` and its tests on purpose. It used to be built inline
+/// and the tests kept a second, identical copy of this `format!` -- so they
+/// asserted on the copy and passed even when the real launcher changed. Removing
+/// `setsid` from production left both green.
+///
+/// `umask 077` and the `rm -f` matter: the body carries the SOURCE database
+/// password in cleartext (postgresql.rs builds the libpq password variable
+/// into the command), and this directory lives inside PGDATA, which
+/// `gfs commit` snapshots. So the
+/// script is written owner-only and removed the moment the work ends -- on the
+/// failure path too, where the scratch dir is otherwise kept for a later repair.
+/// The log and sentinel, which carry no secret, are what that repair reads.
+///
+/// The pid recorded is the WORKER's (`$!`), not the wrapping shell's. Recording
+/// `$$` named the shell that merely waits, so killing it reported the bootstrap
+/// gone while the real work carried on writing DDL.
+fn bootstrap_launch_script(dir: &str, body: &str) -> String {
+    let script = format!("{dir}/bootstrap.sh");
+    let status = format!("{dir}/status");
+    let log = format!("{dir}/bootstrap.log");
+    let pid = format!("{dir}/pid");
+    format!(
+        "mkdir -p {dir}\n\
+         rm -f {status}\n\
+         umask 077\n\
+         printf '%s' {b} > {script}\n\
+         setsid sh -c 'sh {script} > {log} 2>&1 & echo $! > {pid}; wait $!; \
+rc=$?; rm -f {script}; echo $rc > {status}' \
+           >/dev/null 2>&1 </dev/null &\n\
+         exit 0",
+        b = crate::utils::shell::shell_single_quote(body),
+    )
+}
+
 impl<R: DatabaseProviderRegistry> CloneRepoUseCase<R> {
     pub fn new(compute: Arc<dyn Compute>, registry: Arc<R>) -> Self {
         Self { compute, registry }
@@ -221,7 +257,6 @@ impl<R: DatabaseProviderRegistry> CloneRepoUseCase<R> {
         //    later repair instead of losing it. Verified on a live pod: a detached
         //    job outlived the exec that launched it and wrote its sentinel.
         let dir = &spec.scratch_dir;
-        let script = format!("{dir}/bootstrap.sh");
         let status = format!("{dir}/status");
         let log = format!("{dir}/bootstrap.log");
         // Liveness is checked by pid, not by name. `pgrep -f bootstrap.sh` matches
@@ -229,15 +264,7 @@ impl<R: DatabaseProviderRegistry> CloneRepoUseCase<R> {
         // string -- so it reports RUNNING forever and the "gone" branch never fires.
         let pid = format!("{dir}/pid");
 
-        let launch = format!(
-            "mkdir -p {dir}\n\
-             rm -f {status}\n\
-             printf '%s' {body} > {script}\n\
-             setsid sh -c 'echo $$ > {pid}; sh {script} > {log} 2>&1; echo $? > {status}' \
-               >/dev/null 2>&1 </dev/null &\n\
-             exit 0",
-            body = crate::utils::shell::shell_single_quote(&spec.command),
-        );
+        let launch = bootstrap_launch_script(dir, &spec.command);
         let launched = self.compute.exec(&instance_id, &launch, None).await?;
         if launched.exit_code != 0 {
             return Err(CloneRepoError::TaskFailed {
@@ -345,25 +372,16 @@ mod tests {
     /// The launcher and poll are built inline in `run`, so this pins their shape
     /// from the one place that is testable without a live pod: the strings
     /// themselves. Behaviour is covered end-to-end on a cluster.
+    /// Calls the SAME builder production uses. It previously kept its own copy of
+    /// the format string, so it pinned the copy rather than the launcher.
     fn launcher_for(dir: &str, body: &str) -> String {
-        let script = format!("{dir}/bootstrap.sh");
-        let status = format!("{dir}/status");
-        let log = format!("{dir}/bootstrap.log");
-        let pid = format!("{dir}/pid");
-        format!(
-            "mkdir -p {dir}\n\
-             rm -f {status}\n\
-             printf '%s' {b} > {script}\n\
-             setsid sh -c 'echo $$ > {pid}; sh {script} > {log} 2>&1; echo $? > {status}' \
-               >/dev/null 2>&1 </dev/null &\n\
-             exit 0",
-            b = crate::utils::shell::shell_single_quote(body),
-        )
+        super::bootstrap_launch_script(dir, body)
     }
 
     #[test]
     fn the_bootstrap_is_launched_detached_so_it_outlives_the_connection() {
-        let cmd = launcher_for("/var/lib/postgresql/data/.gfs_bootstrap", "echo hi");
+        let dir = "/var/lib/postgresql/data/.gfs_bootstrap";
+        let cmd = launcher_for(dir, "echo hi");
         // `setsid` is the whole point: without it the work dies with the exec
         // stream. Measured on a live cluster -- killing the daemon while the
         // bootstrap ran on the stream left it reaped part-way, with foreign tables
@@ -382,7 +400,7 @@ mod tests {
         );
         // The exit code has to outlive the process that produced it.
         assert!(
-            cmd.contains("echo $? > "),
+            cmd.contains("rc=$?") && cmd.contains("echo $rc > "),
             "must record an exit status: {cmd}"
         );
         assert!(
@@ -394,8 +412,32 @@ mod tests {
         // the command string -- so it reports RUNNING forever and the "gone" branch
         // is dead code. Measured: a reap guarded that way never fired.
         assert!(
-            cmd.contains("echo $$ > ") && cmd.contains("/pid"),
+            cmd.contains("echo $! > ") && cmd.contains("/pid"),
             "the detached run must record its pid so liveness is not checked by name: {cmd}"
+        );
+        // ...and it must be the WORKER's pid, not the wrapping shell's. `$$` named
+        // the shell that only waits, so killing it reported the bootstrap gone
+        // while the orphaned worker carried on writing DDL.
+        assert!(
+            !cmd.contains("echo $$ > "),
+            "must not record the wrapper's pid -- liveness would not follow the work: {cmd}"
+        );
+        assert!(
+            cmd.contains("wait $!"),
+            "the wrapper must wait on the worker so the sentinel is the worker's status: {cmd}"
+        );
+        // The body carries the source password and this dir is inside PGDATA,
+        // which gfs commit snapshots. Owner-only, and gone when the work ends.
+        assert!(
+            cmd.contains("umask 077"),
+            "the script carrying the source password must be owner-only: {cmd}"
+        );
+        // Contiguous, and the script path specifically: `rm -f <dir>/status` and
+        // the `printf ... > <dir>/bootstrap.sh` both already appear, so asserting
+        // on "rm -f" and "bootstrap.sh" separately passes with no removal at all.
+        assert!(
+            cmd.contains(&format!("rm -f {dir}/bootstrap.sh")),
+            "the credential-bearing script must be removed when the work ends: {cmd}"
         );
     }
 
