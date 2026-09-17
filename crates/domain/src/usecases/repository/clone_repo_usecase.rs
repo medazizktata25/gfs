@@ -75,12 +75,20 @@ pub struct CloneRepoUseCase<R: DatabaseProviderRegistry> {
 /// `setsid` from production left both green.
 ///
 /// `umask 077` and the `rm -f` matter: the body carries the SOURCE database
-/// password in cleartext (postgresql.rs builds the libpq password variable
-/// into the command), and this directory lives inside PGDATA, which
-/// `gfs commit` snapshots. So the
-/// script is written owner-only and removed the moment the work ends -- on the
-/// failure path too, where the scratch dir is otherwise kept for a later repair.
-/// The log and sentinel, which carry no secret, are what that repair reads.
+/// password in cleartext (postgresql.rs builds the libpq password variable into
+/// the command), and this directory lives inside PGDATA, which `gfs commit`
+/// snapshots. So the script is written owner-only and removed the moment the
+/// work ends -- on the failure path too, where the scratch dir is otherwise kept
+/// for a later repair. The log and sentinel, which carry no secret, are what
+/// that repair reads.
+///
+/// This narrows the exposure; it does not end it. A lazy clone keeps a live FDW
+/// link to the source, so Postgres stores that password in the user mapping for
+/// `gfs_remote_srv` in order to reconnect, and the catalog write lands in the
+/// WAL. Measured after a real clone: no file under PGDATA contained the string
+/// `PGPASSWORD`, but `pg_wal/…0001` still contained the source password itself
+/// (mode 0600). Getting it out of the snapshot entirely means detaching the FDW
+/// after seeding, not tightening this script.
 ///
 /// The pid recorded is the WORKER's (`$!`), not the wrapping shell's. Recording
 /// `$$` named the shell that merely waits, so killing it reported the bootstrap
