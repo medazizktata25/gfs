@@ -25,8 +25,11 @@ use tokio::io::{AsyncBufRead, AsyncRead, BufReader, ReadBuf};
 /// Wraps a byte stream and forwards every line except the blank ones.
 pub struct SkipBlankLines<R> {
     inner: BufReader<R>,
-    /// The current line, still to be handed to the caller, and how much of it
-    /// has been handed over already.
+    /// The line being accumulated. Not yet judged, because a line cannot be
+    /// judged blank until its terminator has arrived.
+    line: Vec<u8>,
+    /// A line that has been judged and is being handed to the caller, and how
+    /// much of it has gone already.
     pending: Vec<u8>,
     offset: usize,
     done: bool,
@@ -36,6 +39,7 @@ impl<R: AsyncRead + Unpin> SkipBlankLines<R> {
     pub fn new(inner: R) -> Self {
         Self {
             inner: BufReader::new(inner),
+            line: Vec::new(),
             pending: Vec::new(),
             offset: 0,
             done: false,
@@ -52,42 +56,60 @@ impl<R: AsyncRead + Unpin> AsyncRead for SkipBlankLines<R> {
         let this = self.get_mut();
 
         loop {
-            // Hand over whatever of the current line is left.
+            // Hand over whatever of the judged line is left.
             if this.offset < this.pending.len() {
                 let n = std::cmp::min(buf.remaining(), this.pending.len() - this.offset);
                 buf.put_slice(&this.pending[this.offset..this.offset + n]);
                 this.offset += n;
                 return Poll::Ready(Ok(()));
             }
+            // That one is spent.
+            this.pending.clear();
+            this.offset = 0;
             if this.done {
                 return Poll::Ready(Ok(()));
             }
 
-            // Pull the next line, skipping any that hold only whitespace.
-            this.pending.clear();
-            this.offset = 0;
+            // Accumulate until the line is terminated, and only then judge it.
+            //
+            // Nothing is forwarded from a line before its terminator arrives.
+            // Forwarding early is what broke this: `writeln!` emits the content
+            // and the `\n` as separate writes, a pipe can deliver them as
+            // separate reads, and the lone `\n` then looks like a complete
+            // all-whitespace line. Dropping it stripped the terminator from a
+            // message already handed over, so the JSON-RPC parser never
+            // dispatched that message and glued the next one onto it.
             match Pin::new(&mut this.inner).poll_fill_buf(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(available)) => {
                     if available.is_empty() {
                         this.done = true;
-                        return Poll::Ready(Ok(()));
+                        if this.line.is_empty() {
+                            return Poll::Ready(Ok(()));
+                        }
+                        // A final line with no terminator is never judged blank,
+                        // and must not be lost.
+                        std::mem::swap(&mut this.pending, &mut this.line);
+                        this.line.clear();
+                        continue;
                     }
                     let take = match available.iter().position(|b| *b == b'\n') {
                         Some(at) => at + 1,
-                        // No newline yet: take what there is and come back for
-                        // the rest. A partial line is never judged blank.
                         None => available.len(),
                     };
-                    this.pending.extend_from_slice(&available[..take]);
+                    this.line.extend_from_slice(&available[..take]);
                     Pin::new(&mut this.inner).consume(take);
 
-                    let complete = this.pending.last() == Some(&b'\n');
-                    if complete && this.pending.iter().all(|b| b.is_ascii_whitespace()) {
-                        // A blank line. Drop it and look at the next one.
-                        this.pending.clear();
+                    if this.line.last() != Some(&b'\n') {
+                        continue; // still partial -- keep reading
                     }
+                    if this.line.iter().all(|b| b.is_ascii_whitespace()) {
+                        this.line.clear(); // a blank line: drop it
+                        continue;
+                    }
+                    std::mem::swap(&mut this.pending, &mut this.line);
+                    this.line.clear();
                 }
             }
         }
@@ -137,6 +159,83 @@ mod tests {
         assert_eq!(
             filtered("{\"a\":1}\n{\"b\":2}").await,
             "{\"a\":1}\n{\"b\":2}"
+        );
+    }
+
+    /// Feeds the filter one chunk per `poll_read`, so a line can be split across
+    /// reads the way a pipe actually delivers it.
+    struct Chunks(std::collections::VecDeque<Vec<u8>>);
+
+    impl Chunks {
+        fn new(parts: &[&str]) -> Self {
+            Self(parts.iter().map(|s| s.as_bytes().to_vec()).collect())
+        }
+    }
+
+    impl AsyncRead for Chunks {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let Some(mut chunk) = self.0.pop_front() else {
+                return Poll::Ready(Ok(())); // EOF
+            };
+            let n = std::cmp::min(buf.remaining(), chunk.len());
+            buf.put_slice(&chunk[..n]);
+            if n < chunk.len() {
+                self.0.push_front(chunk.split_off(n));
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn filtered_chunks(parts: &[&str]) -> String {
+        let mut out = String::new();
+        SkipBlankLines::new(Chunks::new(parts))
+            .read_to_string(&mut out)
+            .await
+            .expect("read");
+        out
+    }
+
+    /// A terminator that arrives in its own read must not be mistaken for a
+    /// blank line.
+    ///
+    /// `writeln!` emits the content and the `\n` as separate writes, so a pipe
+    /// can deliver them as separate reads. The content is forwarded first; the
+    /// lone `\n` then arrives as a "complete, all-whitespace line" and was
+    /// dropped -- leaving the message with no terminator, so the JSON-RPC parser
+    /// never dispatched it and glued the next message onto it.
+    #[tokio::test]
+    async fn a_terminator_in_its_own_read_is_not_a_blank_line() {
+        assert_eq!(filtered_chunks(&["{\"a\":1}", "\n"]).await, "{\"a\":1}\n");
+        assert_eq!(
+            filtered_chunks(&["{\"a\":1}", "\n", "{\"b\":2}", "\n"]).await,
+            "{\"a\":1}\n{\"b\":2}\n"
+        );
+        // A genuinely blank line delivered on its own is still dropped.
+        assert_eq!(
+            filtered_chunks(&["{\"a\":1}\n", "\n", "{\"b\":2}\n"]).await,
+            "{\"a\":1}\n{\"b\":2}\n"
+        );
+        // And one split mid-content, with its terminator separate again.
+        assert_eq!(
+            filtered_chunks(&["{\"a\"", ":1}", "\n"]).await,
+            "{\"a\":1}\n"
+        );
+        // A blank line split across reads is still blank. Judging only whole
+        // lines gets this for free; a flag saying "we are mid-line" would not,
+        // and would leak the whitespace through to rmcp as a protocol
+        // violation -- the failure this filter exists to prevent.
+        assert_eq!(
+            filtered_chunks(&["{\"a\":1}\n", "  ", " \n", "{\"b\":2}\n"]).await,
+            "{\"a\":1}\n{\"b\":2}\n"
+        );
+        // Several messages arriving in one read still split correctly.
+        assert_eq!(
+            filtered_chunks(&["{\"a\":1}\n\n{\"b\":2}\n"]).await,
+            "{\"a\":1}\n{\"b\":2}\n"
         );
     }
 
