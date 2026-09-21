@@ -1705,6 +1705,19 @@ name = "test-repo"
     /// `refs/heads` escapes just as well, and the name that does it looks
     /// entirely ordinary. `sub/x` with `sub -> /tmp` wrote `/tmp/x` and reported
     /// success -- on both platforms, and on the base build too.
+    ///
+    /// Unix-only because of how the escape is *built*, not because of what it
+    /// proves. `std::os::unix` does not exist on Windows, so an unguarded
+    /// reference here fails the whole `gfs-domain` test target to compile there
+    /// (E0433) rather than skipping one case. Creating a symlink on Windows also
+    /// needs `SeCreateSymbolicLinkPrivilege` or Developer Mode, so the setup is
+    /// not portable even spelled the Windows way.
+    ///
+    /// The guard itself is not unix-only: `branch_ref_path` canonicalises, and
+    /// canonicalisation resolves Windows junctions -- which an unprivileged user
+    /// *can* create -- just as it resolves symlinks. So the protection holds on
+    /// Windows; it is only unverified there.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_component_inside_refs_heads_cannot_escape() {
         let temp_dir = TempDir::new().unwrap();
