@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use crate::model::commit::{Commit, CommitWithRefs, FileEntry, NewCommit, file_entry_diff_stats};
 use crate::model::config::{EnvironmentConfig, GfsConfig, RuntimeConfig, UserConfig};
 use crate::model::errors::RepoError;
-use crate::model::layout::{GFS_DIR, HEADS_DIR, OBJECTS_DIR, REFS_DIR, SNAPSHOTS_DIR};
+use crate::model::layout::{GFS_DIR, OBJECTS_DIR, SNAPSHOTS_DIR};
 use crate::ports::repository::{LogOptions, RemoteOptions, Repository, RepositoryError, Result};
 use crate::repo_utils::repo_layout;
 use crate::utils::hash::hash_commit;
@@ -803,8 +803,13 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    // HEADS_DIR and REFS_DIR are test-only here now: this adapter used to build
+    // `refs/heads/<name>` inline in `checkout`, and #76 replaced that with the
+    // single-source `checkout_target()`. The tests still assert on the on-disk
+    // layout directly, so they keep the constants; the lib no longer needs them.
     use crate::model::layout::{
-        CONFIG_FILE, HEAD_FILE, MAIN_BRANCH, WORKSPACE_DATA_DIR, WORKSPACE_FILE, WORKSPACES_DIR,
+        CONFIG_FILE, HEAD_FILE, HEADS_DIR, MAIN_BRANCH, REFS_DIR, WORKSPACE_DATA_DIR,
+        WORKSPACE_FILE, WORKSPACES_DIR,
     };
     use crate::ports::repository::{LogOptions, Repository};
     use crate::utils::hash::hash_commit;
