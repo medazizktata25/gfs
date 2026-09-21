@@ -44,8 +44,15 @@ pub fn resolve(name: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// On any platform these tests run on, `cp` is in a standard location, so
-    /// resolution must not fall through to a bare name.
+    /// Unix-only: `STANDARD_DIRS` is `/bin` and `/usr/bin`, neither of which
+    /// exists on Windows, so `resolve` correctly falls back to the bare name
+    /// there and `is_absolute()` is false. Asserting otherwise made this fail
+    /// on the windows runner -- the fallback working as designed, read as a
+    /// defect.
+    ///
+    /// The other two tests here are genuinely cross-platform: both exercise the
+    /// fallback, which is the only branch Windows ever takes.
+    #[cfg(unix)]
     #[test]
     fn a_standard_utility_resolves_to_an_absolute_path() {
         let cp = resolve("cp");

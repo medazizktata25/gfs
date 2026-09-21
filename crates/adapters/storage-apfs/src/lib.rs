@@ -379,7 +379,21 @@ fn remap_id(err: StorageError, id: &VolumeId) -> StorageError {
     }
 }
 
-#[cfg(test)]
+/// macOS-only, and the whole module rather than the one test it holds.
+///
+/// The single test here asserts that a snapshot *succeeds*. This adapter copies
+/// with `cp -cRp`, and `-c` is clonefile(2) -- a BSD flag. On Linux the resolved
+/// `/bin/cp` is GNU cp, which answers `/bin/cp: invalid option -- 'c'`
+/// (reproduced on ubuntu 24.04: that is the exact text), so no GNU cp can ever
+/// satisfy it. `storage-file` needs no such gate -- it selects
+/// `--reflink=auto -a` on Linux -- which is why only this crate's copy of the
+/// assertion is restricted.
+///
+/// Gating the module, not the `#[test]`: both `use` lines serve only this test,
+/// so a per-test attribute leaves them unused everywhere else, and CI runs
+/// `clippy --all-targets -- -D warnings` on ubuntu, where an unused import is an
+/// error rather than a warning.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use gfs_domain::ports::storage::{SnapshotOptions, StoragePort, VolumeId};
