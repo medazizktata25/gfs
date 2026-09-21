@@ -892,15 +892,28 @@ pub fn soft_delete_branch_ref(
         .trim()
         .to_string();
 
-    // Two deletions within the same millisecond would otherwise share a
-    // directory; step forward until the slot is free rather than merging them.
+    // One deletion per timestamp directory, so step forward while the directory
+    // exists at all -- not while this branch's name is already inside it.
+    //
+    // Probing for the name is not enough, because the collision is between
+    // *different* names landing in one millisecond. Delete `a` and then `a/b`
+    // inside the same millisecond and the second call asks for
+    // `<ts>/a/b`, whose parent `<ts>/a` is the file the first call just wrote:
+    // `create_dir_all` fails with EEXIST. That is precisely the nested-branch
+    // case this timestamp-outer layout exists to make unreachable, and a
+    // name-keyed probe cannot see it -- `<ts>/a/b` does not exist, so the loop
+    // never steps.
+    //
+    // It also breaks pruning: two unrelated names in one directory mean
+    // removing the expired one cannot remove the directory, and a restore of
+    // either leaves the other's slot half-occupied.
+    //
+    // Only reachable on a machine fast enough to run two deletions inside a
+    // millisecond, which is why CI saw it on Linux and macOS while the slower
+    // Windows runner passed.
     let mut deleted_at_ms = now_ms();
     let base = deleted_refs_dir(repo_path);
-    while base
-        .join(deleted_at_ms.to_string())
-        .join(branch_name)
-        .exists()
-    {
+    while base.join(deleted_at_ms.to_string()).exists() {
         deleted_at_ms += 1;
     }
 
@@ -1718,6 +1731,49 @@ mod tests {
             !branch_exists(repo, "a"),
             "restoring one must not restore the other"
         );
+    }
+
+    /// The slot search must step on the *directory*, not on the name inside it.
+    ///
+    /// Keyed by name, two deletions of *different* names in one millisecond
+    /// share a directory: the probe looks for `<ts>/<this name>`, which is
+    /// absent, so it never steps. That makes the two tests around this one fail
+    /// intermittently -- on a machine fast enough to run two deletions inside a
+    /// millisecond -- which is how it reached CI green on Windows and red on
+    /// Linux and macOS.
+    ///
+    /// A burst makes the collision reliable instead of leaving it to how fast
+    /// the machine is.
+    #[test]
+    fn a_burst_of_deletions_never_shares_a_timestamp_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        create_valid_repo_layout(repo).unwrap();
+
+        const N: usize = 64;
+        let mut slots = Vec::with_capacity(N);
+        for i in 0..N {
+            let name = format!("b{i}");
+            write_branch(repo, &name, "a".repeat(64).as_str());
+            slots.push(soft_delete_branch_ref(repo, &name).unwrap().deleted_at_ms);
+        }
+
+        let unique: std::collections::BTreeSet<u64> = slots.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            N,
+            "each deletion needs its own slot; {} of {N} were handed a shared one",
+            N - unique.len()
+        );
+
+        // On disk, not only in the returned value: the slot a caller is told
+        // about and the directory the ref landed in have to agree.
+        let base = deleted_refs_dir(repo);
+        for slot in &unique {
+            let held = fs::read_dir(base.join(slot.to_string())).unwrap().count();
+            assert_eq!(held, 1, "slot {slot} holds {held} deletions, not one");
+        }
+        assert_eq!(list_deleted_branch_refs(repo).unwrap().len(), N);
     }
 
     #[test]
