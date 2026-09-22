@@ -2888,8 +2888,12 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("alpha.db"), "{err}");
+        // Built with the platform separator rather than a literal "/": the
+        // message renders a real path, so Windows prints `storage\beta.sqlite3`
+        // and a hardcoded forward slash fails there and nowhere else.
+        let nested = std::path::Path::new("storage").join("beta.sqlite3");
         assert!(
-            err.contains("storage/beta.sqlite3"),
+            err.contains(&nested.display().to_string()),
             "relative path expected: {err}"
         );
     }
