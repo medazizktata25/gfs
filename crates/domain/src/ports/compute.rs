@@ -300,6 +300,21 @@ pub trait Compute: Send + Sync {
     /// Return the current runtime status of the instance.
     async fn status(&self, id: &InstanceId) -> Result<InstanceStatus>;
 
+    /// Watch for instance state changes, delivering `(InstanceId, InstanceState)`
+    /// the moment a runtime transition is observed (e.g. a pod becoming ready)
+    /// rather than on the next poll tick.
+    ///
+    /// Returns `Some(receiver)` for runtimes with a native change feed (e.g. the
+    /// Kubernetes API watch); the caller consumes it as the primary signal and
+    /// keeps a slow status poll only as a reconnect backstop. Returns `None` for
+    /// runtimes with no watch (e.g. Docker), where the caller must poll `status`.
+    /// The default implementation returns `None`.
+    async fn watch_status(
+        &self,
+    ) -> Result<Option<tokio::sync::mpsc::Receiver<(InstanceId, InstanceState)>>> {
+        Ok(None)
+    }
+
     /// Return host port and env for the given container port, for building a connection string.
     /// The adapter inspects the instance (e.g. Docker port bindings and container env).
     async fn get_connection_info(

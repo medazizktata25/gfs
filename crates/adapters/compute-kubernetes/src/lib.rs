@@ -22,10 +22,11 @@ use gfs_domain::ports::compute::{
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{
     Container, EnvVarSource, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
-    PodSecurityContext, PodSpec, PodTemplateSpec, Secret, SecretKeySelector, Service, ServicePort,
-    ServiceSpec, Volume, VolumeMount,
+    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, Secret, SecretKeySelector, Service,
+    ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 use serde_json::json;
@@ -118,6 +119,61 @@ fn pod_is_ready(pod: &Pod) -> bool {
         .map(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
         .unwrap_or(false);
     running && ready
+}
+
+/// Name of the engine container in every instance pod (see `statefulset_manifest`).
+const DB_CONTAINER_NAME: &str = "db";
+
+/// Container-`waiting` reasons that mean the container can never reach a serving
+/// state on its own: a crash loop, or an image/config error that prevents it
+/// from running at all. Deliberately NOT the normal startup reasons
+/// (`ContainerCreating` / `PodInitializing`).
+const BROKEN_WAITING_REASONS: &[&str] = &[
+    "CrashLoopBackOff",
+    "ImagePullBackOff",
+    "ErrImagePull",
+    "InvalidImageName",
+    "CreateContainerConfigError",
+    "CreateContainerError",
+];
+
+fn container_is_broken(status: &k8s_openapi::api::core::v1::ContainerStatus) -> bool {
+    status
+        .state
+        .as_ref()
+        .and_then(|st| st.waiting.as_ref())
+        .and_then(|w| w.reason.as_deref())
+        .map(|r| BROKEN_WAITING_REASONS.contains(&r))
+        .unwrap_or(false)
+}
+
+/// True when the pod can never reach a serving state: the ENGINE (`db`) container
+/// is in a broken waiting state, OR any **init** container is — a failed init
+/// container (e.g. the seal-hba initContainer stuck in `ImagePullBackOff` because
+/// the image tag is bad) blocks the pod forever while `db` merely sits in
+/// `PodInitializing`. These map to Failed rather than
+/// a perpetual Starting. The regular-container check is scoped to `db` by name so
+/// a future crashing sidecar can never condemn a live engine; init containers are
+/// all mandatory and sequential, so any broken one blocks the whole pod.
+fn pod_container_broken(pod: &Pod) -> bool {
+    let Some(status) = pod.status.as_ref() else {
+        return false;
+    };
+    let init_broken = status
+        .init_container_statuses
+        .as_ref()
+        .map(|cs| cs.iter().any(container_is_broken))
+        .unwrap_or(false);
+    let db_broken = status
+        .container_statuses
+        .as_ref()
+        .map(|cs| {
+            cs.iter()
+                .filter(|c| c.name == DB_CONTAINER_NAME)
+                .any(container_is_broken)
+        })
+        .unwrap_or(false);
+    init_broken || db_broken
 }
 
 fn now_suffix() -> String {
@@ -228,6 +284,23 @@ fn labels_for(instance: &str) -> BTreeMap<String, String> {
     m.insert(APP_LABEL_KEY.to_string(), APP_LABEL_VALUE.to_string());
     m.insert(INSTANCE_LABEL_KEY.to_string(), instance.to_string());
     m
+}
+
+/// Recover the [`InstanceId`] a managed pod belongs to from its instance label.
+fn instance_id_from_pod(pod: &Pod) -> Option<InstanceId> {
+    pod.metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(INSTANCE_LABEL_KEY))
+        .map(|value| InstanceId(value.clone()))
+}
+
+/// Map a watched pod to `(InstanceId, InstanceState)` using the same readiness
+/// mapping the poll path uses, so the watch changes only the timing of an edge.
+fn instance_update_from_pod(pod: &Pod) -> Option<(InstanceId, InstanceState)> {
+    let id = instance_id_from_pod(pod)?;
+    let state = KubernetesCompute::instance_status_from_pod(&id, Some(pod.clone())).state;
+    Some((id, state))
 }
 
 /// Name of the per-instance Secret that is the durable home of the
@@ -489,6 +562,78 @@ impl KubernetesCompute {
             args.push("hba_file=/gfs-hba/pg_hba.conf".to_string());
         }
 
+        // Readiness probe: prove the engine is actually query-serving, so the
+        // pod's Ready condition — and therefore the instance's `Running` state
+        // (see `instance_status_from_pod`) — reflects "serving", not merely
+        // "process started" or "port open". Prefer an engine-aware exec check
+        // over loopback: it is seal-independent (never authenticates, so it works
+        // while the pod boots under the loopback-only credential seal) AND, unlike
+        // a raw TCP connect, it distinguishes "accepting queries" from "port open
+        // but still in recovery" and does not accrue aborted-connection errors
+        // (which would eventually host-block a MySQL engine). Engines without a
+        // cheap exec check fall back to a TCP connect. Tolerant thresholds keep a
+        // momentary blip on a healthy engine from flipping it out of Ready.
+        let readiness_probe = def.ports.first().map(|p| {
+            let port = i32::from(p.compute_port);
+            let image = def.image.as_str();
+            let is_postgres = ["postgres", "postgis", "timescale"]
+                .iter()
+                .any(|f| image.contains(f));
+            let is_mysql = ["mysql", "maria", "percona"]
+                .iter()
+                .any(|f| image.contains(f));
+            let exec_command: Option<Vec<String>> = if is_postgres {
+                // pg_isready exits 0 only once the server accepts connections; it
+                // reports "rejecting" (57P03) throughout initdb/WAL recovery.
+                Some(vec![
+                    "pg_isready".into(),
+                    "-q".into(),
+                    "-h".into(),
+                    "127.0.0.1".into(),
+                    "-p".into(),
+                    port.to_string(),
+                ])
+            } else if is_mysql {
+                // `mysqladmin ping` exits 0 when the server responds — including on
+                // an auth error — so it is a seal-independent liveness check that
+                // does not count toward MySQL's per-host connection-error cap.
+                // MariaDB 11+ renamed the tool to `mariadb-admin`; try both.
+                let ping =
+                    |tool: &str| format!("{tool} ping -h 127.0.0.1 --protocol=TCP --port={port}");
+                Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!("{} || {}", ping("mysqladmin"), ping("mariadb-admin")),
+                ])
+            } else {
+                None
+            };
+            let (exec, tcp_socket) = match exec_command {
+                Some(command) => (
+                    Some(k8s_openapi::api::core::v1::ExecAction {
+                        command: Some(command),
+                    }),
+                    None,
+                ),
+                None => (
+                    None,
+                    Some(TCPSocketAction {
+                        port: IntOrString::Int(port),
+                        ..Default::default()
+                    }),
+                ),
+            };
+            Probe {
+                exec,
+                tcp_socket,
+                period_seconds: Some(5),
+                timeout_seconds: Some(3),
+                failure_threshold: Some(3),
+                success_threshold: Some(1),
+                ..Default::default()
+            }
+        });
+
         let container = Container {
             name: "db".to_string(),
             image: Some(def.image.clone()),
@@ -497,6 +642,7 @@ impl KubernetesCompute {
             ports: Some(container_ports),
             volume_mounts: Some(mounts),
             args: if args.is_empty() { None } else { Some(args) },
+            readiness_probe,
             ..Default::default()
         };
 
@@ -715,7 +861,7 @@ impl KubernetesCompute {
     /// still be Terminating while the new one is Pending; exec'ing into a
     /// not-ready pod fails the WebSocket upgrade with `400 Bad Request`.
     async fn wait_ready_pod_name(&self, instance: &str) -> Result<String> {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         // Fast-fail if the instance is stopped (StatefulSet scaled to zero): no pod
         // exists and none is coming, so don't burn the full deadline hanging and
         // then return a misleading "not Ready" error. Tell the caller to resume it.
@@ -730,41 +876,71 @@ impl KubernetesCompute {
                  (e.g. `gfs compute start`) before running this operation"
             )));
         }
+        use kube::runtime::watcher;
+        use tokio_stream::StreamExt;
+
         let api = self.api_pods();
-        let lp = ListParams::default().labels(&format!("{INSTANCE_LABEL_KEY}={instance}"));
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            let pods = api
-                .list(&lp)
-                .await
-                .map_err(|e| ComputeError::Internal(format!("k8s pod list failed: {e}")))?;
-            let mut ready: Vec<&Pod> = pods
-                .items
-                .iter()
-                .filter(|p| p.metadata.deletion_timestamp.is_none() && pod_is_ready(p))
-                .collect();
-            ready.sort_by(|a, b| {
-                a.metadata
-                    .creation_timestamp
-                    .as_ref()
-                    .map(|t| t.0)
-                    .cmp(&b.metadata.creation_timestamp.as_ref().map(|t| t.0))
-            });
-            if let Some(name) = ready.last().and_then(|p| p.metadata.name.clone()) {
-                return Ok(name);
+        let config = watcher::Config::default().labels(&format!("{INSTANCE_LABEL_KEY}={instance}"));
+
+        // Watch the instance's pods and return the newest Ready, non-terminating
+        // one the moment it appears — no polling. The watcher's initial list seeds
+        // the current pods; ongoing events report each transition (including a
+        // Ready-condition flip), so a pod that becomes ready after the watch
+        // starts is delivered as an event rather than caught on the next tick.
+        // Bounded by the same 120s deadline.
+        let find_ready = async {
+            let mut pods: std::collections::HashMap<String, Pod> = std::collections::HashMap::new();
+            let stream = watcher(api, config);
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(watcher::Event::Apply(pod)) | Ok(watcher::Event::InitApply(pod)) => {
+                        if let Some(name) = pod.metadata.name.clone() {
+                            pods.insert(name, pod);
+                        }
+                    }
+                    Ok(watcher::Event::Delete(pod)) => {
+                        if let Some(name) = pod.metadata.name.as_ref() {
+                            pods.remove(name);
+                        }
+                    }
+                    // A relist begins: drop the stale snapshot and rebuild it from
+                    // the InitApply events that follow.
+                    Ok(watcher::Event::Init) => pods.clear(),
+                    Ok(watcher::Event::InitDone) => {}
+                    Err(e) => {
+                        tracing::debug!("wait_ready pod watch error (retrying): {e}");
+                        continue;
+                    }
+                }
+                // Same selection as the former poll: the newest non-terminating
+                // Ready pod, so a checkout reprovision's terminating old pod is
+                // ignored in favour of the fresh one.
+                let mut ready: Vec<&Pod> = pods
+                    .values()
+                    .filter(|p| p.metadata.deletion_timestamp.is_none() && pod_is_ready(p))
+                    .collect();
+                ready.sort_by(|a, b| {
+                    a.metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .map(|t| t.0)
+                        .cmp(&b.metadata.creation_timestamp.as_ref().map(|t| t.0))
+                });
+                if let Some(name) = ready.last().and_then(|p| p.metadata.name.clone()) {
+                    return Ok::<String, ComputeError>(name);
+                }
             }
-            if Instant::now() >= deadline {
-                let last_phase = pods
-                    .items
-                    .first()
-                    .and_then(|p| p.status.as_ref())
-                    .and_then(|s| s.phase.clone())
-                    .unwrap_or_else(|| "<none>".into());
-                return Err(ComputeError::Internal(format!(
-                    "pod for instance '{instance}' not Ready in time (last phase: {last_phase})"
-                )));
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            Err(ComputeError::Internal(format!(
+                "pod watch for instance '{instance}' ended before a Ready pod appeared"
+            )))
+        };
+
+        match tokio::time::timeout(Duration::from_secs(120), find_ready).await {
+            Ok(result) => result,
+            Err(_) => Err(ComputeError::Internal(format!(
+                "pod for instance '{instance}' not Ready in time"
+            ))),
         }
     }
 
@@ -794,14 +970,34 @@ impl KubernetesCompute {
                 exit_code: None,
             };
         }
+        // A broken engine container (crash loop, or an image/config error that
+        // prevents it from ever running) keeps phase=Running/Pending indefinitely,
+        // so a phase-only mapping would report it "starting" forever. Detect it
+        // explicitly and report Failed so a broken deploy surfaces its failure
+        // instead of lingering as a perpetual transition.
+        if pod_container_broken(&pod) {
+            return InstanceStatus {
+                id: instance.clone(),
+                state: InstanceState::Failed,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            };
+        }
         let phase = pod
             .status
             .as_ref()
             .and_then(|s| s.phase.as_deref())
             .unwrap_or("Unknown");
         let state = match phase {
-            "Running" => InstanceState::Running,
-            "Pending" => InstanceState::Starting,
+            // Phase `Running` means the container process is up, NOT that the
+            // engine is serving: a pod still running initdb/recovery is not ready.
+            // Gate `Running` on the pod's Ready condition (driven by the readiness
+            // probe) and report a not-ready pod as `Starting` — the same state as
+            // `Pending`, so it is never mistaken for a serving engine and never
+            // surfaces as an error during provisioning.
+            "Running" if pod_is_ready(&pod) => InstanceState::Running,
+            "Running" | "Pending" => InstanceState::Starting,
             "Succeeded" => InstanceState::Stopped,
             "Failed" => InstanceState::Failed,
             _ => InstanceState::Unknown,
@@ -1037,11 +1233,12 @@ impl KubernetesCompute {
 
     /// Full teardown for a genuine DESTROY: everything
     /// [`Self::teardown_instance_keep_snapshots`] does, plus reclaim the
-    /// per-commit VolumeSnapshots sourced from these PVCs — one ZFS snapshot per
-    /// commit would otherwise leak. Consumers that DESTROY a database call this
-    /// (the CLI via `remove_instance`, and the node daemon directly);
-    /// consumers that RESTORE from a snapshot MUST use
-    /// `teardown_instance_keep_snapshots` instead.
+    /// per-commit VolumeSnapshots sourced from these PVCs (one ZFS snapshot per
+    /// commit would otherwise leak) AND retire the per-instance credentials
+    /// Secret. Consumers that DESTROY a database call this (the CLI via
+    /// `remove_instance`, and the node daemon directly); consumers that RESTORE
+    /// from a snapshot MUST use `teardown_instance_keep_snapshots` instead, which
+    /// deliberately preserves the Secret (the durable deploy-time password).
     pub async fn remove_instance_with_pvcs(
         &self,
         id: &InstanceId,
@@ -1049,6 +1246,13 @@ impl KubernetesCompute {
     ) -> Result<()> {
         self.teardown_instance_keep_snapshots(id, extra_pvcs)
             .await?;
+
+        // A genuine destroy removes everything: retire the credentials Secret so
+        // it does not outlive the StatefulSet/Service/PVC it belonged to.
+        let _ = self
+            .api_secrets()
+            .delete(&credentials_secret_name(&id.0), &DeleteParams::default())
+            .await;
 
         let storage = gfs_storage_kubernetes::KubernetesStorage::new(Some(self.namespace.clone()))
             .await
@@ -1113,6 +1317,59 @@ impl Compute for KubernetesCompute {
 
     async fn status(&self, id: &InstanceId) -> Result<InstanceStatus> {
         Ok(Self::instance_status_from_pod(id, self.get_pod(id).await?))
+    }
+
+    async fn watch_status(
+        &self,
+    ) -> Result<Option<tokio::sync::mpsc::Receiver<(InstanceId, InstanceState)>>> {
+        use kube::runtime::watcher;
+        use tokio_stream::StreamExt;
+
+        // Stream every managed instance pod (app label) so one watch covers all
+        // instances on the node; each pod carries the instance label to recover
+        // its id. The readiness verdict reuses the same status mapping the poll
+        // uses, so the watch only changes *when* an edge is seen, not *what*.
+        let api = self.api_pods();
+        let config =
+            watcher::Config::default().labels(&format!("{APP_LABEL_KEY}={APP_LABEL_VALUE}"));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+        tokio::spawn(async move {
+            let stream = watcher(api, config);
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                let updates = match event {
+                    Ok(watcher::Event::Apply(pod)) | Ok(watcher::Event::InitApply(pod)) => {
+                        instance_update_from_pod(&pod)
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                    }
+                    // A deleted pod is gone from the API — the same signal the
+                    // poll turns into "stopped" when `get_pod` finds nothing.
+                    Ok(watcher::Event::Delete(pod)) => instance_id_from_pod(&pod)
+                        .map(|id| (id, InstanceState::Unknown))
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    // Init markers bracket the initial/resync list; the individual
+                    // InitApply events carry the states, so nothing to emit here.
+                    Ok(watcher::Event::Init) | Ok(watcher::Event::InitDone) => Vec::new(),
+                    Err(e) => {
+                        // `watcher` retries (relist) internally on error; keep the
+                        // stream alive so a transient API blip never ends the watch.
+                        tracing::warn!("compute pod watcher error (retrying): {e}");
+                        continue;
+                    }
+                };
+                for update in updates {
+                    if tx.send(update).await.is_err() {
+                        // Receiver dropped (health watch shut down) — stop watching.
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Some(rx))
     }
 
     async fn get_connection_info(
@@ -1339,16 +1596,11 @@ impl Compute for KubernetesCompute {
     }
 
     async fn remove_instance(&self, id: &InstanceId) -> Result<()> {
-        // Genuine deletion also retires the credentials Secret. The checkout /
-        // clone-seed restore tears down via `teardown_instance_keep_snapshots`,
-        // which deliberately preserves the Secret — it is the only durable copy
-        // of the deploy-time password and must survive StatefulSet recreation.
-        let _ = self
-            .api_secrets()
-            .delete(&credentials_secret_name(&id.0), &DeleteParams::default())
-            .await;
-        // Full destroy: `remove_instance_with_pvcs` also reclaims the per-commit
-        // VolumeSnapshots.
+        // Full destroy: `remove_instance_with_pvcs` reclaims the per-commit
+        // VolumeSnapshots AND retires the credentials Secret. (The checkout /
+        // clone-seed restore path instead uses `teardown_instance_keep_snapshots`,
+        // which deliberately preserves the Secret — the durable deploy-time
+        // password that must survive StatefulSet recreation.)
         self.remove_instance_with_pvcs(id, &[]).await
     }
 
@@ -1939,20 +2191,163 @@ mod tests {
     #[test]
     fn instance_status_maps_pod_phase_to_state() {
         let id = InstanceId("gfs-pg-1".to_string());
-        let case = |phase: Option<&str>| {
+        let case = |phase: Option<&str>, ready: Option<bool>| {
             KubernetesCompute::instance_status_from_pod(
                 &id,
-                Some(pod_with_phase_ready(phase, None)),
+                Some(pod_with_phase_ready(phase, ready)),
             )
             .state
         };
-        assert!(matches!(case(Some("Running")), InstanceState::Running));
-        assert!(matches!(case(Some("Pending")), InstanceState::Starting));
-        assert!(matches!(case(Some("Succeeded")), InstanceState::Stopped));
-        assert!(matches!(case(Some("Failed")), InstanceState::Failed));
+        // Only a Running pod whose Ready condition is True is Running.
+        assert!(matches!(
+            case(Some("Running"), Some(true)),
+            InstanceState::Running
+        ));
+        assert!(matches!(
+            case(Some("Pending"), None),
+            InstanceState::Starting
+        ));
+        assert!(matches!(
+            case(Some("Succeeded"), None),
+            InstanceState::Stopped
+        ));
+        assert!(matches!(case(Some("Failed"), None), InstanceState::Failed));
         // An unrecognized phase, and a missing phase, both map to Unknown.
-        assert!(matches!(case(Some("Weird")), InstanceState::Unknown));
-        assert!(matches!(case(None), InstanceState::Unknown));
+        assert!(matches!(case(Some("Weird"), None), InstanceState::Unknown));
+        assert!(matches!(case(None, None), InstanceState::Unknown));
+    }
+
+    #[test]
+    fn instance_status_running_but_not_ready_is_starting() {
+        // Phase Running but the engine is not yet (or no longer) accepting
+        // connections — initdb/recovery, or a crash-loop that keeps phase=Running
+        // under restartPolicy Always. It must read as Starting, never Running,
+        // and never as an error.
+        let id = InstanceId("gfs-pg-1".to_string());
+        let readied = |ready: Option<bool>| {
+            KubernetesCompute::instance_status_from_pod(
+                &id,
+                Some(pod_with_phase_ready(Some("Running"), ready)),
+            )
+            .state
+        };
+        assert!(matches!(readied(Some(false)), InstanceState::Starting));
+        // No Ready condition reported yet (early in startup) is also not-ready.
+        assert!(matches!(readied(None), InstanceState::Starting));
+    }
+
+    #[test]
+    fn instance_status_crashloop_is_failed() {
+        // A container stuck in CrashLoopBackOff keeps phase=Running under
+        // restartPolicy Always; it must surface as Failed, not a perpetual
+        // Starting, so a broken deploy is detectable.
+        let id = InstanceId("gfs-pg-1".to_string());
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{
+                    "name": "db",
+                    "ready": false,
+                    "restartCount": 7,
+                    "image": "postgres",
+                    "imageID": "",
+                    "state": { "waiting": { "reason": "CrashLoopBackOff" } }
+                }]
+            }
+        }))
+        .expect("valid pod json");
+        assert!(matches!(
+            KubernetesCompute::instance_status_from_pod(&id, Some(pod)).state,
+            InstanceState::Failed
+        ));
+    }
+
+    #[test]
+    fn instance_status_bad_image_is_failed() {
+        // An unpullable/misconfigured engine container never runs — it must be
+        // Failed, not a perpetual Starting.
+        let id = InstanceId("gfs-pg-1".to_string());
+        for reason in [
+            "ImagePullBackOff",
+            "ErrImagePull",
+            "InvalidImageName",
+            "CreateContainerConfigError",
+        ] {
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "status": {
+                    "phase": "Pending",
+                    "containerStatuses": [{
+                        "name": "db", "ready": false, "restartCount": 0,
+                        "image": "postgres", "imageID": "",
+                        "state": { "waiting": { "reason": reason } }
+                    }]
+                }
+            }))
+            .expect("valid pod json");
+            assert!(
+                matches!(
+                    KubernetesCompute::instance_status_from_pod(&id, Some(pod)).state,
+                    InstanceState::Failed
+                ),
+                "reason {reason} should map to Failed"
+            );
+        }
+    }
+
+    #[test]
+    fn instance_status_bad_image_on_init_container_is_failed() {
+        // The realistic Postgres shape: the image tag is bad, so the shared-image
+        // `gfs-seal-hba` INIT container is ImagePullBackOff while the `db`
+        // container merely sits in PodInitializing. The pod can never serve, so it
+        // must be Failed, not a perpetual Starting.
+        let id = InstanceId("gfs-pg-1".to_string());
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "status": {
+                "phase": "Pending",
+                "initContainerStatuses": [{
+                    "name": "gfs-seal-hba", "ready": false, "restartCount": 0,
+                    "image": "gfs-postgres:bad", "imageID": "",
+                    "state": { "waiting": { "reason": "ImagePullBackOff" } }
+                }],
+                "containerStatuses": [{
+                    "name": "db", "ready": false, "restartCount": 0,
+                    "image": "gfs-postgres:bad", "imageID": "",
+                    "state": { "waiting": { "reason": "PodInitializing" } }
+                }]
+            }
+        }))
+        .expect("valid pod json");
+        assert!(matches!(
+            KubernetesCompute::instance_status_from_pod(&id, Some(pod)).state,
+            InstanceState::Failed
+        ));
+    }
+
+    #[test]
+    fn instance_status_crashing_sidecar_does_not_condemn_db() {
+        // A crashing NON-db container (e.g. a future metrics sidecar) must never
+        // make a live engine read Failed — a false condemnation of a live database.
+        let id = InstanceId("gfs-pg-1".to_string());
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "status": {
+                "phase": "Running",
+                "conditions": [{ "type": "Ready", "status": "True" }],
+                "containerStatuses": [
+                    { "name": "db", "ready": true, "restartCount": 0,
+                      "image": "postgres", "imageID": "",
+                      "state": { "running": { "startedAt": "2020-01-01T00:00:00Z" } } },
+                    { "name": "metrics", "ready": false, "restartCount": 9,
+                      "image": "exporter", "imageID": "",
+                      "state": { "waiting": { "reason": "CrashLoopBackOff" } } }
+                ]
+            }
+        }))
+        .expect("valid pod json");
+        // db is ready and the pod Ready condition is True → Running, NOT Failed.
+        assert!(matches!(
+            KubernetesCompute::instance_status_from_pod(&id, Some(pod)).state,
+            InstanceState::Running
+        ));
     }
 
     #[test]
