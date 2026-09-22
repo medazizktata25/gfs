@@ -619,6 +619,41 @@ impl Repository for GfsRepository {
             workspace_path,
             workspace_path.exists()
         );
+        // Refuse BEFORE the workspace is removed, not after.
+        //
+        // The check below used to be reached only when the workspace did not
+        // exist, so there was nothing to lose by the time it ran. Mainline then
+        // made the restore unconditional -- delete, then repopulate -- and the
+        // refusal moved to the far side of `remove_dir_all`. The message it
+        // prints tells you to recover by copying `.gfs/snapshots` from wherever
+        // the repository came from, while the working copy, which in exactly
+        // that scenario is the only surviving copy of the data, has just been
+        // deleted.
+        //
+        // Nothing here mutates the repository, so an early return is safe.
+        {
+            let commit = repo_layout::get_commit_from_hash(&repo, &commit_hash).map_err(map_err)?;
+            let snapshot_hash = &commit.snapshot_hash;
+            if !snapshot_hash.is_empty() && !restore_is_not_filesystem_based(&repo) {
+                let snapshot_dir = repo
+                    .join(GFS_DIR)
+                    .join(SNAPSHOTS_DIR)
+                    .join(&snapshot_hash[..2])
+                    .join(&snapshot_hash[2..]);
+                if !(snapshot_dir.exists() && snapshot_dir.is_dir()) {
+                    return Err(RepositoryError::Internal(format!(
+                        "commit {} refers to snapshot {} but '{}' does not exist. Its data \
+                         cannot be restored, so this checkout would silently hand you an \
+                         empty database. The workspace has been left untouched. If the \
+                         repository was copied, copy .gfs/snapshots as well",
+                        &commit_hash[..7.min(commit_hash.len())],
+                        &snapshot_hash[..7.min(snapshot_hash.len())],
+                        snapshot_dir.display()
+                    )));
+                }
+            }
+        }
+
         if workspace_path.exists() {
             // Files restored from a snapshot carry its read-only bits, which
             // `remove_dir_all` will not override.

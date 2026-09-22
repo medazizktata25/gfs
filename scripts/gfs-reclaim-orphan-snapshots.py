@@ -53,18 +53,53 @@ def two_level(root):
 
 
 referenced = set()
+damaged = []
 for _, path in two_level(os.path.join(gfs, "objects")):
     try:
         with open(path) as fh:
             obj = json.load(fh)
     except (OSError, ValueError):
-        # Not every object is a commit, and an unreadable one must make this
-        # MORE conservative, not less: an object we cannot parse might be the
-        # only reference to a snapshot, so nothing is assumed about it.
+        # An object that cannot be parsed might be the only reference to a
+        # snapshot, so it has to make this MORE conservative, not less.
+        # `continue` did the opposite: it contributed nothing to `referenced`,
+        # so a snapshot only that object referred to became an orphan and
+        # `--delete` would destroy it. Measured on a repository with one commit
+        # object corrupted in place and its refs intact: referenced went 4 -> 3
+        # and the live snapshot was listed for deletion.
+        #
+        # But refusing on every unparseable object is also wrong: a healthy
+        # repository contains objects that are legitimately not JSON at all --
+        # the files object is binary, and `two_level` also yields directories.
+        # Refusing on those would mean refusing on every repository.
+        #
+        # So the discriminator is whether it LOOKS like a commit: commit objects
+        # are JSON and start with `{`. One that starts with `{` and will not
+        # parse is damaged, and we stop. Anything else is another object kind
+        # and is skipped as before.
+        if os.path.isdir(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(64).lstrip()
+        except OSError:
+            head = b"{"  # cannot even read it: treat as damaged
+        if head.startswith(b"{"):
+            damaged.append(path)
         continue
     snapshot = obj.get("snapshot_hash")
     if snapshot:
         referenced.add(snapshot)
+
+if damaged:
+    print(
+        f"refusing to reclaim: {len(damaged)} commit-shaped object(s) could not be parsed, "
+        f"so the set of referenced snapshots is not known and any snapshot could be one "
+        f"of theirs.",
+        file=sys.stderr,
+    )
+    for path in damaged[:10]:
+        print(f"  {path}", file=sys.stderr)
+    sys.exit(2)
 
 
 def tree_size(path):

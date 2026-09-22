@@ -2256,6 +2256,13 @@ mod tests {
     /// than its target, so a symlinked database would be committed as a live
     /// pointer: mutating the target changes the "snapshot", deleting it makes
     /// the snapshot unreadable.
+    // Unix-only: `std::os::unix` does not exist on Windows, and an unguarded
+    // reference does not skip this test -- it fails the whole `gfs-db-providers`
+    // test target to compile there, taking every other test in the crate with it.
+    // Gated per test rather than at the module, which holds the crate's entire
+    // suite. The symlinks are only how the case is BUILT; the refusal itself is
+    // not unix-only, and stays unverified on Windows.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_database_is_refused_rather_than_committed_as_a_pointer() {
         let outside = tempfile::tempdir().unwrap();
@@ -2623,6 +2630,13 @@ mod tests {
     /// never fired. The link was skipped, the workspace looked empty, and the
     /// commit ran with no snapshot guard over a directory holding nothing but
     /// the link — reporting success with an empty snapshot.
+    // Unix-only: `std::os::unix` does not exist on Windows, and an unguarded
+    // reference does not skip this test -- it fails the whole `gfs-db-providers`
+    // test target to compile there, taking every other test in the crate with it.
+    // Gated per test rather than at the module, which holds the crate's entire
+    // suite. The symlinks are only how the case is BUILT; the refusal itself is
+    // not unix-only, and stays unverified on Windows.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_database_is_refused_however_it_is_reached() {
         let outside = tempfile::tempdir().unwrap();
@@ -2666,6 +2680,13 @@ mod tests {
 
     /// A link that points at nothing hides nothing, and must not stop a
     /// perfectly good database next to it from being found.
+    // Unix-only: `std::os::unix` does not exist on Windows, and an unguarded
+    // reference does not skip this test -- it fails the whole `gfs-db-providers`
+    // test target to compile there, taking every other test in the crate with it.
+    // Gated per test rather than at the module, which holds the crate's entire
+    // suite. The symlinks are only how the case is BUILT; the refusal itself is
+    // not unix-only, and stays unverified on Windows.
+    #[cfg(unix)]
     #[test]
     fn a_broken_link_is_not_mistaken_for_a_database() {
         let workspace = tempfile::tempdir().unwrap();
