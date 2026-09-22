@@ -48,7 +48,7 @@ pub enum CheckoutRepoError {
 ///
 /// Long enough for a snapshot of a realistic database, short enough that a
 /// daemon is not parked indefinitely by a commit that has wedged.
-const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
 // Use case
@@ -177,10 +177,12 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
         // concurrent commit can be mutating; the guard drops on any early
         // return, releasing the lock.
         let _repo_lock = RepoLock::acquire_waiting(&path, LOCK_WAIT).map_err(|e| match e {
+            // "another operation", not "a commit": a second checkout holds this
+            // same lock, so the blocker is not always a commit.
             LockError::Busy(_) => CheckoutRepoError::Busy(format!(
-                "a `gfs commit` has been running on this repository for over {} seconds; \
-                 checkout would interleave with it and lose a commit, so it is not started. \
-                 Retry once the commit finishes",
+                "another operation has held this repository's lock for over {} seconds; \
+                 starting a checkout now could interleave with it and lose a commit, so it \
+                 is not started. Retry once that operation finishes",
                 LOCK_WAIT.as_secs()
             )),
             LockError::Io(e) => CheckoutRepoError::Repository(RepositoryError::Io(e)),

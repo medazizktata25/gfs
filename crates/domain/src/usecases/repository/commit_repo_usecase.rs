@@ -255,15 +255,14 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
         // Fail fast rather than wait: a second commit would snapshot a state the
         // first has already captured, so queueing it produces a redundant commit
         // rather than a useful one. Checkout waits instead — see repo_lock.
+        //
+        // The message comes from `LockError`'s own `Display`, which says "another
+        // operation": checkout takes this same lock, so a commit refused here is
+        // as often blocked by a checkout as by a commit. Naming `gfs commit`
+        // sent people looking for a second commit that was never running.
         let _repo_lock = RepoLock::try_acquire(&path).map_err(|e| match e {
-            LockError::Busy(busy) => {
-                CommitRepoError::Repository(RepositoryError::Internal(format!(
-                    "another `gfs commit` is already running on this repository \
-                     (lock held at {}); retry once it finishes",
-                    busy.lock_path.display()
-                )))
-            }
-            LockError::Io(e) => CommitRepoError::Repository(RepositoryError::Io(e)),
+            LockError::Io(io) => CommitRepoError::Repository(RepositoryError::Io(io)),
+            busy => CommitRepoError::Repository(RepositoryError::Internal(busy.to_string())),
         })?;
 
         // 1. Resolve commit context from the repository.
