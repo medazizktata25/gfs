@@ -75,6 +75,23 @@ fn embedded_provider(config: &GfsConfig) -> Option<String> {
 
 pub async fn run(path: Option<PathBuf>, action: ComputeAction, json_output: bool) -> Result<()> {
     if let ComputeAction::Config { ref key, ref value } = action {
+        // The embedded-provider refusal lives in `resolve_id`, and this arm
+        // returns before reaching it -- `resolve_id` even has an explicit
+        // `Config { .. } => return Ok(String::new())`, so the guard was
+        // structurally unreachable here. The other seven actions refuse on an
+        // embedded provider; this one accepted `db.port 5432` on a database
+        // that has no port, wrote it to config.toml, and told the caller to run
+        // `gfs compute restart` -- which then refuses.
+        let repo_path = path.clone().unwrap_or_else(get_repo_dir);
+        if let Ok(config) = GfsConfig::load(&repo_path)
+            && let Some(name) = embedded_provider(&config)
+        {
+            anyhow::bail!(
+                "'{name}' is an embedded database — a file this process opens, not a \
+                 server. There is no container to configure: `gfs query` and `gfs commit` \
+                 work directly on the file"
+            );
+        }
         return handle_config(path, key, value, json_output);
     }
     let repo_path = path.clone().unwrap_or_else(get_repo_dir);
