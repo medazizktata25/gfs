@@ -188,7 +188,7 @@ impl PostgresqlProvider {
             },
             DatabaseProviderArg {
                 name: "-c".into(),
-                value: "max_connections=10".into(),
+                value: "max_connections=50".into(),
             },
             DatabaseProviderArg {
                 name: "-c".into(),
@@ -2397,7 +2397,7 @@ mod tests {
         let last_default = base
             .args
             .iter()
-            .rposition(|a| a == "max_connections=10")
+            .rposition(|a| a == "max_connections=50")
             .expect("default max_connections present");
         let override_pos = def
             .args
