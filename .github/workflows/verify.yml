@@ -34,7 +34,26 @@ jobs:
           build /tmp/bin-fix
           git checkout upstream/main -- "$SQ"
           build /tmp/bin-base
+          # main's source plus an env gate that skips only the checkpoint -- the exact
+          # shape the earlier harness scored as arm C, so the contradiction can be
+          # resolved inside one run instead of across two.
+          python3 - "$SQ" <<'PYEOF'
+          import sys
+          p = sys.argv[1]; s = open(p).read()
+          old = """        if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
+            tracing::debug!(error = %e, "wal checkpoint did not complete; snapshotting WAL as-is");
+        }"""
+          assert s.count(old) == 1, s.count(old)
+          new = """        if std::env::var("ARM_C").as_deref() != Ok("1") {
+            if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
+                tracing::debug!(error = %e, "wal checkpoint did not complete; snapshotting WAL as-is");
+            }
+        }"""
+          open(p, "w").write(s.replace(old, new, 1))
+          print("gated binary source prepared")
+          PYEOF
+          build /tmp/bin-gated
           git checkout HEAD -- "$SQ"
           echo "tree restored: $(git status --porcelain | wc -l) modified"
       - name: Verify
-        run: .github/verify.sh /tmp/bin-fix /tmp/bin-base
+        run: .github/verify.sh /tmp/bin-fix /tmp/bin-base /tmp/bin-gated
