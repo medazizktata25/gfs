@@ -1,0 +1,40 @@
+name: Verify the checkpoint removal
+
+on:
+  push:
+    branches: [fix/the-wal-checkpoint-is-what-corrupts-the-snapshot]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Confirm no reflink
+        run: |
+          : > .p
+          if cp --reflink=always .p .q 2>/dev/null; then echo "::error::reflink works here"; exit 1; fi
+          echo "filesystem: $(stat -f -c %T .) - no reflink"; rm -f .p .q
+      - name: Rust toolchain
+        run: |
+          command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Fetch main
+        run: git fetch --no-tags https://github.com/Guepard-Corp/gfs main:refs/remotes/upstream/main
+      - name: Build both test binaries
+        run: |
+          set -e
+          SQ=crates/adapters/db-providers/src/sqlite.rs
+          build() {
+            cargo test --locked -q -p gfs-cli --test e2e_sqlite --no-run 2>/dev/null
+            cp "$(find target/debug/deps -name 'e2e_sqlite-*' -type f -perm -u+x -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)" "$1"
+          }
+          build /tmp/bin-fix
+          git checkout upstream/main -- "$SQ"
+          build /tmp/bin-base
+          git checkout HEAD -- "$SQ"
+          echo "tree restored: $(git status --porcelain | wc -l) modified"
+      - name: Verify
+        run: .github/verify.sh /tmp/bin-fix /tmp/bin-base
