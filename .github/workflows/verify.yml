@@ -23,23 +23,23 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Fetch main
         run: git fetch --no-tags https://github.com/Guepard-Corp/gfs main:refs/remotes/upstream/main
-      - name: Build both test binaries
+      - name: Build one test binary and two gfs binaries
         run: |
           set -e
           SQ=crates/adapters/db-providers/src/sqlite.rs
-          build() {
-            cargo test --locked -q -p gfs-cli --test e2e_sqlite --no-run 2>/dev/null
-            cp "$(find target/debug/deps -name 'e2e_sqlite-*' -type f -perm -u+x -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)" "$1"
-          }
-          build /tmp/bin-fix
+          # The gfs binary carries the behaviour; the test binary only invokes it at a
+          # compile-time path. So build the test binary ONCE and the gfs binary twice.
+          cargo build --locked -q --bin gfs
+          cp target/debug/gfs /tmp/gfs-fix
+          cargo test --locked -q -p gfs-cli --test e2e_sqlite --no-run 2>/dev/null
+          cp "$(find target/debug/deps -name 'e2e_sqlite-*' -type f -perm -u+x -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)" /tmp/testbin
           git checkout upstream/main -- "$SQ"
-          build /tmp/bin-base
-          # main's source plus an env gate that skips only the checkpoint -- the exact
-          # shape the earlier harness scored as arm C, so the contradiction can be
-          # resolved inside one run instead of across two.
-          python3 .github/add-gate.py "$SQ"
-          build /tmp/bin-gated
+          cargo build --locked -q --bin gfs
+          cp target/debug/gfs /tmp/gfs-base
           git checkout HEAD -- "$SQ"
           echo "tree restored: $(git status --porcelain | wc -l) modified"
+          cmp -s /tmp/gfs-fix /tmp/gfs-base && { echo "::error::identical gfs binaries"; exit 1; }
+          echo "two distinct gfs binaries built"
+
       - name: Verify
-        run: .github/verify.sh /tmp/bin-fix /tmp/bin-base /tmp/bin-gated
+        run: .github/verify.sh /tmp/testbin /tmp/gfs-fix /tmp/gfs-base "$PWD/target/debug/gfs"

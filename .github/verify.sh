@@ -1,34 +1,41 @@
 #!/usr/bin/env bash
-# Does removing the checkpoint eliminate the malformed snapshots?
+# Does removing the WAL checkpoint eliminate the malformed snapshots?
 #
-# Two test binaries, one per tree, so there is no env gating to get wrong -- an argument
-# ordering bug in a previous harness (GNU env treats the first VAR=value as the end of
-# options) meant the non-default arm never ran the test and its failures were counted as
-# corruption. Nothing here passes variables to select behaviour.
+# THE BEHAVIOUR LIVES IN THE gfs BINARY, NOT THE TEST BINARY. The test invokes
+# env!("CARGO_BIN_EXE_gfs"), a COMPILE-TIME path, so every test binary runs the same
+# target/debug/gfs on disk -- whichever was built last. Two earlier runs of this script
+# therefore compared test binaries while all of them shared one gfs, and scored main's
+# behaviour under the fix's name.
 #
-# Every failure is classified by which of the test's four assertions fired, because
-# counting any non-pass as "corrupt" is what produced the wrong conclusion before.
+# So this swaps the gfs binary per arm and keeps ONE test binary. Each swap is verified
+# by md5 before the arm runs.
 set -u
-FIX=$1
-BASE=$2
-GATED=$3
+TESTBIN=$1
+GFS_FIX=$2
+GFS_BASE=$3
+GFS_PATH=$4   # the compile-time path the test binary will invoke
 TEST=commits_under_a_concurrent_writer_capture_only_whole_transactions
 
-# Guard: the binaries must differ, or this compares one thing twice.
-cmp -s "$FIX" "$BASE" && { echo "::error::fix and base are identical"; exit 1; }
-cmp -s "$GATED" "$BASE" && { echo "::error::gated and base are identical"; exit 1; }
-echo "  three binaries: fix $(md5sum "$FIX" | cut -c1-10), base $(md5sum "$BASE" | cut -c1-10), gated $(md5sum "$GATED" | cut -c1-10)"
+cmp -s "$GFS_FIX" "$GFS_BASE" && { echo "::error::the two gfs binaries are identical"; exit 1; }
+echo "  gfs fix   $(md5sum "$GFS_FIX" | cut -c1-12)"
+echo "  gfs base  $(md5sum "$GFS_BASE" | cut -c1-12)"
+echo "  test bin  $(md5sum "$TESTBIN" | cut -c1-12)  invokes $GFS_PATH"
+
+use() { # $1 = which gfs to install; verified, because an unswapped binary is the bug above
+  cp "$1" "$GFS_PATH"
+  local want have
+  want=$(md5sum "$1" | cut -d' ' -f1)
+  have=$(md5sum "$GFS_PATH" | cut -d' ' -f1)
+  [ "$want" = "$have" ] || { echo "::error::gfs swap did not take effect"; exit 1; }
+}
 
 declare -A INTEG ROWS TORN GAP OTHER PASS
-for a in fix base gated; do INTEG[$a]=0; ROWS[$a]=0; TORN[$a]=0; GAP[$a]=0; OTHER[$a]=0; PASS[$a]=0; done
+for a in fix base; do INTEG[$a]=0; ROWS[$a]=0; TORN[$a]=0; GAP[$a]=0; OTHER[$a]=0; PASS[$a]=0; done
 
-run() { # $1 = binary, $2 = optional env
+run() { # $1 = which gfs binary to run against
+  use "$1"
   local out
-  if [ "${2:-}" = gate ]; then
-    out=$(env ARM_C=1 "$1" "$TEST" --exact --nocapture 2>&1)
-  else
-    out=$("$1" "$TEST" --exact --nocapture 2>&1)
-  fi
+  out=$("$TESTBIN" "$TEST" --exact --nocapture 2>&1)
   if printf '%s' "$out" | grep -q '^test result: ok'; then echo PASS; return; fi
   # An exec or harness failure is not a test failure.
   if printf '%s' "$out" | grep -qE "No such file|Permission denied|error: test failed, to rerun"; then
@@ -49,11 +56,10 @@ run() { # $1 = binary, $2 = optional env
 N=40
 echo "=== interleaving $N attempts per binary ==="
 for i in $(seq 1 $N); do
-  for a in base gated fix; do
+  for a in base fix; do
     case $a in
-      base)  line=$(run "$BASE") ;;
-      gated) line=$(run "$GATED" gate) ;;
-      fix)   line=$(run "$FIX") ;;
+      base) line=$(run "$GFS_BASE") ;;
+      fix)  line=$(run "$GFS_FIX") ;;
     esac
     if [ "$line" = PASS ]; then PASS[$a]=$(( ${PASS[$a]} + 1 )); printf '.'; continue; fi
     printf 'F'
@@ -69,11 +75,10 @@ done
 echo
 echo "################ RESULT (of $N each) ################"
 printf "  %-28s %6s %10s %6s %5s %6s %6s\n" binary pass integrity torn gap rows other
-for a in base gated fix; do
+for a in base fix; do
   case $a in
-    base)  l="main, checkpoint present" ;;
-    gated) l="main, ARM_C=1 skips ckpt" ;;
-    fix)   l="source removal" ;;
+    base) l="gfs with the checkpoint" ;;
+    fix)  l="gfs without it" ;;
   esac
   printf "  %-28s %6s %10s %6s %5s %6s %6s\n" "$l" "${PASS[$a]}" "${INTEG[$a]}" "${TORN[$a]}" "${GAP[$a]}" "${ROWS[$a]}" "${OTHER[$a]}"
 done
